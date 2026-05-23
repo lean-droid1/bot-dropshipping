@@ -36,76 +36,7 @@ def scrapear_web_a():
     productos = {}
     try:
         headers = {
-            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-            'Accept-Language': 'es-ES,es;q=0.9',
-            'Accept-Encoding': 'gzip, deflate, br'
-        }
-        
-        session = requests.Session()
-        response = session.get(URL_A, headers=headers, timeout=30)
-        
-        if response.status_code != 200:
-            response = session.get(URL_A, headers=headers, timeout=30, verify=False)
-            if response.status_code != 200:
-                return productos
-            
-        soup = BeautifulSoup(response.text, 'lxml')
-        items = soup.find_all(['li', 'div'], class_=lambda x: x and 'product' in x)
-        
-        for item in items:
-            title_el = item.find(['h2', 'h3', 'h4', 'a'], class_=lambda x: x and ('title' in x or 'woocommerce-loop' in x))
-            price_el = item.find(class_=lambda x: x and 'price' in x)
-            
-            if title_el and price_el and title_el.text.strip():
-                nombre = title_el.text.strip().lower()
-                
-                precio_texto = ''.join(filter(str.isdigit, price_el.text))
-                precio = int(precio_texto) if precio_texto else 0
-                
-                texto_item = item.text.lower()
-                clases = item.get('class', [])
-                
-                tiene_stock = True
-                if "sin stock" in texto_item or "agotado" in texto_item or "out-of-stock" in clases:
-                    tiene_stock = False
-                
-                productos[nombre] = {
-                    "nombre_real": title_el.text.strip(),
-                    "precio": precio,
-                    "stock": tiene_stock
-                }
-    except Exception as e:
-        print(f"Error crítico scrapeando Proveedor (Web A): {e}")
-    return productos
-
-def scrapear_web_b():
-    """ Scrapea tu tienda (TiendaNegocio) recorriendo todas las páginas disponibles """
-    productos = {}
-    pagina_actual = 1
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-    }
-    
-    while True:
-        # Si es la página 1 usa la URL base, sino le agrega el paginador numérico (?page=2, ?page=3...)
-        url = URL_B if pagina_actual == 1 else f"{URL_B}?page={pagina_actual}"
-        print(f"Scrapeando Tu Tienda (Web B) - Página {pagina_actual}...")
-        
-        try:
-            response = requests.get(url, headers=headers, timeout=30)
-            if response.status_code != 200:
-                print(f"Frenando paginación en página {pagina_actual} (Código {response.status_code})")
-                break
-                
-            soup = BeautifulSoup(response.text, 'lxml')
-            items = soup.find_all(['div', 'li', 'article', 'form'])
-            
-            productos_en_pagina = 0
-            for item in items:
-                title_el = item.find(['h2', 'h3', 'h1', 'a'], class_=lambda x: x and ('title' in x or 'name' in x or 'producto' in x))
-                price_el = item.find(class_=lambda x: x and ('price' in x or 'precio' in x or 'money' in x))
-                
+            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone
                 if title_el and price_el and title_el.text.strip():
                     nombre = title_el.text.strip().lower()
                     if nombre not in productos:
