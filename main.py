@@ -46,14 +46,12 @@ def scrapear_web_a():
         response = session.get(URL_A, headers=headers, timeout=30)
         
         if response.status_code != 200:
-            print(f"Error de conexión Web A: Código de estado {response.status_code}")
             response = session.get(URL_A, headers=headers, timeout=30, verify=False)
             if response.status_code != 200:
                 return productos
             
         soup = BeautifulSoup(response.text, 'lxml')
         items = soup.find_all(['li', 'div'], class_=lambda x: x and 'product' in x)
-        print(f"Elementos sospechosos de ser productos en Web A: {len(items)}")
         
         for item in items:
             title_el = item.find(['h2', 'h3', 'h4', 'a'], class_=lambda x: x and ('title' in x or 'woocommerce-loop' in x))
@@ -82,39 +80,62 @@ def scrapear_web_a():
     return productos
 
 def scrapear_web_b():
-    """ Scrapea tu tienda (TiendaNegocio) buscando estructuras genéricas """
+    """ Scrapea tu tienda (TiendaNegocio) recorriendo todas las páginas disponibles """
     productos = {}
-    try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-        }
-        response = requests.get(URL_B, headers=headers, timeout=30)
-        soup = BeautifulSoup(response.text, 'lxml')
+    pagina_actual = 1
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+    }
+    
+    while True:
+        # Si es la página 1 usa la URL base, sino le agrega el paginador numérico (?page=2, ?page=3...)
+        url = URL_B if pagina_actual == 1 else f"{URL_B}?page={pagina_actual}"
+        print(f"Scrapeando Tu Tienda (Web B) - Página {pagina_actual}...")
         
-        # Buscamos bloques contenedores estándar de e-commerce
-        items = soup.find_all(['div', 'li', 'article', 'form'])
-        
-        for item in items:
-            # Buscamos títulos y precios con selectores amplios
-            title_el = item.find(['h2', 'h3', 'h1', 'a'], class_=lambda x: x and ('title' in x or 'name' in x or 'producto' in x))
-            price_el = item.find(class_=lambda x: x and ('price' in x or 'precio' in x or 'money' in x))
+        try:
+            response = requests.get(url, headers=headers, timeout=30)
+            if response.status_code != 200:
+                print(f"Frenando paginación en página {pagina_actual} (Código {response.status_code})")
+                break
+                
+            soup = BeautifulSoup(response.text, 'lxml')
+            items = soup.find_all(['div', 'li', 'article', 'form'])
             
-            if title_el and price_el and title_el.text.strip():
-                nombre = title_el.text.strip().lower()
-                if nombre not in productos:
-                    precio_texto = ''.join(filter(str.isdigit, price_el.text))
-                    precio = int(precio_texto) if precio_texto else 0
-                    
-                    texto_producto = item.text.lower()
-                    tiene_stock = "sin stock" not in texto_producto and "agotado" not in texto_producto
-                    
-                    productos[nombre] = {
-                        "nombre_real": title_el.text.strip(),
-                        "precio": precio,
-                        "stock": tiene_stock
-                    }
-    except Exception as e:
-        print(f"Error crítico scrapeando Tu Tienda (Web B): {e}")
+            productos_en_pagina = 0
+            for item in items:
+                title_el = item.find(['h2', 'h3', 'h1', 'a'], class_=lambda x: x and ('title' in x or 'name' in x or 'producto' in x))
+                price_el = item.find(class_=lambda x: x and ('price' in x or 'precio' in x or 'money' in x))
+                
+                if title_el and price_el and title_el.text.strip():
+                    nombre = title_el.text.strip().lower()
+                    if nombre not in productos:
+                        precio_texto = ''.join(filter(str.isdigit, price_el.text))
+                        precio = int(precio_texto) if precio_texto else 0
+                        
+                        texto_producto = item.text.lower()
+                        tiene_stock = "sin stock" not in texto_producto and "agotado" not in texto_producto
+                        
+                        productos[nombre] = {
+                            "nombre_real": title_el.text.strip(),
+                            "precio": precio,
+                            "stock": tiene_stock
+                        }
+                        productos_en_pagina += 1
+            
+            print(f"Encontrados {productos_en_pagina} nuevos productos en la página {pagina_actual}.")
+            
+            # Si en esta página no encontramos ningún producto nuevo, significa que ya pasamos el límite y terminamos
+            if productos_en_pagina == 0:
+                break
+                
+            # Avanzamos a la siguiente página
+            pagina_actual += 1
+            time.sleep(1) # Pausa de 1 segundo entre páginas para evitar bloqueos
+            
+        except Exception as e:
+            print(f"Error en paginación de Web B: {e}")
+            break
+            
     return productos
 
 def procesar_logica():
