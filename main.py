@@ -32,50 +32,49 @@ def guardar_estado_actual(estado):
         json.dump(estado, f, ensure_ascii=False, indent=4)
 
 def scrapear_web_a():
-    """ Scrapea el proveedor (rxzweb) usando WooCommerce """
+    """ Scrapea el proveedor (rxzweb) imitando un iPhone para saltar el error 403 """
     productos = {}
     try:
-        # Cabeceras completas para simular un navegador Google Chrome real en Windows 10
+        # Cabeceras de iPhone (suelen saltarse bloqueos Cloudflare comunes)
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-            'Accept-Language': 'es-ES,es;q=0.8,en-US;q=0.5,en;q=0.3',
-            'Upgrade-Insecure-Requests': '1'
+            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.5 Mobile/15E148 Safari/604.1',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+            'Accept-Language': 'es-ES,es;q=0.9',
+            'Accept-Encoding': 'gzip, deflate, br'
         }
-        response = requests.get(URL_A, headers=headers, timeout=30)
+        
+        session = requests.Session()
+        response = session.get(URL_A, headers=headers, timeout=30)
         
         if response.status_code != 200:
             print(f"Error de conexión Web A: Código de estado {response.status_code}")
-            return productos
+            # Intento alternativo sin HTTPS estricto si falla
+            response = session.get(URL_A, headers=headers, timeout=30, verify=False)
+            if response.status_code != 200:
+                return productos
             
-        soup = BeautifulSoup(response.text, 'html.parser')
+        soup = BeautifulSoup(response.text, 'lxml')
         
-        # Buscamos de forma más abierta tanto li.product como div.product
-        items = soup.select('li.product, div.product, .product-grid-item') 
-        print(f"Productos encontrados en HTML de Web A: {len(items)}") # Log para ver si encuentra algo
+        # Buscamos de forma masiva cualquier estructura de producto de WooCommerce
+        items = soup.find_all(['li', 'div'], class_=lambda x: x and 'product' in x)
+        print(f"Elementos sospechosos de ser productos en Web A: {len(items)}")
         
         for item in items:
-            # Selectores flexibles para el título de WooCommerce
-            title_el = item.select_one('.woocommerce-loop-product__title, .product-title, h2, h3')
-            price_el = item.select_one('.price, .woocommerce-Price-amount')
+            title_el = item.find(['h2', 'h3', 'h4', 'a'], class_=lambda x: x and 'title' in x or 'woocommerce-loop' in x)
+            price_el = item.find(class_=lambda x: x and 'price' in x)
             
-            if title_el and price_el:
+            if title_el and price_el and title_el.text.strip():
                 nombre = title_el.text.strip().lower()
                 
-                # Extraemos solo los números del precio
                 precio_texto = ''.join(filter(str.isdigit, price_el.text))
                 precio = int(precio_texto) if precio_texto else 0
                 
-                # WooCommerce detecta falta de stock con clases en el contenedor principal
-                clases = item.get('class', [])
-                tiene_stock = "out-of-stock" not in clases and "instock" in clases
-                
-                # Si no tiene la clase 'instock' explícita, asumimos True a menos que diga 'sin stock' textualmente
                 texto_item = item.text.lower()
-                if "sin stock" in texto_item or "agotado" in texto_item:
+                clases = item.get('class', [])
+                
+                tiene_stock = True
+                if "sin stock" in texto_item or "agotado" in texto_item or "out-of-stock" in clases:
                     tiene_stock = False
-                elif "out-of-stock" not in clases:
-                    tiene_stock = True
                 
                 productos[nombre] = {
                     "nombre_real": title_el.text.strip(),
@@ -87,25 +86,84 @@ def scrapear_web_a():
     return productos
 
 def scrapear_web_b():
-    """ Scrapea tu tienda (TiendaNegocio) """
+    """ Scrapea tu tienda (TiendaNegocio) buscando estructuras genéricas de e-commerce """
     productos = {}
     try:
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
         response = requests.get(URL_B, headers=headers, timeout=30)
+        soup = BeautifulSoup(response.text, 'lxml')
         
-        if response.status_code != 200:
-            print(f"Error de conexión Web B: Código de estado {response.status_code}")
-            return productos
-            
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        # Selectores adaptados para la plataforma TiendaNegocio
-        items = soup.select('.product-item, .item, .js-product-container, div[data-product-id]') 
-        print(f"Productos encontrados en HTML de Web B: {len(items)}")
+        # TiendaNegocio suele estructurar en divs con clases de productos o directamente enlaces
+        # Buscamos de forma muy abierta para capturar todo
+        items = soup.find_all(['div', 'li', 'article'])
         
         for item in items:
+            # Buscamos títulos por etiquetas comunes dentro de contenedores pequeños
+            title_el = item.find(['h2', 'h3', 'h1'], class_=lambda x: x and ('title' in x or 'name' in x or 'producto' in x))
+            price_el = item.find(class_=lambda x: x and ('price' in x or 'precio' in x or 'money' in x))
+            
+            if title_el and price_el:
+                nombre = title_el.text.strip().lower()
+                if nombre not in productos: # Evitar duplicar sub-elementos
+                    precio_texto = ''.join(filter(str.isdigit, price_el.text))
+                    precio = int(precio_texto) if precio_texto else 0
+                    
+                    texto_producto = item.text.lower()
+                    tiene_stock = "sin stock" not in texto_producto and "agotado" not in texto_producto
+                    
+                    productos[nombre] = {
+                        "nombre_real": title_el.text.strip(),
+                        "precio": precio,
+                        "stock": tiene_stock
+                    }
+    except Exception as e:
+        print(f"Error crítico scrapeando Tu Tienda (Web B): {e}")
+    return productos
+
+def procesar_logica():
+    print("--- Iniciando Chequeo de productos ---")
+    estado_anterior = cargar_estado_anterior()
+    
+    prod_a = scrapear_web_a()
+    prod_b = scrapear_web_b()
+    
+    print(f"📊 Resumen de escaneo:")
+    print(f" -> Web A (Proveedor): {len(prod_a)} productos encontrados.")
+    print(f" -> Web B (Tu tienda): {len(prod_b)} productos encontrados.")
+    
+    if not prod_a:
+        print("❌ Freno preventivo: No se detectaron productos en el Proveedor (Posible bloqueo 403 activo).")
+        return
+
+    # REGLA 4: Alerta de productos nuevos en el proveedor
+    for nombre, datos in prod_a.items():
+        if nombre not in estado_anterior.get("productos_a", {}):
+            enviar_telegram(f"🆕 *¡Nuevo Producto en Proveedor!*\n*Nombre:* {datos['nombre_real']}\n*Precio:* ${datos['precio']}")
+
+    # REGLAS 1, 2 y 3: Comparación cruzada
+    for nombre, datos_a in prod_a.items():
+        if nombre in prod_b:
+            datos_b = prod_b[nombre]
+            
+            # REGLA 1: Web A no tiene stock pero tu Web B sí tiene
+            if not datos_a["stock"] and datos_b["stock"]:
+                enviar_telegram(f"⚠️ *Alerta Stock:* El proveedor NO tiene stock de `{datos_a['nombre_real']}`, pero en tu tienda figura como DISPONIBLE.")
+            
+            # REGLA 3: Tu tienda (B) tiene el precio más bajo que el proveedor (A)
+            if datos_b["precio"] < datos_a["precio"]:
+                enviar_telegram(f"📉 *Alerta Precio:* Tu precio (${datos_b['precio']}) es MENOR que el del proveedor (${datos_a['precio']}) en `{datos_a['nombre_real']}`.")
+
+    # Guardar estado para la próxima vuelta
+    guardar_estado_actual({"productos_a": prod_a, "productos_b": prod_b})
+    print("--- Ciclo completado con éxito ---")
+
+if __name__ == "__main__":
+    print("Bot iniciado con éxito. Corriendo control de fondo...")
+    while True:
+        procesar_logica()
+        time.sleep(900)  # Chequea cada 15 minutos
             title_el = item.select_one('.item-name, .product-title, h2, .title')
             price_el = item.select_one('.item-price, .product-price, .price, .money')
             
