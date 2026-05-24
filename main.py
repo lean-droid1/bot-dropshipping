@@ -3,10 +3,20 @@ import time
 import json
 import requests
 from bs4 import BeautifulSoup
+import urllib3
 
-# Configuración desde las variables de Railway
-TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")
+# Desactivar advertencias de certificados SSL en el log
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+# Buscamos las variables limpiando cualquier espacio accidental que tengan en Railway
+TELEGRAM_TOKEN = None
+CHAT_ID = None
+
+for k, v in os.environ.items():
+    if "TELEGRAM_TOKEN" in k:
+        TELEGRAM_TOKEN = v.strip()
+    if "CHAT_ID" in k:
+        CHAT_ID = v.strip()
 
 URL_A = "https://rxzweb.com/tienda/?et_per_page=-1"
 URL_B = "https://leandroid.tiendanegocio.com/productos"
@@ -14,7 +24,7 @@ DB_FILE = "estado_productos.json"
 
 def enviar_telegram(mensaje):
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        print("❌ ERROR CRÍTICO: Las variables TELEGRAM_TOKEN o CHAT_ID están vacías en Railway.")
+        print(f"❌ ERROR CRÍTICO: Variables no detectadas. Claves en sistema: {[k for k in os.environ.keys() if 'TOKEN' in k or 'CHAT' in k]}")
         return
         
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
@@ -41,7 +51,6 @@ def guardar_estado_actual(estado):
 
 def scrapear_web_a():
     productos = {}
-    # Probamos con un agente de escritorio clásico para evitar bloqueos SSL transitorios
     headers = {
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
     }
@@ -127,7 +136,6 @@ def scrapear_web_b():
 def procesar_logica():
     print("--- Iniciando Chequeo de productos ---")
     
-    # PROBAMOS TELEGRAM AL PRINCIPIO DE TODO PARA SACARNOS LA DUDA YA
     print("Enviando señal de inicio a Telegram...")
     enviar_telegram("🤖 *Bot de Monitoreo Activo*\nIniciando ciclo de control de stock y precios...")
 
@@ -137,8 +145,9 @@ def procesar_logica():
     prod_b = scrapear_web_b()
     
     print(f"📊 Resumen: Web A: {len(prod_a)} | Web B: {len(prod_b)}")
+    
     if not prod_a:
-        print("❌ Freno preventivo: Proveedor vacío.")
+        print("⚠️ Nota: Proveedor vacío en este ciclo, se omiten comparaciones de stock.")
         return
 
     # REGLA 4: Alertas de productos nuevos
