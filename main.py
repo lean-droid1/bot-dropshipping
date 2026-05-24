@@ -4,6 +4,7 @@ import json
 import requests
 from bs4 import BeautifulSoup
 
+# Configuración desde las variables de Railway
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")
 
@@ -12,12 +13,22 @@ URL_B = "https://leandroid.tiendanegocio.com/productos"
 DB_FILE = "estado_productos.json"
 
 def enviar_telegram(mensaje):
+    if not TELEGRAM_TOKEN or not CHAT_ID:
+        print("❌ ERROR CRÍTICO: Las variables TELEGRAM_TOKEN o CHAT_ID están vacías en Railway.")
+        return
+        
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": mensaje, "parse_mode": "Markdown"}
+    
     try:
-        requests.post(url, json=payload, timeout=10)
+        response = requests.post(url, json=payload, timeout=15)
+        # Si Telegram devuelve un error (ej: Código 400 o 401), esto lo expone en el log
+        if response.status_code != 200:
+            print(f"❌ ERROR DE TELEGRAM (Código {response.status_code}): {response.text}")
+        else:
+            print("🚀 Mensaje enviado a Telegram con éxito.")
     except Exception as e:
-        print(f"Error Telegram: {e}")
+        print(f"❌ Error de conexión al intentar hablar con Telegram: {e}")
 
 def cargar_estado_anterior():
     if os.path.exists(DB_FILE):
@@ -130,7 +141,8 @@ def procesar_logica():
         print("❌ Freno preventivo: Proveedor vacío.")
         return
 
-    # MENSAJE DE CONTROL DIRECTO A TELEGRAM
+    # MENSAJE DE CONTROL DIRECTO
+    print("Intentando enviar reporte a Telegram...")
     enviar_telegram(f"✅ *Control Automático Ejecutado*\nEl bot escaneó {len(prod_a)} productos en el proveedor y {len(prod_b)} en tu tienda con éxito.")
 
     # REGLA 4: Alertas de productos nuevos
@@ -143,7 +155,7 @@ def procesar_logica():
         for nombre_b, datos_b in prod_b.items():
             if nombre_a in nombre_b or nombre_b in nombre_a:
                 if not datos_a["stock"] and datos_b["stock"]:
-                    enviar_telegram(f"⚠️ *Alerta Stock:* Proveedor SIN STOCK de `{datos_a['nombre_real']}` (En tu web figura disponible).")
+                    enviar_telegram(f"⚠️ *Alerta Stock:* El proveedor NO tiene stock de `{datos_a['nombre_real']}`, pero en tu tienda figura como DISPONIBLE.")
                 if datos_b["precio"] < datos_a["precio"] and datos_b["precio"] > 0:
                     enviar_telegram(f"📉 *Alerta Precio:* Tu precio (${datos_b['precio']}) es MENOR que el del proveedor (${datos_a['precio']}) en `{datos_a['nombre_real']}`.")
 
