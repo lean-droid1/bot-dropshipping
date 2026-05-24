@@ -61,16 +61,26 @@ def guardar_estado_actual(estado):
     except Exception as e:
         print(f"❌ Error al guardar la base de datos local: {e}")
 
-def limpiar_precio(texto_precio):
-    if not texto_precio:
+def limpiar_precio(html_precio):
+    """Limpia el precio manejando ofertas (<ins>) y formatos con coma decimal"""
+    if not html_precio:
         return 0
     try:
-        texto = " ".join(texto_precio.split())
-        bloques = re.findall(r'\$\s*[\d\.\,]+', texto)
-        if bloques:
-            texto = bloques[-1]
+        # Si es un objeto de BeautifulSoup, buscamos si hay una oferta (tag <ins>)
+        if hasattr(html_precio, 'find'):
+            ins_tag = html_precio.find('ins')
+            if ins_tag:
+                texto = ins_tag.text.strip()
+            else:
+                texto = html_precio.text.strip()
+        else:
+            texto = str(html_precio).strip()
+
+        # Si el texto contiene una coma de decimales (ej: ,00), tiramos lo que esté después
         if "," in texto:
             texto = texto.split(",")[0]
+            
+        # Nos quedamos solo con los números pura y exclusivamente
         precio_numerico = ''.join(filter(str.isdigit, texto))
         return int(precio_numerico) if precio_numerico else 0
     except Exception:
@@ -117,9 +127,8 @@ def scrapear_web_a():
             return productos
 
         soup = BeautifulSoup(response.text, 'lxml')
-        items = soup.find_all(['li', 'div'], class_=lambda x: x and 'product' in x)
-        if len(items) == 0:
-            items = soup.select('ul.products li') or soup.find_all('div', class_='product-grid-item')
+        # Selector genérico ultra-amplio para capturar estructuras Woocommerce fijas y dinámicas
+        items = soup.select('.product') or soup.find_all(['li', 'div'], class_=lambda x: x and 'product' in x)
 
         for item in items:
             title_el = item.find(['h2', 'h3', 'h4', 'a', 'p'], class_=lambda x: x and ('title' in x or 'woocommerce-loop' in x or 'name' in x))
@@ -129,8 +138,11 @@ def scrapear_web_a():
 
             if title_el and price_el and title_el.text.strip():
                 nombre_original = title_el.text.strip()
+                # Parche: Evitar capturar bloques vacíos o contenedores de categorías
+                if len(nombre_original) < 3:
+                    continue
                 nombre_clave = " ".join(nombre_original.lower().split())
-                precio = limpiar_precio(price_el.text)
+                precio = limpiar_precio(price_el)
                 if precio > 0:
                     productos[nombre_clave] = {
                         "nombre_real": nombre_original,
@@ -162,7 +174,7 @@ def scrapear_web_b():
                     nombre_original = title_el.text.strip()
                     nombre_clave = " ".join(nombre_original.lower().split())
                     if nombre_clave not in productos:
-                        precio = limpiar_precio(price_el.text)
+                        precio = limpiar_precio(price_el)
                         texto_producto = item.text.lower()
                         tiene_stock = "sin stock" not in texto_producto and "agotado" not in texto_producto
                         if precio > 0:
@@ -225,13 +237,15 @@ def procesar_logica():
         # CASO 1: El producto está ACTIVO en tu web
         if datos_b["stock"]:
             if not encontrado_en_proveedor:
-                msg_stock = (
-                    f"⚠️ *Alerta de Stock:*\n"
-                    f"{datos_b['nombre_real']}\n\n"
-                    f"❌ *Proveedor:* SIN STOCK (Eliminado de su web)\n"
-                    f"✅ *Tu Web:* Disponible"
-                )
-                enviar_telegram(msg_stock)
+                # Evitamos alertar si el producto se llama literalmente "Productos" por un error de tag
+                if len(datos_b['nombre_real']) > 3 and datos_b['nombre_real'].lower() != "productos":
+                    msg_stock = (
+                        f"⚠️ *Alerta de Stock:*\n"
+                        f"{datos_b['nombre_real']}\n\n"
+                        f"❌ *Proveedor:* SIN STOCK (Eliminado de su web)\n"
+                        f"✅ *Tu Web:* Disponible"
+                    )
+                    enviar_telegram(msg_stock)
                 
             elif datos_a_coincidente and datos_b["precio"] < datos_a_coincidente["precio"]:
                 msg_precio = (
@@ -242,13 +256,11 @@ def procesar_logica():
                 )
                 enviar_telegram(msg_precio)
 
-        # NUEVA REGLA - CASO 2: El producto está SIN STOCK (Pausado) en tu web, pero volvió al proveedor
+        # CASO 2: El producto está SIN STOCK (Pausado) en tu web, pero volvió al proveedor (Opción 3)
         else:
             if encontrado_en_proveedor and datos_a_coincidente:
-                # Sacamos el historial para verificar si efectivamente antes el proveedor tampoco lo tenía
                 estaba_en_proveedor_antes = clave_b in estado_anterior.get("productos_a", {}) or any(son_coincidentes_inteligentes(clave_b, ca) for ca in estado_anterior.get("productos_a", {}).keys())
                 
-                # Si el proveedor antes no lo tenía (o el bot arranca de cero) y ahora sí, mandamos alerta de reactivación
                 if not estaba_en_proveedor_antes or db_vacia:
                     msg_recuperado = (
                         f"🔄 *¡Stock Recuperado en Proveedor!*\n"
