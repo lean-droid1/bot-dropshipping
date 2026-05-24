@@ -56,21 +56,12 @@ def limpiar_precio(texto_precio):
     if not texto_precio:
         return 0
     try:
-        # Remover espacios extraños y saltos de línea
         texto = " ".join(texto_precio.split())
-        
-        # Si la etiqueta trae múltiples precios (ej. oferta tachada y precio nuevo),
-        # buscamos todos los bloques que tengan pinta de precio monetario
         bloques = re.findall(r'\$\s*[\d\.\,]+', texto)
         if bloques:
-            # Nos quedamos siempre con el último bloque de precio (suele ser el valor actual/vigente)
             texto = bloques[-1]
-            
-        # Si contiene coma de centavos (ej: ,00), cortamos para ignorar la parte decimal
         if "," in texto:
             texto = texto.split(",")[0]
-            
-        # Filtramos y nos quedamos únicamente con los dígitos numéricos finales
         precio_numerico = ''.join(filter(str.isdigit, texto))
         return int(precio_numerico) if precio_numerico else 0
     except Exception:
@@ -109,19 +100,13 @@ def scrapear_web_a():
             if title_el and price_el and title_el.text.strip():
                 nombre_original = title_el.text.strip()
                 nombre_clave = nombre_original.lower().replace("  ", " ")
-                
                 precio = limpiar_precio(price_el.text)
                 
-                texto_item = item.text.lower()
-                clases = item.get('class', [])
-                tiene_stock = not ("sin stock" in texto_item or "agotado" in texto_item or "out-of-stock" in clases)
-                
-                # Evitamos guardar basura si el precio no se pudo procesar bien
                 if precio > 0:
                     productos[nombre_clave] = {
                         "nombre_real": nombre_original,
                         "precio": precio,
-                        "stock": tiene_stock
+                        "stock": True  # Si aparece en su web, es porque TIENE stock
                     }
     except Exception as e:
         print(f"❌ Error en scraping de Web A: {e}")
@@ -157,7 +142,6 @@ def scrapear_web_b():
                     
                     if nombre_clave not in productos:
                         precio = limpiar_precio(price_el.text)
-                        
                         texto_producto = item.text.lower()
                         tiene_stock = "sin stock" not in texto_producto and "agotado" not in texto_producto
                         
@@ -204,37 +188,47 @@ def procesar_logica():
                 )
                 enviar_telegram(msg_nuevo)
 
-    # REGLAS DE COMPARACIÓN CRUZADA (PROVEEDOR vs TU WEB)
-    for clave_a, datos_a in prod_a.items():
-        for clave_b, datos_b in prod_b.items():
-            if clave_a in clave_b or clave_b in clave_a:
-                
-                # REGLA 2: Alerta de Stock Desincronizado (Simplificada)
-                if not datos_a["stock"] and datos_b["stock"]:
-                    msg_stock = (
-                        f"⚠️ *Alerta de Stock:*\n"
-                        f"{datos_a['nombre_real']}\n\n"
-                        f"❌ *Proveedor:* SIN STOCK\n"
-                        f"✅ *Tu Web:* Disponible"
-                    )
-                    enviar_telegram(msg_stock)
-                
-                # REGLA 3: Alerta de Precio Bajo (Simplificada con tu estructura limpia)
-                if datos_b["precio"] < datos_a["precio"] and datos_b["precio"] > 0:
-                    msg_precio = (
-                        f"📉 *Alerta de precio:*\n"
-                        f"{datos_a['nombre_real']}\n\n"
-                        f"📱 *Tu web:* ${datos_b['precio']:,}\n"
-                        f"📦 *Web proveedor:* ${datos_a['precio']:,}"
-                    )
-                    enviar_telegram(msg_precio)
+    # NUEVA LÓGICA DE CONTROL DE STOCK Y PRECIOS
+    # Recorremos tus productos (Web B) y verificamos si existen en el Proveedor (Web A)
+    for clave_b, datos_b in prod_b.items():
+        if not datos_b["stock"]:
+            continue  # Si vos ya lo tenés sin stock, no hace falta analizarlo
+            
+        # Buscamos si tu producto activo tiene un equivalente en el catálogo actual del proveedor
+        encontrado_en_proveedor = False
+        datos_a_coincidente = None
+        
+        for clave_a, datos_a in prod_a.items():
+            if clave_b in clave_a or clave_a in clave_b:
+                encontrado_en_proveedor = True
+                datos_a_coincidente = datos_a
+                break
+        
+        # SI VOS LO TENÉS DISPONIBLE, PERO EL PROVEEDOR LO BORRÓ (No encontrado = Sin Stock)
+        if not encontrado_en_proveedor:
+            msg_stock = (
+                f"⚠️ *Alerta de Stock:*\n"
+                f"{datos_b['nombre_real']}\n\n"
+                f"❌ *Proveedor:* SIN STOCK (Eliminado de su web)\n"
+                f"✅ *Tu Web:* Disponible"
+            )
+            enviar_telegram(msg_stock)
+            
+        # SI SÍ EXISTE EN AMBAS WEBS, COMPARAMOS EL PRECIO
+        elif datos_a_coincidente and datos_b["precio"] < datos_a_coincidente["precio"]:
+            msg_precio = (
+                f"📉 *Alerta de precio:*\n"
+                f"{datos_b['nombre_real']}\n\n"
+                f"📱 *Tu web:* ${datos_b['precio']:,}\n"
+                f"📦 *Web proveedor:* ${datos_a_coincidente['precio']:,}"
+            )
+            enviar_telegram(msg_precio)
 
     guardar_estado_actual({"productos_a": prod_a, "productos_b": prod_b})
     print("--- ✅ Ciclo completado y base de datos actualizada ---")
 
 if __name__ == "__main__":
     print("🚀 Bot de Control Iniciado Exitosamente...")
-    
     while True:
         procesar_logica()
         print("💤 Esperando 30 minutos hasta el próximo control...")
