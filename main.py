@@ -44,30 +44,45 @@ def guardar_estado_actual(estado):
 
 def scrapear_web_a():
     productos = {}
-    # Headers hiper-realistas de navegador moderno para evitar bloqueos
+    
+    # Cabeceras de nivel navegador real para saltar bloqueos 403 / Cloudflare
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-        'Accept-Language': 'es-ES,es;q=0.9',
-        'Cache-Control': 'no-cache',
-        'Pragma': 'no-cache'
+        'Accept-Language': 'es-419,es;q=0.9,en;q=0.8',
+        'Accept-Encoding': 'gzip, deflate, br',
+        'Connection': 'keep-alive',
+        'Upgrade-Insecure-Requests': '1',
+        'Sec-Ch-Ua': '"Chromium";v="124", "Google Chrome";v="124", "Not-A.Brand";v="99"',
+        'Sec-Ch-Ua-Mobile': '?0',
+        'Sec-Ch-Ua-Platform': '"Windows"',
+        'Sec-Fetch-Dest': 'document',
+        'Sec-Fetch-Mode': 'navigate',
+        'Sec-Fetch-Site': 'none',
+        'Sec-Fetch-User': '?1'
     }
+    
     try:
         session = requests.Session()
-        response = session.get(URL_A, headers=headers, timeout=35, verify=False)
+        # Forzamos a la sesión a mantener las cabeceras activas
+        session.headers.update(headers)
+        
+        print("Consultando Web A (Proveedor)...")
+        response = session.get(URL_A, timeout=45, verify=False)
+        
+        print(f"Respuesta Web A - Código de estado: {response.status_code}")
         
         if response.status_code != 200:
-            print(f"⚠️ Web A respondió con código erróneo: {response.status_code}")
             return productos
 
         soup = BeautifulSoup(response.text, 'lxml')
         
-        # Estrategia 1: Mapeo clásico por clases Woocommerce estándar
+        # Intentar capturar por múltiples selectores comunes de WooCommerce
         items = soup.find_all(['li', 'div'], class_=lambda x: x and 'product' in x)
         
-        # Estrategia 2: Por si cambiaron las clases, buscamos contenedores comunes de productos
         if len(items) == 0:
-            items = soup.find_all('div', class_=lambda x: x and ('item' in x or 'card' in x or 'grid' in x))
+            # Selector alternativo si cambia la estructura de grilla
+            items = soup.select('ul.products li') or soup.find_all('div', class_='product-grid-item')
 
         for item in items:
             title_el = item.find(['h2', 'h3', 'h4', 'a', 'p'], class_=lambda x: x and ('title' in x or 'woocommerce-loop' in x or 'name' in x))
@@ -177,4 +192,5 @@ if __name__ == "__main__":
     print("Bot iniciado con éxito. Corriendo...")
     while True:
         procesar_logica()
-        time.sleep(1200) # Subimos el intervalo a 20 min para mitigar bloqueos por IP
+        time.sleep(1800) # Subimos el intervalo a 30 min para no saturar y evitar bloqueos por IP
+
