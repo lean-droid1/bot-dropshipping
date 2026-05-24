@@ -9,10 +9,22 @@ import imaplib
 import email
 from email.header import decode_header
 
-# Desactivar advertencias de certificados SSL
+# Desactivar advertencias de certificados SSL para evitar ruidos en consola
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Configuración de variables de entorno de Railway
+# Configuración de URLs y Base de Datos local
+URL_A = "https://rxzweb.com/tienda/?et_per_page=-1"
+URL_B = "https://leandroid.tiendanegocio.com/productos"
+DB_FILE = "estado_productos.json"
+
+# LISTA DE MARCAS Y PALABRAS DE INTERÉS PARA ALERTAS DE NUEVOS/OFERTAS
+PALABRAS_INTERES = [
+    'ma ant', 'amaoe', '2uul', 'goot wick', 'mijing', 'louwei', 
+    'rf4', 'jakemy', 'kailiwei', 'kslid', 'aifen', 'sugon', 'jcid',
+    'organizador', 'cinta', 'silla', 'mesa', 'puas', 'hilo', 'cepillo'
+]
+
+# Captura limpia de variables de entorno de Railway
 TELEGRAM_TOKEN = None
 CHAT_ID = None
 SCRAPERAPI_KEY = None
@@ -26,16 +38,6 @@ for k, v in os.environ.items():
     if "GMAIL_USER" in k: GMAIL_USER = v.strip()
     if "GMAIL_PASS" in k: GMAIL_PASS = v.strip()
 
-URL_A = "https://rxzweb.com/tienda/?et_per_page=-1"
-URL_B = "https://leandroid.tiendanegocio.com/productos"
-DB_FILE = "estado_productos.json"
-
-# LISTA DE MARCAS Y PALABRAS DE INTERÉS
-PALABRAS_INTERES = [
-    'ma ant', 'amaoe', '2uul', 'goot wick', 'mijing', 'louwei', 
-    'rf4', 'jakemy', 'kailiwei', 'kslid', 'aifen', 'sugon', 'jcid',
-    'organizador', 'cinta', 'silla', 'mesa', 'puas', 'hilo', 'cepillo'
-]
 
 def enviar_telegram(mensaje):
     if not TELEGRAM_TOKEN or not CHAT_ID:
@@ -49,6 +51,7 @@ def enviar_telegram(mensaje):
     except Exception as e:
         print(f"❌ Error al enviar a Telegram: {e}")
 
+
 def cargar_estado_anterior():
     if os.path.exists(DB_FILE):
         try:
@@ -61,6 +64,7 @@ def cargar_estado_anterior():
             return {"productos_a": {}, "productos_b": {}, "pedidos_procesados": []}
     return {"productos_a": {}, "productos_b": {}, "pedidos_procesados": []}
 
+
 def guardar_estado_actual(estado):
     try:
         with open(DB_FILE, "w", encoding="utf-8") as f:
@@ -68,11 +72,13 @@ def guardar_estado_actual(estado):
     except Exception as e:
         print(f"❌ Error al guardar la base de datos local: {e}")
 
+
 def limpiar_precio_simple(texto):
     if not texto: return 0
     if "," in texto: texto = texto.split(",")[0]
     precio_numerico = ''.join(filter(str.isdigit, texto))
     return int(precio_numerico) if precio_numerico else 0
+
 
 def procesar_html_precio(html_precio):
     if not html_precio: return 0, 0, False
@@ -88,10 +94,12 @@ def procesar_html_precio(html_precio):
     except Exception:
         return 0, 0, False
 
+
 def son_coincidentes_inteligentes(nombre1, nombre2):
     n1 = nombre1.lower()
     n2 = nombre2.lower()
     
+    # Bloqueo estricto para evitar falsos positivos cruzados (ej: Mesa normal vs Mesa MINI)
     palabras_criticas = ['mini', 'pro', 'plus', 'max', 'kit', 'ultra', 'xl', 'lw-a1']
     for pc in palabras_criticas:
         if (pc in n1 and pc not in n2) or (pc in n2 and pc not in n1):
@@ -117,6 +125,7 @@ def son_coincidentes_inteligentes(nombre1, nombre2):
     menor_cantidad = min(len(palabras_n1), len(palabras_n2))
     return (len(comunes) / menor_cantidad) >= 0.85
 
+
 def extraer_productos_del_mail(cuerpo_texto):
     productos_encontrados = []
     lineas = cuerpo_texto.split('\n')
@@ -139,6 +148,7 @@ def extraer_productos_del_mail(cuerpo_texto):
                     productos_encontrados.append({"nombre": nombre_prod, "cantidad": cantidad})
     return productos_encontrados
 
+
 def chequear_nuevos_pedidos_gmail():
     pedidos = []
     if not GMAIL_USER or not GMAIL_PASS:
@@ -149,23 +159,21 @@ def chequear_nuevos_pedidos_gmail():
         print("📬 Conectando a Gmail para revisar pedidos...")
         mail = imaplib.IMAP4_SSL("imap.gmail.com")
         mail.login(GMAIL_USER, GMAIL_PASS)
-        
-        # Seleccionamos 'inbox' pero dejamos registro en el log
         mail.select("inbox")
         
-        # Buscamos correos de tiendanegocio.com de manera más amplia para ver si los detecta
+        # Escaneo general para agarrar cualquier correo del remitente de la tienda
         status, mensajes = mail.search(None, '(FROM "tiendanegocio.com")')
         
         if status != "OK" or not mensajes[0]:
-            print("✉️ Info Gmail: No se encontraron correos recientes de 'tiendanegocio.com' en la bandeja principal.")
+            print("✉️ Info Gmail: No se encontraron correos de 'tiendanegocio.com' en la bandeja principal.")
             mail.close()
             mail.logout()
             return pedidos
             
         id_lista = mensajes[0].split()
-        print(f"📩 Info Gmail: Se detectaron {len(id_lista)} correos de Tienda Negocio. Analizando los últimos...")
+        print(f"📩 Info Gmail: Se detectaron {len(id_lista)} correos en total en el servidor. Analizándolos...")
         
-        for msg_id in id_lista[-5:]:
+        for msg_id in id_lista:
             str_id = msg_id.decode()
             res, data = mail.fetch(msg_id, "(RFC822)")
             if res != "OK": continue
@@ -178,9 +186,12 @@ def chequear_nuevos_pedidos_gmail():
                 subject = subject.decode(encoding or "utf-8")
             
             sender = msg["From"]
-            print(f"🔍 Analizando Mail ID #{str_id} | De: {sender} | Asunto: {subject}")
+            asunto_minuscula = subject.lower()
+            
+            # Filtro optimizado incluyendo "venta" para capturar "Nueva venta #..."
+            if any(palabra in asunto_minuscula for palabra in ["compra", "realizó", "pedido", "venta"]):
+                print(f"🔍 Evaluando Mail ID #{str_id} | De: {sender} | Asunto: {subject}")
                 
-            if "compra" in subject.lower() or "realizó" in subject.lower() or "pedido" in subject.lower():
                 cuerpo = ""
                 if msg.is_multipart():
                     for part in msg.walk():
@@ -204,6 +215,7 @@ def chequear_nuevos_pedidos_gmail():
     except Exception as e:
         print(f"❌ Error leyendo Gmail: {e}")
     return pedidos
+
 
 def verificar_pedido_contra_proveedor(pedido, prod_proveedor):
     reporte = f"🛒 *¡Nuevo Pedido Recibido en tu Web! (Ref Mail: #{pedido['id_mail']})*\n\n"
@@ -238,6 +250,7 @@ def verificar_pedido_contra_proveedor(pedido, prod_proveedor):
         reporte += "⚠️ *Verificación:* ¡Atención! Hay faltantes en la web del proveedor."
     return reporte
 
+
 def scrapear_web_a():
     productos = {}
     if not SCRAPERAPI_KEY:
@@ -246,6 +259,7 @@ def scrapear_web_a():
 
     target_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={URL_A}"
     try:
+        print("Consultando Web A (Proveedor) mediante túnel ScraperAPI...")
         response = requests.get(target_url, timeout=60, verify=False)
         if response.status_code != 200: return productos
         
@@ -274,6 +288,7 @@ def scrapear_web_a():
         print(f"❌ Error en scraping de Web A con ScraperAPI: {e}")
     return productos
 
+
 def scrapear_web_b():
     productos = {}
     pagina_actual = 1
@@ -281,6 +296,7 @@ def scrapear_web_b():
     while True:
         url = URL_B if pagina_actual == 1 else f"{URL_B}?page={pagina_actual}"
         try:
+            print(f"Scrapeando Tu Tienda (Web B) - Página {pagina_actual}...")
             response = requests.get(url, headers=headers, timeout=30)
             if response.status_code != 200: break
             soup = BeautifulSoup(response.text, 'lxml')
@@ -312,18 +328,18 @@ def scrapear_web_b():
             break
     return productos
 
+
 def procesar_logica():
     print("\n--- 🔄 Iniciando Nuevo Ciclo de Monitoreo ---")
     estado_anterior = cargar_estado_anterior()
     db_vacia = len(estado_anterior.get("productos_a", {})) == 0
     pedidos_procesados = estado_anterior.get("pedidos_procesados", [])
 
-    # CONTROL DE PEDIDOS DESDE GMAIL PRIMERO PARA AUDITAR LOGS
+    # 1. ESCANEO DE CORREOS (GMAIL) PRIMERO PARA AGARRAR COMPRAS INMEDIATAS
     pedidos_nuevos = chequear_nuevos_pedidos_gmail()
 
-    print("Consultando Web A (Proveedor) mediante túnel ScraperAPI...")
+    # 2. SCRAPING DE AMBAS WEBS
     prod_a = scrapear_web_a()
-    print("Scrapeando Tu Tienda (Web B)...")
     prod_b = scrapear_web_b()
     
     print(f"📊 Resumen: Web A (Proveedor): {len(prod_a)} | Web B (Tu tienda): {len(prod_b)}")
@@ -331,13 +347,14 @@ def procesar_logica():
         print("⚠️ Freno preventivo: El proveedor devolvió 0 productos.")
         return
 
+    # 3. VERIFICACIÓN Y ALERTA DE NUEVOS PEDIDOS A TELEGRAM
     for ped in pedidos_nuevos:
         if ped["id_mail"] not in pedidos_procesados:
             msg_reporte = verificar_pedido_contra_proveedor(ped, prod_a)
             enviar_telegram(msg_reporte)
             pedidos_procesados.append(ped["id_mail"])
 
-    # ALERTAS DE OFERTAS Y NUEVOS PRODUCTOS
+    # 4. ALERTAS DE OFERTAS Y NUEVOS PRODUCTOS (PROVEEDOR)
     if not db_vacia:
         for nombre_clave, datos in prod_a.items():
             interesa_producto = any(p in nombre_clave for p in PALABRAS_INTERES)
@@ -365,7 +382,7 @@ def procesar_logica():
                     )
                     enviar_telegram(msg_oportunidad)
 
-    # COMPARACIÓN DE PRECIO Y STOCK GENERAL
+    # 5. COMPARACIÓN GENERAL DE PRECIOS Y STOCK (TU TIENDA VS PROVEEDOR)
     for clave_b, datos_b in prod_b.items():
         encontrado_en_proveedor = False
         datos_a_coincidente = None
@@ -405,8 +422,10 @@ def procesar_logica():
                     )
                     enviar_telegram(msg_recuperado)
 
+    # Guardamos el estado para el siguiente ciclo de control
     guardar_estado_actual({"productos_a": prod_a, "productos_b": prod_b, "pedidos_procesados": pedidos_procesados})
     print("--- ✅ Ciclo completado e informe procesado ---")
+
 
 if __name__ == "__main__":
     print("🚀 Bot de Control Iniciado Espectacularmente...")
