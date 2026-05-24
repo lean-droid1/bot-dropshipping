@@ -91,7 +91,9 @@ def procesar_html_precio(html_precio):
 def son_coincidentes_inteligentes(nombre1, nombre2):
     n1 = nombre1.lower()
     n2 = nombre2.lower()
-    palabras_criticas = ['mini', 'pro', 'plus', 'max', 'kit', 'ultra', 'xl']
+    
+    # Control estricto de variantes críticas para evitar falsos positivos (Mesa vs Mesa Mini)
+    palabras_criticas = ['mini', 'pro', 'plus', 'max', 'kit', 'ultra', 'xl', 'lw-a1']
     for pc in palabras_criticas:
         if (pc in n1 and pc not in n2) or (pc in n2 and pc not in n1):
             return False
@@ -114,10 +116,9 @@ def son_coincidentes_inteligentes(nombre1, nombre2):
         if numeros_n1 != numeros_n2: return False
             
     menor_cantidad = min(len(palabras_n1), len(palabras_n2))
-    return (len(comunes) / menor_cantidad) >= 0.80
+    return (len(comunes) / menor_cantidad) >= 0.85
 
 def extraer_productos_del_mail(cuerpo_texto):
-    """Parsea las líneas del mail de TiendaNegocio bajo el bloque Productos:"""
     productos_encontrados = []
     lineas = cuerpo_texto.split('\n')
     en_bloque_productos = False
@@ -132,7 +133,6 @@ def extraer_productos_del_mail(cuerpo_texto):
                 en_bloque_productos = False
                 continue
             if linea_limpia.startswith('-'):
-                # Formato esperado: - Nombre Producto x1 - $Precio
                 match = re.match(r'-\s*(.+?)\s+x(\d+)\s*-', linea_limpia)
                 if match:
                     nombre_prod = match.group(1).strip()
@@ -141,7 +141,6 @@ def extraer_productos_del_mail(cuerpo_texto):
     return productos_encontrados
 
 def chequear_nuevos_pedidos_gmail():
-    """Se conecta de forma segura a Gmail e identifica mails de nuevas ventas sin procesar"""
     pedidos = []
     if not GMAIL_USER or not GMAIL_PASS:
         print("⚠️ Variables de Gmail ausentes en Railway. Se omite control de mails.")
@@ -152,7 +151,6 @@ def chequear_nuevos_pedidos_gmail():
         mail.login(GMAIL_USER, GMAIL_PASS)
         mail.select("inbox")
         
-        # Filtramos correos del remitente oficial de alertas de la tienda
         status, mensajes = mail.search(None, '(FROM "ventas@tiendanegocio.com")')
         if status != "OK" or not mensajes[0]:
             mail.close()
@@ -160,7 +158,6 @@ def chequear_nuevos_pedidos_gmail():
             return pedidos
             
         id_lista = mensajes[0].split()
-        # Analizamos los últimos 10 correos recibidos para optimizar tiempos
         for msg_id in id_lista[-10:]:
             str_id = msg_id.decode()
             res, data = mail.fetch(msg_id, "(RFC822)")
@@ -169,7 +166,6 @@ def chequear_nuevos_pedidos_gmail():
             raw_email = data[0][1]
             msg = email.message_from_bytes(raw_email)
             
-            # Obtener Asunto
             subject, encoding = decode_header(msg["Subject"])[0]
             if isinstance(subject, bytes):
                 subject = subject.decode(encoding or "utf-8")
@@ -231,19 +227,16 @@ def verificar_pedido_contra_proveedor(pedido, prod_proveedor):
 
 def scrapear_web_a():
     productos = {}
-    if SCRAPERAPI_KEY:
-        target_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={URL_A}"
-        headers = None
-    else:
-        target_url = URL_A
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept-Language': 'es-419,es;q=0.9,en;q=0.8'
-        }
+    if not SCRAPERAPI_KEY:
+        print("❌ ERROR CRÍTICO: SCRAPERAPI_KEY no configurada en Railway.")
+        return productos
+
+    target_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={URL_A}"
     try:
-        print("Consultando Web A (Proveedor)...")
-        response = requests.get(target_url, headers=headers, timeout=60, verify=False)
+        print("Consultando Web A (Proveedor) mediante túnel ScraperAPI...")
+        response = requests.get(target_url, timeout=60, verify=False)
         if response.status_code != 200: return productos
+        
         soup = BeautifulSoup(response.text, 'lxml')
         items = soup.select('.product') or soup.find_all(['li', 'div'], class_=lambda x: x and 'product' in x)
 
@@ -254,7 +247,7 @@ def scrapear_web_a():
 
             if title_el and price_el and title_el.text.strip():
                 nombre_original = title_el.text.strip()
-                if len(nombre_original) < 3: continue
+                if len(nombre_original) < 4 or nombre_original.lower() == "productos": continue
                 nombre_clave = " ".join(nombre_original.lower().split())
                 precio, precio_anterior, en_oferta = procesar_html_precio(price_el)
                 if precio > 0:
@@ -266,7 +259,7 @@ def scrapear_web_a():
                         "stock": True
                     }
     except Exception as e:
-        print(f"❌ Error en scraping de Web A: {e}")
+        print(f"❌ Error en scraping de Web A con ScraperAPI: {e}")
     return productos
 
 def scrapear_web_b():
@@ -276,6 +269,7 @@ def scrapear_web_b():
     while True:
         url = URL_B if pagina_actual == 1 else f"{URL_B}?page={pagina_actual}"
         try:
+            print(f"Scrapeando Tu Tienda (Web B) - Página {pagina_actual}...")
             response = requests.get(url, headers=headers, timeout=30)
             if response.status_code != 200: break
             soup = BeautifulSoup(response.text, 'lxml')
@@ -286,6 +280,7 @@ def scrapear_web_b():
                 price_el = item.find(class_=lambda x: x and ('price' in x or 'precio' in x or 'money' in x))
                 if title_el and price_el and title_el.text.strip():
                     nombre_original = title_el.text.strip()
+                    if len(nombre_original) < 4 or nombre_original.lower() == "productos": continue
                     nombre_clave = " ".join(nombre_original.lower().split())
                     if nombre_clave not in productos:
                         precio, _, _ = procesar_html_precio(price_el)
@@ -358,7 +353,6 @@ def procesar_logica():
 
     # COMPARACIÓN DE PRECIO Y STOCK GENERAL
     for clave_b, datos_b in prod_b.items():
-        if len(datos_b['nombre_real']) <= 3 or datos_b['nombre_real'].lower() == "productos": continue
         encontrado_en_proveedor = False
         datos_a_coincidente = None
         
@@ -397,7 +391,7 @@ def procesar_logica():
                     )
                     enviar_telegram(msg_recuperado)
 
-    guardar_estado_actual({"productos_a": prod_a, "productos_b": prod_b, "pedidos_procesados": pedidos_procesados})
+    guardar_estado_actual({"productos_a": prod_a, "productos_b": prod_b, "pedidos_processed": pedidos_procesados})
     print("--- ✅ Ciclo completado e informe procesado ---")
 
 if __name__ == "__main__":
