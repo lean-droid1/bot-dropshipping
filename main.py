@@ -12,12 +12,15 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # Configuración de variables de entorno de Railway
 TELEGRAM_TOKEN = None
 CHAT_ID = None
+SCRAPERAPI_KEY = None
 
 for k, v in os.environ.items():
     if "TELEGRAM_TOKEN" in k:
         TELEGRAM_TOKEN = v.strip()
     if "CHAT_ID" in k:
         CHAT_ID = v.strip()
+    if "SCRAPERAPI_KEY" in k:
+        SCRAPERAPI_KEY = v.strip()
 
 URL_A = "https://rxzweb.com/tienda/?et_per_page=-1"
 URL_B = "https://leandroid.tiendanegocio.com/productos"
@@ -52,7 +55,6 @@ def guardar_estado_actual(estado):
         print(f"❌ Error al guardar la base de datos local: {e}")
 
 def limpiar_precio(texto_precio):
-    """Limpia de forma avanzada el texto para extraer el precio neto entero correcto"""
     if not texto_precio:
         return 0
     try:
@@ -68,58 +70,47 @@ def limpiar_precio(texto_precio):
         return 0
 
 def son_coincidentes_inteligentes(nombre1, nombre2):
-    """
-    Verifica si dos nombres de productos se refieren al mismo artículo
-    analizando palabras clave significativas y descartando conectores.
-    """
-    # Limpiamos caracteres raros y pasamos a minúsculas
     n1 = re.sub(r'[^a-z0-9 ]', ' ', nombre1.lower())
     n2 = re.sub(r'[^a-z0-9 ]', ' ', nombre2.lower())
-    
     palabras_n1 = set(n1.split())
     palabras_n2 = set(n2.split())
-    
-    # Palabras irrelevantes que suelen inflar coincidencias falsas
     descartables = {'de', 'para', 'con', 'el', 'la', 'los', 'las', 'un', 'una', 'y', 'en', 'del', 'al'}
-    
     palabras_n1 = palabras_n1 - descartables
     palabras_n2 = palabras_n2 - descartables
-    
     if not palabras_n1 or not palabras_n2:
         return False
-        
-    # Calculamos la intersección (palabras que tienen en común)
     comunes = palabras_n1.intersection(palabras_n2)
-    
-    # Condición estricta: si tienen números o modelos (ej: T210, 0.01, 12), Tienen que coincidir sí o sí
     numeros_n1 = {w for w in palabras_n1 if any(char.isdigit() for char in w)}
     numeros_n2 = {w for w in palabras_n2 if any(char.isdigit() for char in w)}
-    
     if numeros_n1 or numeros_n2:
-        # Si uno tiene un número/modelo que el otro no tiene en común, NO son el mismo producto
         if numeros_n1 != numeros_n2:
             return False
-
-    # Exigimos un alto porcentaje de coincidencia en el resto de las palabras de la cadena más corta
     menor_cantidad = min(len(palabras_n1), len(palabras_n2))
     porcentaje_coincidencia = len(comunes) / menor_cantidad
-    
     return porcentaje_coincidencia >= 0.75
 
 def scrapear_web_a():
-    """Scraping del Proveedor (Web A)"""
+    """Scraping del Proveedor (Web A) usando túnel anti-bloqueos si está disponible"""
     productos = {}
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
-        'Accept-Language': 'es-419,es;q=0.9,en;q=0.8',
-        'Connection': 'keep-alive'
-    }
+    
+    # Si configuraste la clave en Railway, mutamos la petición a través del proxy rotativo
+    if SCRAPERAPI_KEY:
+        print("🔗 Utilizando túnel anti-bloqueos (ScraperAPI)...")
+        target_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={URL_A}"
+        headers = None
+    else:
+        print("⚠️ Modo clásico activo (Sin proxy anti-bloqueos)...")
+        target_url = URL_A
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept-Language': 'es-419,es;q=0.9,en;q=0.8'
+        }
+        
     try:
         print("Consultando Web A (Proveedor)...")
-        session = requests.Session()
-        response = session.get(URL_A, headers=headers, timeout=45, verify=False)
+        response = requests.get(target_url, headers=headers, timeout=60, verify=False)
         
+        print(f"Respuesta Web A - Código de estado: {response.status_code}")
         if response.status_code != 200:
             return productos
 
@@ -152,12 +143,9 @@ def scrapear_web_a():
     return productos
 
 def scrapear_web_b():
-    """Scraping de Tu Tienda (Web B)"""
     productos = {}
     pagina_actual = 1
-    headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
-    }
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     
     while True:
         url = URL_B if pagina_actual == 1 else f"{URL_B}?page={pagina_actual}"
@@ -203,7 +191,6 @@ def scrapear_web_b():
 
 def procesar_logica():
     print("\n--- 🔄 Iniciando Nuevo Ciclo de Monitoreo ---")
-    
     estado_anterior = cargar_estado_anterior()
     db_vacia = len(estado_anterior.get("productos_a", {})) == 0
 
@@ -216,7 +203,6 @@ def procesar_logica():
         print("⚠️ Freno preventivo: El proveedor devolvió 0 productos. Esperando próxima vuelta.")
         return
 
-    # REGLA 1: Alertas de productos totalmente NUEVOS en el proveedor
     if not db_vacia:
         for nombre_clave, datos in prod_a.items():
             if nombre_clave not in estado_anterior.get("productos_a", {}):
@@ -227,7 +213,6 @@ def procesar_logica():
                 )
                 enviar_telegram(msg_nuevo)
 
-    # NUEVA COMPARACIÓN INTELIGENTE PALABRA POR PALABRA
     for clave_b, datos_b in prod_b.items():
         if not datos_b["stock"]:
             continue
@@ -241,7 +226,6 @@ def procesar_logica():
                 datos_a_coincidente = datos_a
                 break
         
-        # SI ESTÁ EN TU TIENDA PERO EL PROVEEDOR LO BORRÓ
         if not encontrado_en_proveedor:
             msg_stock = (
                 f"⚠️ *Alerta de Stock:*\n"
@@ -251,7 +235,6 @@ def procesar_logica():
             )
             enviar_telegram(msg_stock)
             
-        # SI ESTÁ EN AMBOS PERO TU PRECIO QUEDÓ MÁS BAJO QUE SU COSTO
         elif datos_a_coincidente and datos_b["precio"] < datos_a_coincidente["precio"]:
             msg_precio = (
                 f"📉 *Alerta de precio:*\n"
