@@ -67,6 +67,45 @@ def limpiar_precio(texto_precio):
     except Exception:
         return 0
 
+def son_coincidentes_inteligentes(nombre1, nombre2):
+    """
+    Verifica si dos nombres de productos se refieren al mismo artículo
+    analizando palabras clave significativas y descartando conectores.
+    """
+    # Limpiamos caracteres raros y pasamos a minúsculas
+    n1 = re.sub(r'[^a-z0-9 ]', ' ', nombre1.lower())
+    n2 = re.sub(r'[^a-z0-9 ]', ' ', nombre2.lower())
+    
+    palabras_n1 = set(n1.split())
+    palabras_n2 = set(n2.split())
+    
+    # Palabras irrelevantes que suelen inflar coincidencias falsas
+    descartables = {'de', 'para', 'con', 'el', 'la', 'los', 'las', 'un', 'una', 'y', 'en', 'del', 'al'}
+    
+    palabras_n1 = palabras_n1 - descartables
+    palabras_n2 = palabras_n2 - descartables
+    
+    if not palabras_n1 or not palabras_n2:
+        return False
+        
+    # Calculamos la intersección (palabras que tienen en común)
+    comunes = palabras_n1.intersection(palabras_n2)
+    
+    # Condición estricta: si tienen números o modelos (ej: T210, 0.01, 12), Tienen que coincidir sí o sí
+    numeros_n1 = {w for w in palabras_n1 if any(char.isdigit() for char in w)}
+    numeros_n2 = {w for w in palabras_n2 if any(char.isdigit() for char in w)}
+    
+    if numeros_n1 or numeros_n2:
+        # Si uno tiene un número/modelo que el otro no tiene en común, NO son el mismo producto
+        if numeros_n1 != numeros_n2:
+            return False
+
+    # Exigimos un alto porcentaje de coincidencia en el resto de las palabras de la cadena más corta
+    menor_cantidad = min(len(palabras_n1), len(palabras_n2))
+    porcentaje_coincidencia = len(comunes) / menor_cantidad
+    
+    return porcentaje_coincidencia >= 0.75
+
 def scrapear_web_a():
     """Scraping del Proveedor (Web A)"""
     productos = {}
@@ -99,14 +138,14 @@ def scrapear_web_a():
 
             if title_el and price_el and title_el.text.strip():
                 nombre_original = title_el.text.strip()
-                nombre_clave = nombre_original.lower().replace("  ", " ")
+                nombre_clave = " ".join(nombre_original.lower().split())
                 precio = limpiar_precio(price_el.text)
                 
                 if precio > 0:
                     productos[nombre_clave] = {
                         "nombre_real": nombre_original,
                         "precio": precio,
-                        "stock": True  # Si aparece en su web, es porque TIENE stock
+                        "stock": True
                     }
     except Exception as e:
         print(f"❌ Error en scraping de Web A: {e}")
@@ -138,7 +177,7 @@ def scrapear_web_b():
                 
                 if title_el and price_el and title_el.text.strip():
                     nombre_original = title_el.text.strip()
-                    nombre_clave = nombre_original.lower().replace("  ", " ")
+                    nombre_clave = " ".join(nombre_original.lower().split())
                     
                     if nombre_clave not in productos:
                         precio = limpiar_precio(price_el.text)
@@ -188,23 +227,21 @@ def procesar_logica():
                 )
                 enviar_telegram(msg_nuevo)
 
-    # NUEVA LÓGICA DE CONTROL DE STOCK Y PRECIOS
-    # Recorremos tus productos (Web B) y verificamos si existen en el Proveedor (Web A)
+    # NUEVA COMPARACIÓN INTELIGENTE PALABRA POR PALABRA
     for clave_b, datos_b in prod_b.items():
         if not datos_b["stock"]:
-            continue  # Si vos ya lo tenés sin stock, no hace falta analizarlo
+            continue
             
-        # Buscamos si tu producto activo tiene un equivalente en el catálogo actual del proveedor
         encontrado_en_proveedor = False
         datos_a_coincidente = None
         
         for clave_a, datos_a in prod_a.items():
-            if clave_b in clave_a or clave_a in clave_b:
+            if son_coincidentes_inteligentes(clave_b, clave_a):
                 encontrado_en_proveedor = True
                 datos_a_coincidente = datos_a
                 break
         
-        # SI VOS LO TENÉS DISPONIBLE, PERO EL PROVEEDOR LO BORRÓ (No encontrado = Sin Stock)
+        # SI ESTÁ EN TU TIENDA PERO EL PROVEEDOR LO BORRÓ
         if not encontrado_en_proveedor:
             msg_stock = (
                 f"⚠️ *Alerta de Stock:*\n"
@@ -214,7 +251,7 @@ def procesar_logica():
             )
             enviar_telegram(msg_stock)
             
-        # SI SÍ EXISTE EN AMBAS WEBS, COMPARAMOS EL PRECIO
+        # SI ESTÁ EN AMBOS PERO TU PRECIO QUEDÓ MÁS BAJO QUE SU COSTO
         elif datos_a_coincidente and datos_b["precio"] < datos_a_coincidente["precio"]:
             msg_precio = (
                 f"📉 *Alerta de precio:*\n"
