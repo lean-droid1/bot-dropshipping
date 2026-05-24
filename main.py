@@ -22,7 +22,6 @@ def enviar_telegram(mensaje):
     
     try:
         response = requests.post(url, json=payload, timeout=15)
-        # Si Telegram devuelve un error (ej: Código 400 o 401), esto lo expone en el log
         if response.status_code != 200:
             print(f"❌ ERROR DE TELEGRAM (Código {response.status_code}): {response.text}")
         else:
@@ -42,18 +41,14 @@ def guardar_estado_actual(estado):
 
 def scrapear_web_a():
     productos = {}
+    # Probamos con un agente de escritorio clásico para evitar bloqueos SSL transitorios
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+    }
     try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) AppleWebKit/605.1.15'
-        }
         session = requests.Session()
-        response = session.get(URL_A, headers=headers, timeout=30)
+        response = session.get(URL_A, headers=headers, timeout=30, verify=False)
         
-        if response.status_code != 200:
-            response = session.get(URL_A, headers=headers, timeout=30, verify=False)
-            if response.status_code != 200:
-                return productos
-            
         soup = BeautifulSoup(response.text, 'lxml')
         items = soup.find_all(['li', 'div'], class_=lambda x: x and 'product' in x)
         
@@ -131,6 +126,11 @@ def scrapear_web_b():
 
 def procesar_logica():
     print("--- Iniciando Chequeo de productos ---")
+    
+    # PROBAMOS TELEGRAM AL PRINCIPIO DE TODO PARA SACARNOS LA DUDA YA
+    print("Enviando señal de inicio a Telegram...")
+    enviar_telegram("🤖 *Bot de Monitoreo Activo*\nIniciando ciclo de control de stock y precios...")
+
     estado_anterior = cargar_estado_anterior()
     
     prod_a = scrapear_web_a()
@@ -140,10 +140,6 @@ def procesar_logica():
     if not prod_a:
         print("❌ Freno preventivo: Proveedor vacío.")
         return
-
-    # MENSAJE DE CONTROL DIRECTO
-    print("Intentando enviar reporte a Telegram...")
-    enviar_telegram(f"✅ *Control Automático Ejecutado*\nEl bot escaneó {len(prod_a)} productos en el proveedor y {len(prod_b)} en tu tienda con éxito.")
 
     # REGLA 4: Alertas de productos nuevos
     for nombre, datos in prod_a.items():
