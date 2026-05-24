@@ -192,6 +192,10 @@ def chequear_nuevos_pedidos_gmail():
             if any(palabra in asunto_minuscula for palabra in ["compra", "realizó", "pedido", "venta"]):
                 print(f"🔍 Evaluando Mail ID #{str_id} | De: {sender} | Asunto: {subject}")
                 
+                # Extraemos de forma inteligente el número de orden real de la tienda (ej: "7" de "Nueva venta #7")
+                match_orden = re.search(r'#(\d+)', subject)
+                num_orden_tienda = match_orden.group(1) if match_orden else str_id
+                
                 cuerpo = ""
                 if msg.is_multipart():
                     for part in msg.walk():
@@ -203,9 +207,10 @@ def chequear_nuevos_pedidos_gmail():
                 
                 lista_items = extraer_productos_del_mail(cuerpo)
                 if lista_items:
-                    print(f"✅ ¡Productos extraídos con éxito del Mail #{str_id}!")
+                    print(f"✅ ¡Productos extraídos con éxito de la Venta #{num_orden_tienda}!")
                     pedidos.append({
                         "id_mail": str_id,
+                        "num_orden": num_orden_tienda,
                         "productos": lista_items
                     })
                 else:
@@ -218,7 +223,8 @@ def chequear_nuevos_pedidos_gmail():
 
 
 def verificar_pedido_contra_proveedor(pedido, prod_proveedor):
-    reporte = f"🛒 *¡Nuevo Pedido Recibido en tu Web! (Ref Mail: #{pedido['id_mail']})*\n\n"
+    # Ahora el reporte muestra directamente la identificación real de la orden de la web
+    reporte = f"🛒 *¡Nuevo Pedido Recibido en tu Web! (Orden: #{pedido['num_orden']})*\n\n"
     todo_ok = True
     
     for item in pedido["productos"]:
