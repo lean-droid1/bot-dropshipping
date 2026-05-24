@@ -26,6 +26,13 @@ URL_A = "https://rxzweb.com/tienda/?et_per_page=-1"
 URL_B = "https://leandroid.tiendanegocio.com/productos"
 DB_FILE = "estado_productos.json"
 
+# LISTA TUNIDADA CON TUS MARCAS Y PALABRAS DE INTERÉS
+PALABRAS_INTERES = [
+    'ma ant', 'amaoe', '2uul', 'goot wick', 'mijing', 'louwei', 
+    'rf4', 'jakemy', 'kailiwei', 'kslid', 'aifen', 'sugon',
+    'organizador', 'cinta', 'silla', 'mesa', 'puas', 'hilo', 'cepillo'
+]
+
 def enviar_telegram(mensaje):
     if not TELEGRAM_TOKEN or not CHAT_ID:
         print("❌ ERROR CRÍTICO: Variables de Telegram ausentes en Railway.")
@@ -90,10 +97,8 @@ def son_coincidentes_inteligentes(nombre1, nombre2):
     return porcentaje_coincidencia >= 0.75
 
 def scrapear_web_a():
-    """Scraping del Proveedor (Web A) usando túnel anti-bloqueos si está disponible"""
+    """Scraping del Proveedor (Web A) usando túnel anti-bloqueos"""
     productos = {}
-    
-    # Si configuraste la clave en Railway, mutamos la petición a través del proxy rotativo
     if SCRAPERAPI_KEY:
         print("🔗 Utilizando túnel anti-bloqueos (ScraperAPI)...")
         target_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={URL_A}"
@@ -105,25 +110,21 @@ def scrapear_web_a():
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
             'Accept-Language': 'es-419,es;q=0.9,en;q=0.8'
         }
-        
     try:
         print("Consultando Web A (Proveedor)...")
         response = requests.get(target_url, headers=headers, timeout=60, verify=False)
-        
         print(f"Respuesta Web A - Código de estado: {response.status_code}")
         if response.status_code != 200:
             return productos
 
         soup = BeautifulSoup(response.text, 'lxml')
         items = soup.find_all(['li', 'div'], class_=lambda x: x and 'product' in x)
-        
         if len(items) == 0:
             items = soup.select('ul.products li') or soup.find_all('div', class_='product-grid-item')
 
         for item in items:
             title_el = item.find(['h2', 'h3', 'h4', 'a', 'p'], class_=lambda x: x and ('title' in x or 'woocommerce-loop' in x or 'name' in x))
             price_el = item.find(class_=lambda x: x and ('price' in x or 'precio' in x))
-            
             if not title_el:
                 title_el = item.find(['h2', 'h3', 'h4'])
 
@@ -131,7 +132,6 @@ def scrapear_web_a():
                 nombre_original = title_el.text.strip()
                 nombre_clave = " ".join(nombre_original.lower().split())
                 precio = limpiar_precio(price_el.text)
-                
                 if precio > 0:
                     productos[nombre_clave] = {
                         "nombre_real": nombre_original,
@@ -146,7 +146,6 @@ def scrapear_web_b():
     productos = {}
     pagina_actual = 1
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-    
     while True:
         url = URL_B if pagina_actual == 1 else f"{URL_B}?page={pagina_actual}"
         print(f"Scrapeando Tu Tienda (Web B) - Página {pagina_actual}...")
@@ -154,24 +153,19 @@ def scrapear_web_b():
             response = requests.get(url, headers=headers, timeout=30)
             if response.status_code != 200:
                 break
-            
             soup = BeautifulSoup(response.text, 'lxml')
             items = soup.find_all(['div', 'li', 'article', 'form'])
             productos_en_pagina = 0
-            
             for item in items:
                 title_el = item.find(['h2', 'h3', 'h1', 'a'], class_=lambda x: x and ('title' in x or 'name' in x or 'producto' in x))
                 price_el = item.find(class_=lambda x: x and ('price' in x or 'precio' in x or 'money' in x))
-                
                 if title_el and price_el and title_el.text.strip():
                     nombre_original = title_el.text.strip()
                     nombre_clave = " ".join(nombre_original.lower().split())
-                    
                     if nombre_clave not in productos:
                         precio = limpiar_precio(price_el.text)
                         texto_producto = item.text.lower()
                         tiene_stock = "sin stock" not in texto_producto and "agotado" not in texto_producto
-                        
                         if precio > 0:
                             productos[nombre_clave] = {
                                 "nombre_real": nombre_original,
@@ -179,7 +173,6 @@ def scrapear_web_b():
                                 "stock": tiene_stock
                             }
                             productos_en_pagina += 1
-            
             if productos_en_pagina == 0:
                 break
             pagina_actual += 1
@@ -203,16 +196,29 @@ def procesar_logica():
         print("⚠️ Freno preventivo: El proveedor devolvió 0 productos. Esperando próxima vuelta.")
         return
 
+    # REGLA DE OPORTUNIDADES: Si el proveedor suma/repone algo que a vos te interesa y NO tenés
     if not db_vacia:
         for nombre_clave, datos in prod_a.items():
-            if nombre_clave not in estado_anterior.get("productos_a", {}):
-                msg_nuevo = (
-                    f"🆕 *¡Nuevo Producto!*\n"
-                    f"{datos['nombre_real']}\n\n"
-                    f"📦 *Web proveedor:* ${datos['precio']:,}"
-                )
-                enviar_telegram(msg_nuevo)
+            # Verificamos si coincide con tus marcas o palabras clave
+            interesa_producto = any(p in nombre_clave for p in PALABRAS_INTERES)
+            
+            if interesa_producto:
+                # Chequeamos si ya lo tenés publicado en tu catálogo actual (Web B)
+                lo_tengo_en_web = any(son_coincidentes_inteligentes(nombre_clave, cb) for cb in prod_b.keys())
+                
+                # Si te interesa y NO lo tenés en tu web, saltó una oportunidad
+                if not lo_tengo_en_web:
+                    # Además, verificamos si es genuinamente nuevo en el radar del proveedor para evitar spam continuo
+                    if nombre_clave not in estado_anterior.get("productos_a", {}):
+                        msg_oportunidad = (
+                            f"🔥 *¡Oportunidad de Stock / Nuevo Producto!*\n"
+                            f"{datos['nombre_real']}\n\n"
+                            f"📦 *El proveedor lo tiene a:* ${datos['precio']:,}\n"
+                            f"⚠️ *Nota:* No lo tenés publicado en tu tienda."
+                        )
+                        enviar_telegram(msg_oportunidad)
 
+    # REGLAS DE COMPARACIÓN CRUZADA (Para lo que SÍ tenés publicado)
     for clave_b, datos_b in prod_b.items():
         if not datos_b["stock"]:
             continue
@@ -226,6 +232,7 @@ def procesar_logica():
                 datos_a_coincidente = datos_a
                 break
         
+        # Alerta de Stock: Si vos lo tenés disponible pero el proveedor lo borró
         if not encontrado_en_proveedor:
             msg_stock = (
                 f"⚠️ *Alerta de Stock:*\n"
@@ -235,6 +242,7 @@ def procesar_logica():
             )
             enviar_telegram(msg_stock)
             
+        # Alerta de Precio: Tu precio quedó por debajo de su costo
         elif datos_a_coincidente and datos_b["precio"] < datos_a_coincidente["precio"]:
             msg_precio = (
                 f"📉 *Alerta de precio:*\n"
