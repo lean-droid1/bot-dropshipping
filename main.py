@@ -4,6 +4,7 @@ import json
 import requests
 from bs4 import BeautifulSoup
 import urllib3
+import re
 
 # Desactivar advertencias de certificados SSL
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -51,16 +52,26 @@ def guardar_estado_actual(estado):
         print(f"❌ Error al guardar la base de datos local: {e}")
 
 def limpiar_precio(texto_precio):
-    """Limpia el texto del precio eliminando centavos tras la coma y dejando solo enteros"""
+    """Limpia de forma avanzada el texto para extraer el precio neto entero correcto"""
     if not texto_precio:
         return 0
     try:
-        # Si tiene coma (separador de centavos), nos quedamos solo con la parte entera de la izquierda
-        if "," in texto_precio:
-            texto_precio = texto_precio.split(",")[0]
+        # Remover espacios extraños y saltos de línea
+        texto = " ".join(texto_precio.split())
         
-        # Filtramos y nos quedamos solo con los números puros
-        precio_numerico = ''.join(filter(str.isdigit, texto_precio))
+        # Si la etiqueta trae múltiples precios (ej. oferta tachada y precio nuevo),
+        # buscamos todos los bloques que tengan pinta de precio monetario
+        bloques = re.findall(r'\$\s*[\d\.\,]+', texto)
+        if bloques:
+            # Nos quedamos siempre con el último bloque de precio (suele ser el valor actual/vigente)
+            texto = bloques[-1]
+            
+        # Si contiene coma de centavos (ej: ,00), cortamos para ignorar la parte decimal
+        if "," in texto:
+            texto = texto.split(",")[0]
+            
+        # Filtramos y nos quedamos únicamente con los dígitos numéricos finales
+        precio_numerico = ''.join(filter(str.isdigit, texto))
         return int(precio_numerico) if precio_numerico else 0
     except Exception:
         return 0
@@ -99,18 +110,19 @@ def scrapear_web_a():
                 nombre_original = title_el.text.strip()
                 nombre_clave = nombre_original.lower().replace("  ", " ")
                 
-                # Usamos la nueva función de limpieza inteligente para evitar los centavos extra
                 precio = limpiar_precio(price_el.text)
                 
                 texto_item = item.text.lower()
                 clases = item.get('class', [])
                 tiene_stock = not ("sin stock" in texto_item or "agotado" in texto_item or "out-of-stock" in clases)
                 
-                productos[nombre_clave] = {
-                    "nombre_real": nombre_original,
-                    "precio": precio,
-                    "stock": tiene_stock
-                }
+                # Evitamos guardar basura si el precio no se pudo procesar bien
+                if precio > 0:
+                    productos[nombre_clave] = {
+                        "nombre_real": nombre_original,
+                        "precio": precio,
+                        "stock": tiene_stock
+                    }
     except Exception as e:
         print(f"❌ Error en scraping de Web A: {e}")
     return productos
@@ -149,12 +161,13 @@ def scrapear_web_b():
                         texto_producto = item.text.lower()
                         tiene_stock = "sin stock" not in texto_producto and "agotado" not in texto_producto
                         
-                        productos[nombre_clave] = {
-                            "nombre_real": nombre_original,
-                            "precio": precio,
-                            "stock": tiene_stock
-                        }
-                        productos_en_pagina += 1
+                        if precio > 0:
+                            productos[nombre_clave] = {
+                                "nombre_real": nombre_original,
+                                "precio": precio,
+                                "stock": tiene_stock
+                            }
+                            productos_en_pagina += 1
             
             if productos_en_pagina == 0:
                 break
@@ -177,7 +190,7 @@ def procesar_logica():
     print(f"📊 Resumen: Web A (Proveedor): {len(prod_a)} | Web B (Tu tienda): {len(prod_b)}")
     
     if len(prod_a) == 0:
-        print("⚠️ Freno preventivo: El proveedor devolvió 0 productos.")
+        print("⚠️ Freno preventivo: El proveedor devolvió 0 productos. Esperando próxima vuelta.")
         return
 
     # REGLA 1: Alertas de productos totalmente NUEVOS en el proveedor
@@ -187,7 +200,7 @@ def procesar_logica():
                 msg_nuevo = (
                     f"🆕 *¡Nuevo Producto!*\n"
                     f"{datos['nombre_real']}\n\n"
-                    f"💰 *Precio proveedor:* ${datos['precio']:,}"
+                    f"📦 *Web proveedor:* ${datos['precio']:,}"
                 )
                 enviar_telegram(msg_nuevo)
 
@@ -196,7 +209,7 @@ def procesar_logica():
         for clave_b, datos_b in prod_b.items():
             if clave_a in clave_b or clave_b in clave_a:
                 
-                # REGLA 2: Alerta de Stock Desincronizado (Proveedor sin stock, vos sí)
+                # REGLA 2: Alerta de Stock Desincronizado (Simplificada)
                 if not datos_a["stock"] and datos_b["stock"]:
                     msg_stock = (
                         f"⚠️ *Alerta de Stock:*\n"
@@ -206,10 +219,10 @@ def procesar_logica():
                     )
                     enviar_telegram(msg_stock)
                 
-                # REGLA 3: Alerta de Precio Bajo (Tu precio quedó por debajo de su costo)
+                # REGLA 3: Alerta de Precio Bajo (Simplificada con tu estructura limpia)
                 if datos_b["precio"] < datos_a["precio"] and datos_b["precio"] > 0:
                     msg_precio = (
-                        f"📉 *Alerta de Precio Bajo:*\n"
+                        f"📉 *Alerta de precio:*\n"
                         f"{datos_a['nombre_real']}\n\n"
                         f"📱 *Tu web:* ${datos_b['precio']:,}\n"
                         f"📦 *Web proveedor:* ${datos_a['precio']:,}"
