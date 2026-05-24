@@ -26,7 +26,7 @@ URL_A = "https://rxzweb.com/tienda/?et_per_page=-1"
 URL_B = "https://leandroid.tiendanegocio.com/productos"
 DB_FILE = "estado_productos.json"
 
-# LISTA TUNIDADA CON TUS MARCAS Y PALABRAS DE INTERÉS
+# LISTA DE MARCAS Y PALABRAS DE INTERÉS
 PALABRAS_INTERES = [
     'ma ant', 'amaoe', '2uul', 'goot wick', 'mijing', 'louwei', 
     'rf4', 'jakemy', 'kailiwei', 'kslid', 'aifen', 'sugon',
@@ -97,7 +97,6 @@ def son_coincidentes_inteligentes(nombre1, nombre2):
     return porcentaje_coincidencia >= 0.75
 
 def scrapear_web_a():
-    """Scraping del Proveedor (Web A) usando túnel anti-bloqueos"""
     productos = {}
     if SCRAPERAPI_KEY:
         print("🔗 Utilizando túnel anti-bloqueos (ScraperAPI)...")
@@ -196,19 +195,13 @@ def procesar_logica():
         print("⚠️ Freno preventivo: El proveedor devolvió 0 productos. Esperando próxima vuelta.")
         return
 
-    # REGLA DE OPORTUNIDADES: Si el proveedor suma/repone algo que a vos te interesa y NO tenés
+    # REGLA DE OPORTUNIDADES: Si el proveedor suma algo de tu interés que NO tenés en tu web
     if not db_vacia:
         for nombre_clave, datos in prod_a.items():
-            # Verificamos si coincide con tus marcas o palabras clave
             interesa_producto = any(p in nombre_clave for p in PALABRAS_INTERES)
-            
             if interesa_producto:
-                # Chequeamos si ya lo tenés publicado en tu catálogo actual (Web B)
                 lo_tengo_en_web = any(son_coincidentes_inteligentes(nombre_clave, cb) for cb in prod_b.keys())
-                
-                # Si te interesa y NO lo tenés en tu web, saltó una oportunidad
                 if not lo_tengo_en_web:
-                    # Además, verificamos si es genuinamente nuevo en el radar del proveedor para evitar spam continuo
                     if nombre_clave not in estado_anterior.get("productos_a", {}):
                         msg_oportunidad = (
                             f"🔥 *¡Oportunidad de Stock / Nuevo Producto!*\n"
@@ -218,11 +211,8 @@ def procesar_logica():
                         )
                         enviar_telegram(msg_oportunidad)
 
-    # REGLAS DE COMPARACIÓN CRUZADA (Para lo que SÍ tenés publicado)
+    # REGLAS DE COMPARACIÓN CRUZADA (Para productos mapeados en tu web)
     for clave_b, datos_b in prod_b.items():
-        if not datos_b["stock"]:
-            continue
-            
         encontrado_en_proveedor = False
         datos_a_coincidente = None
         
@@ -231,26 +221,42 @@ def procesar_logica():
                 encontrado_en_proveedor = True
                 datos_a_coincidente = datos_a
                 break
-        
-        # Alerta de Stock: Si vos lo tenés disponible pero el proveedor lo borró
-        if not encontrado_en_proveedor:
-            msg_stock = (
-                f"⚠️ *Alerta de Stock:*\n"
-                f"{datos_b['nombre_real']}\n\n"
-                f"❌ *Proveedor:* SIN STOCK (Eliminado de su web)\n"
-                f"✅ *Tu Web:* Disponible"
-            )
-            enviar_telegram(msg_stock)
-            
-        # Alerta de Precio: Tu precio quedó por debajo de su costo
-        elif datos_a_coincidente and datos_b["precio"] < datos_a_coincidente["precio"]:
-            msg_precio = (
-                f"📉 *Alerta de precio:*\n"
-                f"{datos_b['nombre_real']}\n\n"
-                f"📱 *Tu web:* ${datos_b['precio']:,}\n"
-                f"📦 *Web proveedor:* ${datos_a_coincidente['precio']:,}"
-            )
-            enviar_telegram(msg_precio)
+
+        # CASO 1: El producto está ACTIVO en tu web
+        if datos_b["stock"]:
+            if not encontrado_en_proveedor:
+                msg_stock = (
+                    f"⚠️ *Alerta de Stock:*\n"
+                    f"{datos_b['nombre_real']}\n\n"
+                    f"❌ *Proveedor:* SIN STOCK (Eliminado de su web)\n"
+                    f"✅ *Tu Web:* Disponible"
+                )
+                enviar_telegram(msg_stock)
+                
+            elif datos_a_coincidente and datos_b["precio"] < datos_a_coincidente["precio"]:
+                msg_precio = (
+                    f"📉 *Alerta de precio:*\n"
+                    f"{datos_b['nombre_real']}\n\n"
+                    f"📱 *Tu web:* ${datos_b['precio']:,}\n"
+                    f"📦 *Web proveedor:* ${datos_a_coincidente['precio']:,}"
+                )
+                enviar_telegram(msg_precio)
+
+        # NUEVA REGLA - CASO 2: El producto está SIN STOCK (Pausado) en tu web, pero volvió al proveedor
+        else:
+            if encontrado_en_proveedor and datos_a_coincidente:
+                # Sacamos el historial para verificar si efectivamente antes el proveedor tampoco lo tenía
+                estaba_en_proveedor_antes = clave_b in estado_anterior.get("productos_a", {}) or any(son_coincidentes_inteligentes(clave_b, ca) for ca in estado_anterior.get("productos_a", {}).keys())
+                
+                # Si el proveedor antes no lo tenía (o el bot arranca de cero) y ahora sí, mandamos alerta de reactivación
+                if not estaba_en_proveedor_antes or db_vacia:
+                    msg_recuperado = (
+                        f"🔄 *¡Stock Recuperado en Proveedor!*\n"
+                        f"{datos_b['nombre_real']}\n\n"
+                        f"📦 *Proveedor:* Vuelve a tener stock a ${datos_a_coincidente['precio']:,}\n"
+                        f"📱 *Tu Web:* Actualmente figura 'Sin Stock'. ¡Ya podés reactivarlo!"
+                    )
+                    enviar_telegram(msg_recuperado)
 
     guardar_estado_actual({"productos_a": prod_a, "productos_b": prod_b})
     print("--- ✅ Ciclo completado y base de datos actualizada ---")
