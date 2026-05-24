@@ -5,10 +5,8 @@ import requests
 from bs4 import BeautifulSoup
 import urllib3
 
-# Desactivar advertencias de certificados SSL en el log
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# Buscamos las variables limpiando cualquier espacio accidental que tengan en Railway
 TELEGRAM_TOKEN = None
 CHAT_ID = None
 
@@ -24,20 +22,15 @@ DB_FILE = "estado_productos.json"
 
 def enviar_telegram(mensaje):
     if not TELEGRAM_TOKEN or not CHAT_ID:
-        print(f"❌ ERROR CRÍTICO: Variables no detectadas. Claves en sistema: {[k for k in os.environ.keys() if 'TOKEN' in k or 'CHAT' in k]}")
+        print("❌ ERROR CRÍTICO: Variables ausentes.")
         return
-        
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": mensaje, "parse_mode": "Markdown"}
-    
     try:
-        response = requests.post(url, json=payload, timeout=15)
-        if response.status_code != 200:
-            print(f"❌ ERROR DE TELEGRAM (Código {response.status_code}): {response.text}")
-        else:
-            print("🚀 Mensaje enviado a Telegram con éxito.")
+        requests.post(url, json=payload, timeout=15)
+        print("🚀 Mensaje enviado a Telegram con éxito.")
     except Exception as e:
-        print(f"❌ Error de conexión al intentar hablar con Telegram: {e}")
+        print(f"❌ Error Telegram: {e}")
 
 def cargar_estado_anterior():
     if os.path.exists(DB_FILE):
@@ -51,20 +44,38 @@ def guardar_estado_actual(estado):
 
 def scrapear_web_a():
     productos = {}
+    # Headers hiper-realistas de navegador moderno para evitar bloqueos
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36',
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+        'Accept-Language': 'es-ES,es;q=0.9',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache'
     }
     try:
         session = requests.Session()
-        response = session.get(URL_A, headers=headers, timeout=30, verify=False)
+        response = session.get(URL_A, headers=headers, timeout=35, verify=False)
         
+        if response.status_code != 200:
+            print(f"⚠️ Web A respondió con código erróneo: {response.status_code}")
+            return productos
+
         soup = BeautifulSoup(response.text, 'lxml')
+        
+        # Estrategia 1: Mapeo clásico por clases Woocommerce estándar
         items = soup.find_all(['li', 'div'], class_=lambda x: x and 'product' in x)
         
+        # Estrategia 2: Por si cambiaron las clases, buscamos contenedores comunes de productos
+        if len(items) == 0:
+            items = soup.find_all('div', class_=lambda x: x and ('item' in x or 'card' in x or 'grid' in x))
+
         for item in items:
-            title_el = item.find(['h2', 'h3', 'h4', 'a'], class_=lambda x: x and ('title' in x or 'woocommerce-loop' in x))
-            price_el = item.find(class_=lambda x: x and 'price' in x)
+            title_el = item.find(['h2', 'h3', 'h4', 'a', 'p'], class_=lambda x: x and ('title' in x or 'woocommerce-loop' in x or 'name' in x))
+            price_el = item.find(class_=lambda x: x and ('price' in x or 'precio' in x))
             
+            if not title_el:
+                title_el = item.find(['h2', 'h3', 'h4'])
+
             if title_el and price_el and title_el.text.strip():
                 nombre = title_el.text.strip().lower()
                 precio_texto = ''.join(filter(str.isdigit, price_el.text))
@@ -87,18 +98,16 @@ def scrapear_web_b():
     productos = {}
     pagina_actual = 1
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
     }
     
     while True:
         url = URL_B if pagina_actual == 1 else f"{URL_B}?page={pagina_actual}"
         print(f"Scrapeando Tu Tienda (Web B) - Página {pagina_actual}...")
-        
         try:
             response = requests.get(url, headers=headers, timeout=30)
             if response.status_code != 200:
                 break
-                
             soup = BeautifulSoup(response.text, 'lxml')
             items = soup.find_all(['div', 'li', 'article', 'form'])
             productos_en_pagina = 0
@@ -123,11 +132,10 @@ def scrapear_web_b():
                         }
                         productos_en_pagina += 1
             
-            print(f"Página {pagina_actual}: {productos_en_pagina} productos.")
             if productos_en_pagina == 0:
                 break
             pagina_actual += 1
-            time.sleep(1)
+            time.sleep(1.5)
         except Exception as e:
             print(f"Error Web B: {e}")
             break
@@ -135,8 +143,6 @@ def scrapear_web_b():
 
 def procesar_logica():
     print("--- Iniciando Chequeo de productos ---")
-    
-    print("Enviando señal de inicio a Telegram...")
     enviar_telegram("🤖 *Bot de Monitoreo Activo*\nIniciando ciclo de control de stock y precios...")
 
     estado_anterior = cargar_estado_anterior()
@@ -171,4 +177,4 @@ if __name__ == "__main__":
     print("Bot iniciado con éxito. Corriendo...")
     while True:
         procesar_logica()
-        time.sleep(900)
+        time.sleep(1200) # Subimos el intervalo a 20 min para mitigar bloqueos por IP
