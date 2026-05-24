@@ -50,6 +50,21 @@ def guardar_estado_actual(estado):
     except Exception as e:
         print(f"❌ Error al guardar la base de datos local: {e}")
 
+def limpiar_precio(texto_precio):
+    """Limpia el texto del precio eliminando centavos tras la coma y dejando solo enteros"""
+    if not texto_precio:
+        return 0
+    try:
+        # Si tiene coma (separador de centavos), nos quedamos solo con la parte entera de la izquierda
+        if "," in texto_precio:
+            texto_precio = texto_precio.split(",")[0]
+        
+        # Filtramos y nos quedamos solo con los números puros
+        precio_numerico = ''.join(filter(str.isdigit, texto_precio))
+        return int(precio_numerico) if precio_numerico else 0
+    except Exception:
+        return 0
+
 def scrapear_web_a():
     """Scraping del Proveedor (Web A)"""
     productos = {}
@@ -57,16 +72,13 @@ def scrapear_web_a():
         'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36',
         'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
         'Accept-Language': 'es-419,es;q=0.9,en;q=0.8',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Connection': 'keep-alive',
-        'Upgrade-Insecure-Requests': '1'
+        'Connection': 'keep-alive'
     }
     try:
         print("Consultando Web A (Proveedor)...")
         session = requests.Session()
         response = session.get(URL_A, headers=headers, timeout=45, verify=False)
         
-        print(f"Respuesta Web A - Código de estado: {response.status_code}")
         if response.status_code != 200:
             return productos
 
@@ -87,8 +99,8 @@ def scrapear_web_a():
                 nombre_original = title_el.text.strip()
                 nombre_clave = nombre_original.lower().replace("  ", " ")
                 
-                precio_texto = ''.join(filter(str.isdigit, price_el.text))
-                precio = int(precio_texto) if precio_texto else 0
+                # Usamos la nueva función de limpieza inteligente para evitar los centavos extra
+                precio = limpiar_precio(price_el.text)
                 
                 texto_item = item.text.lower()
                 clases = item.get('class', [])
@@ -132,8 +144,7 @@ def scrapear_web_b():
                     nombre_clave = nombre_original.lower().replace("  ", " ")
                     
                     if nombre_clave not in productos:
-                        precio_texto = ''.join(filter(str.isdigit, price_el.text))
-                        precio = int(precio_texto) if precio_texto else 0
+                        precio = limpiar_precio(price_el.text)
                         
                         texto_producto = item.text.lower()
                         tiene_stock = "sin stock" not in texto_producto and "agotado" not in texto_producto
@@ -163,45 +174,55 @@ def procesar_logica():
     prod_a = scrapear_web_a()
     prod_b = scrapear_web_b()
     
-    print(f"📊 Resumen de escaneo: Web A (Proveedor): {len(prod_a)} | Web B (Tu tienda): {len(prod_b)}")
+    print(f"📊 Resumen: Web A (Proveedor): {len(prod_a)} | Web B (Tu tienda): {len(prod_b)}")
     
-    # FRENO DE SEGURIDAD: Si la Web A da cero por bloqueo o error, no rompemos nada.
     if len(prod_a) == 0:
-        print("⚠️ Freno preventivo: El proveedor devolvió 0 productos. Se cancela el ciclo.")
+        print("⚠️ Freno preventivo: El proveedor devolvió 0 productos.")
         return
 
-    # REGLA 1: Alertas de productos verdaderamente NUEVOS en el proveedor
-    # Solo se ejecuta si ya teníamos guardados datos previos (evita el spam del primer inicio)
+    # REGLA 1: Alertas de productos totalmente NUEVOS en el proveedor
     if not db_vacia:
         for nombre_clave, datos in prod_a.items():
             if nombre_clave not in estado_anterior.get("productos_a", {}):
-                enviar_telegram(f"🆕 *¡Nuevo Producto en Proveedor!*\n*Nombre:* {datos['nombre_real']}\n*Precio:* ${datos['precio']:,}")
+                msg_nuevo = (
+                    f"🆕 *¡Nuevo Producto!*\n"
+                    f"{datos['nombre_real']}\n\n"
+                    f"💰 *Precio proveedor:* ${datos['precio']:,}"
+                )
+                enviar_telegram(msg_nuevo)
 
     # REGLAS DE COMPARACIÓN CRUZADA (PROVEEDOR vs TU WEB)
-    # Buscamos coincidencias inteligentes de nombres entre ambas tiendas
     for clave_a, datos_a in prod_a.items():
         for clave_b, datos_b in prod_b.items():
-            # Si los nombres coinciden o uno está contenido dentro del otro
             if clave_a in clave_b or clave_b in clave_a:
                 
-                # REGLA 2: Alerta si el proveedor se quedó SIN STOCK pero vos lo tenés ACTIVO
+                # REGLA 2: Alerta de Stock Desincronizado (Proveedor sin stock, vos sí)
                 if not datos_a["stock"] and datos_b["stock"]:
-                    enviar_telegram(f"⚠️ *Alerta Stock Desincronizado:*\nEl proveedor NO tiene stock de `{datos_a['nombre_real']}`, pero en tu tienda todavía figura como *Disponible*.")
+                    msg_stock = (
+                        f"⚠️ *Alerta de Stock:*\n"
+                        f"{datos_a['nombre_real']}\n\n"
+                        f"❌ *Proveedor:* SIN STOCK\n"
+                        f"✅ *Tu Web:* Disponible"
+                    )
+                    enviar_telegram(msg_stock)
                 
-                # REGLA 3: Alerta si quedaste más BARATO que el costo del proveedor
+                # REGLA 3: Alerta de Precio Bajo (Tu precio quedó por debajo de su costo)
                 if datos_b["precio"] < datos_a["precio"] and datos_b["precio"] > 0:
-                    enviar_telegram(f"📉 *Alerta de Precio Bajo:*\nTu precio (${datos_b['precio']:,}) es MENOR que el del proveedor (${datos_a['precio']:,}) en el producto: `{datos_a['nombre_real']}`.")
+                    msg_precio = (
+                        f"📉 *Alerta de Precio Bajo:*\n"
+                        f"{datos_a['nombre_real']}\n\n"
+                        f"📱 *Tu web:* ${datos_b['precio']:,}\n"
+                        f"📦 *Web proveedor:* ${datos_a['precio']:,}"
+                    )
+                    enviar_telegram(msg_precio)
 
-    # Guardamos el catálogo actual para el próximo ciclo
     guardar_estado_actual({"productos_a": prod_a, "productos_b": prod_b})
     print("--- ✅ Ciclo completado y base de datos actualizada ---")
 
 if __name__ == "__main__":
-    print("🚀 Bot de Control Iniciado Exitosamente. Corriendo en segundo plano...")
-    # Envía un aviso limpio a Telegram una única vez al arrancar el contenedor
-    enviar_telegram("🤖 *¡Bot Inicializado!*\nA partir de este momento monitoreando cambios de precios y stock cada 30 minutos.")
+    print("🚀 Bot de Control Iniciado Exitosamente...")
     
     while True:
         procesar_logica()
-        print("💤 Durmiendo por 30 minutos hasta el próximo control...")
+        print("💤 Esperando 30 minutos hasta el próximo control...")
         time.sleep(1800)
