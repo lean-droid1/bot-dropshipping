@@ -137,7 +137,7 @@ def extraer_productos_del_mail(cuerpo_texto):
                 if match:
                     nombre_prod = match.group(1).strip()
                     cantidad = int(match.group(2).strip())
-                    productos_encontrados.append({"nombre": nombre_prod, "cantidad": quantity})
+                    productos_encontrados.append({"nombre": nombre_prod, "cantidad": cantidad})
     return productos_encontrados
 
 def chequear_nuevos_pedidos_gmail():
