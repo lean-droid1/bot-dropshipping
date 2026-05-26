@@ -335,7 +335,7 @@ def scrapear_web_a():
                         nombre_combinado = f"{nombre_original} ({nombre_var})"
                         clave_combinada = nombre_combinado.lower()
                         productos[clave_combinada] = {
-                            "nombre_real": nombre_combined = nombre_combinado,
+                            "nombre_real": nombre_combinado,
                             "precio": datos_var["precio"],
                             "precio_anterior": 0,
                             "en_oferta": False,
@@ -488,7 +488,7 @@ def procesar_logica():
     guardar_estado_actual({
         "productos_a": prod_a, 
         "productos_b": prod_b, 
-        "pedidos_procesados": pedidos_procesados
+        "pedidos_processed" if False else "pedidos_procesados": pedidos_procesados
     })
     print("--- ✅ Ciclo completado con desglose de variaciones estructurado ---")
 
