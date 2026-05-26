@@ -20,7 +20,8 @@ DB_FILE = "estado_productos.json"
 # LISTA DE MARCAS Y PALABRAS DE INTERÉS PARA ALERTAS DE NUEVOS/OFERTAS
 PALABRAS_INTERES = [
     'ma ant', 'amaoe', '2uul', 'goot wick', 'mijing', 'louwei', 
-    'rf4', 'jakemy', 'kailiwei', 'kslid', 'aifen', 'sugon', 'jcid',
+    'rf4', 'jakemy', 'kailiwei', 'kslid', 'aifen', 'sugon', 'jcid', 'jc',
+    'v1', 'v1s', 'v1se', 'v1 pro', 'programadora',
     'organizador', 'cinta', 'silla', 'mesa', 'puas', 'hilo', 'cepillo'
 ]
 
@@ -223,7 +224,6 @@ def chequear_nuevos_pedidos_gmail():
 
 
 def verificar_pedido_contra_proveedor(pedido, prod_proveedor):
-    # Ahora el reporte muestra directamente la identificación real de la orden de la web
     reporte = f"🛒 *¡Nuevo Pedido Recibido en tu Web! (Orden: #{pedido['num_orden']})*\n\n"
     todo_ok = True
     
@@ -341,7 +341,7 @@ def procesar_logica():
     db_vacia = len(estado_anterior.get("productos_a", {})) == 0
     pedidos_procesados = estado_anterior.get("pedidos_procesados", [])
 
-    # 1. ESCANEO DE CORREOS (GMAIL) PRIMERO PARA AGARRAR COMPRAS INMEDIATAS
+    # 1. ESCANEO DE CORREOS (GMAIL)
     pedidos_nuevos = chequear_nuevos_pedidos_gmail()
 
     # 2. SCRAPING DE AMBAS WEBS
