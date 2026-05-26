@@ -67,7 +67,7 @@ def cargar_estado_anterior():
                 return data
         except Exception:
             return {"productos_a": {}, "productos_b": {}, "pedidos_procesados": []}
-    return {"productos_a": {}, "productos_b": {}, "pedidos_procesados": []}
+    return {"productos_a": {}, "productos_b": {}, "pedidos_processed": []}
 
 
 def guardar_estado_actual(estado):
@@ -149,7 +149,7 @@ def extraer_productos_del_mail(cuerpo_texto):
                 if match:
                     nombre_prod = match.group(1).strip()
                     cantidad = int(match.group(2).strip())
-                    productos_encontrados.append({"nombre": nombre_prod, "cantidad": cantidad})
+                    productos_encontrados.append({"nombre": nombre_prod, "cantidad": quantity})
     return productos_encontrados
 
 
@@ -349,7 +349,7 @@ def procesar_logica():
         print("⚠️ Freno preventivo: El proveedor devolvió 0 productos.")
         return
 
-    # 3. VERIFICACIÓN INMEDIATA DE NUEVOS PEDIDOS (No se agrupan porque urge verlos)
+    # 3. VERIFICACIÓN INMEDIATA DE NUEVOS PEDIDOS
     for ped in pedidos_nuevos:
         if ped["id_mail"] not in pedidos_procesados:
             msg_reporte = verificar_pedido_contra_proveedor(ped, prod_a)
@@ -363,13 +363,12 @@ def procesar_logica():
     bloque_precios_bajos = ""
     bloque_faltantes = ""
 
-    # 4. ANALIZAR LO QUE TIENE EL PROVEEDOR (Ofertas, Nuevos y Stock Recuperado Real)
+    # 4. ANALIZAR LO QUE TIENE EL PROVEEDOR (Ofertas, Nuevos y Stock Recuperado)
     for nombre_clave, datos in prod_a.items():
         interesa_producto = any(p in nombre_clave for p in PALABRAS_INTERES)
         if not interesa_producto:
             continue
 
-        # Verificar si existía en el ciclo anterior del proveedor
         estaba_antes_en_proveedor = nombre_clave in historial_a_viejo
 
         # A) Detectar Oferta Nueva
@@ -378,15 +377,19 @@ def procesar_logica():
             if not era_oferta_antes:
                 bloque_ofertas += f"• *{datos['nombre_real']}*\n  💰 Reg: ${datos['precio_anterior']:,} ➔ *🔥 REBAJADO: ${datos['precio']:,}*\n\n"
 
-        # B) Determinar si es un reingreso de Stock o un artículo completamente nuevo
+        # B) Determinar si es una oportunidad (No está en mi web) o un reingreso (Sí está en mi web)
         lo_tengo_en_web = any(son_coincidentes_inteligentes(nombre_clave, cb) for cb in prod_b.keys())
         
-        if not estaba_antes_en_proveedor and len(historial_a_viejo) > 0:
-            if not lo_tengo_en_web:
-                # Oportunidad: El proveedor lo sumó y vos no lo tenés publicado
-                bloque_nuevos += f"• *{datos['nombre_real']}*\n  📦 Costo proveedor: ${datos['precio']:,}\n  ⚠️ _Nota: No lo tenés publicado_\n\n"
-            else:
-                # Recuperado: Lo tenés publicado (probablemente figuraba sin stock) y el proveedor volvió a listarlo
+        if not lo_tengo_en_web:
+            # CORRECCIÓN AQUÍ: Si no está en tu tienda, se evalúa directo como Oportunidad Crítica
+            precio_anterior_prov = historial_a_viejo.get(nombre_clave, {}).get("precio", 0) if estaba_antes_en_proveedor else 0
+            
+            # Se reporta si es un producto recién ingresado o si antes figuraba en cero/sin stock
+            if not estaba_antes_en_proveedor or precio_anterior_prov == 0:
+                bloque_nuevos += f"• *{datos['nombre_real']}*\n  📦 Costo proveedor: ${datos['precio']:,}\n  ⚠️ _Nota: No lo tenés publicado en tu Web_\n\n"
+        else:
+            # Si sí está en tu tienda, evaluamos si el proveedor recuperó stock de algo que ya conocías
+            if not estaba_antes_en_proveedor and len(historial_a_viejo) > 0:
                 bloque_recuperados += f"• *{datos['nombre_real']}*\n  📦 Vuelve a tener stock a: ${datos['precio']:,}\n\n"
 
     # 5. COMPARAR TU WEB CONTRA EL PROVEEDOR (Precios desactualizados y Faltantes)
@@ -402,10 +405,8 @@ def procesar_logica():
 
         if datos_b["stock"]:
             if not encontrado_en_proveedor:
-                # Tu web dice que tenés, pero el proveedor lo borró o se quedó a cero
                 bloque_faltantes += f"• *{datos_b['nombre_real']}*\n  ❌ _Proveedor se quedó SIN STOCK_\n\n"
             elif datos_a_coincidente and datos_b["precio"] < datos_a_coincidente["precio"]:
-                # Estás vendiendo más barato de lo que te cuesta comprarle al proveedor
                 bloque_precios_bajos += f"• *{datos_b['nombre_real']}*\n  📱 Tu web: ${datos_b['precio']:,} ➔ 📦 Proveedor: ${datos_a_coincidente['precio']:,}\n\n"
 
     # 6. DESPACHAR MENSAJES CONSOLIDADOS (Solo si contienen datos)
@@ -413,7 +414,7 @@ def procesar_logica():
         enviar_telegram(f"🏷️ *¡Nuevos Descuentos en el Proveedor!*\n\n{bloque_ofertas}")
         
     if bloque_nuevos:
-        enviar_telegram(f"🔥 *¡Oportunidades de Stock / Nuevos Productos!*\n\n{bloque_nuevos}")
+        enviar_telegram(f"🔥 *¡Oportunidades de Stock / Nuevos Productos!*\n_Productos del proveedor que NO tenés cargados en tu web:_\n\n{bloque_nuevos}")
         
     if bloque_recuperados:
         enviar_telegram(f"🔄 *¡Stock Recuperado en Proveedor!*\n\n{bloque_recuperados}")
@@ -424,8 +425,12 @@ def procesar_logica():
     if bloque_faltantes:
         enviar_telegram(f"⚠️ *¡Alerta de Stock Crítica!*\n_Tenés disponible algo que el proveedor ya no tiene:_\n\n{bloque_faltantes}")
 
-    # Guardamos el estado actual para la comparación del próximo ciclo
-    guardar_estado_actual({"productos_a": prod_a, "productos_b": prod_b, "pedidos_processed": pedidos_procesados, "pedidos_procesados": pedidos_procesados})
+    # Guardamos el estado limpio para la comparación del próximo ciclo
+    guardar_estado_actual({
+        "productos_a": prod_a, 
+        "productos_b": prod_b, 
+        "pedidos_procesados": pedidos_procesados
+    })
     print("--- ✅ Ciclo completado e informe agrupado procesado ---")
 
 
@@ -435,4 +440,3 @@ if __name__ == "__main__":
         procesar_logica()
         print("💤 Esperando 15 minutos hasta el próximo control...")
         time.sleep(900)
-
