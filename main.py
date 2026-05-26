@@ -8,6 +8,7 @@ import re
 import imaplib
 import email
 from email.header import decode_header
+from datetime import datetime, timedelta
 
 # Desactivar advertencias de certificados SSL para evitar ruidos en consola
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
@@ -41,14 +42,13 @@ for k, v in os.environ.items():
 
 
 def enviar_telegram(mensaje):
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        print("❌ ERROR CRÍTICO: Variables de Telegram ausentes en Railway.")
+    if not mensaje or not TELEGRAM_TOKEN or not CHAT_ID:
         return
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     payload = {"chat_id": CHAT_ID, "text": mensaje, "parse_mode": "Markdown"}
     try:
         requests.post(url, json=payload, timeout=15)
-        print("🚀 Mensaje enviado a Telegram con éxito.")
+        print("🚀 Mensaje agrupado enviado a Telegram con éxito.")
     except Exception as e:
         print(f"❌ Error al enviar a Telegram: {e}")
 
@@ -60,6 +60,10 @@ def cargar_estado_anterior():
                 data = json.load(f)
                 if "pedidos_procesados" not in data:
                     data["pedidos_procesados"] = []
+                if "productos_a" not in data:
+                    data["productos_a"] = {}
+                if "productos_b" not in data:
+                    data["productos_b"] = {}
                 return data
         except Exception:
             return {"productos_a": {}, "productos_b": {}, "pedidos_procesados": []}
@@ -100,7 +104,6 @@ def son_coincidentes_inteligentes(nombre1, nombre2):
     n1 = nombre1.lower()
     n2 = nombre2.lower()
     
-    # Bloqueo estricto para evitar falsos positivos cruzados (ej: Mesa normal vs Mesa MINI)
     palabras_criticas = ['mini', 'pro', 'plus', 'max', 'kit', 'ultra', 'xl', 'lw-a1']
     for pc in palabras_criticas:
         if (pc in n1 and pc not in n2) or (pc in n2 and pc not in n1):
@@ -157,22 +160,23 @@ def chequear_nuevos_pedidos_gmail():
         return pedidos
 
     try:
-        print("📬 Conectando a Gmail para revisar pedidos...")
+        print("📬 Conectando a Gmail para revisar pedidos de las últimas 24 horas...")
         mail = imaplib.IMAP4_SSL("imap.gmail.com")
         mail.login(GMAIL_USER, GMAIL_PASS)
         mail.select("inbox")
         
-        # Escaneo general para agarrar cualquier correo del remitente de la tienda
-        status, mensajes = mail.search(None, '(FROM "tiendanegocio.com")')
+        # Filtro estricto de fecha: solo correos desde ayer para evitar spam histórico
+        hace_24h = (datetime.now() - timedelta(days=1)).strftime("%d-%b-%Y")
+        criterio_busqueda = f'(FROM "tiendanegocio.com" SINCE {hace_24h})'
+        status, mensajes = mail.search(None, criterio_busqueda)
         
         if status != "OK" or not mensajes[0]:
-            print("✉️ Info Gmail: No se encontraron correos de 'tiendanegocio.com' en la bandeja principal.")
+            print("✉️ Info Gmail: No se encontraron correos nuevos en las últimas 24 horas.")
             mail.close()
             mail.logout()
             return pedidos
             
         id_lista = mensajes[0].split()
-        print(f"📩 Info Gmail: Se detectaron {len(id_lista)} correos en total en el servidor. Analizándolos...")
         
         for msg_id in id_lista:
             str_id = msg_id.decode()
@@ -186,14 +190,9 @@ def chequear_nuevos_pedidos_gmail():
             if isinstance(subject, bytes):
                 subject = subject.decode(encoding or "utf-8")
             
-            sender = msg["From"]
             asunto_minuscula = subject.lower()
             
-            # Filtro optimizado incluyendo "venta" para capturar "Nueva venta #..."
             if any(palabra in asunto_minuscula for palabra in ["compra", "realizó", "pedido", "venta"]):
-                print(f"🔍 Evaluando Mail ID #{str_id} | De: {sender} | Asunto: {subject}")
-                
-                # Extraemos de forma inteligente el número de orden real de la tienda (ej: "7" de "Nueva venta #7")
                 match_orden = re.search(r'#(\d+)', subject)
                 num_orden_tienda = match_orden.group(1) if match_orden else str_id
                 
@@ -208,14 +207,11 @@ def chequear_nuevos_pedidos_gmail():
                 
                 lista_items = extraer_productos_del_mail(cuerpo)
                 if lista_items:
-                    print(f"✅ ¡Productos extraídos con éxito de la Venta #{num_orden_tienda}!")
                     pedidos.append({
                         "id_mail": str_id,
                         "num_orden": num_orden_tienda,
                         "productos": lista_items
                     })
-                else:
-                    print(f"⚠️ Mail #{str_id} coincide con el asunto, pero no se pudieron parsear los productos del texto.")
         mail.close()
         mail.logout()
     except Exception as e:
@@ -260,7 +256,7 @@ def verificar_pedido_contra_proveedor(pedido, prod_proveedor):
 def scrapear_web_a():
     productos = {}
     if not SCRAPERAPI_KEY:
-        print("❌ ERROR CRÍTICO: SCRAPERAPI_KEY no configurada en Railway.")
+        print("❌ ERROR CRÍTICO: SCRAPERAPI_KEY no configurada.")
         return productos
 
     target_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={URL_A}"
@@ -291,7 +287,7 @@ def scrapear_web_a():
                         "stock": True
                     }
     except Exception as e:
-        print(f"❌ Error en scraping de Web A con ScraperAPI: {e}")
+        print(f"❌ Error en scraping de Web A: {e}")
     return productos
 
 
@@ -338,10 +334,10 @@ def scrapear_web_b():
 def procesar_logica():
     print("\n--- 🔄 Iniciando Nuevo Ciclo de Monitoreo ---")
     estado_anterior = cargar_estado_anterior()
-    db_vacia = len(estado_anterior.get("productos_a", {})) == 0
     pedidos_procesados = estado_anterior.get("pedidos_procesados", [])
+    historial_a_viejo = estado_anterior.get("productos_a", {})
 
-    # 1. ESCANEO DE CORREOS (GMAIL)
+    # 1. ESCANEO DE CORREOS DE LAS ÚLTIMAS 24 HORAS
     pedidos_nuevos = chequear_nuevos_pedidos_gmail()
 
     # 2. SCRAPING DE AMBAS WEBS
@@ -353,42 +349,47 @@ def procesar_logica():
         print("⚠️ Freno preventivo: El proveedor devolvió 0 productos.")
         return
 
-    # 3. VERIFICACIÓN Y ALERTA DE NUEVOS PEDIDOS A TELEGRAM
+    # 3. VERIFICACIÓN INMEDIATA DE NUEVOS PEDIDOS (No se agrupan porque urge verlos)
     for ped in pedidos_nuevos:
         if ped["id_mail"] not in pedidos_procesados:
             msg_reporte = verificar_pedido_contra_proveedor(ped, prod_a)
             enviar_telegram(msg_reporte)
             pedidos_procesados.append(ped["id_mail"])
 
-    # 4. ALERTAS DE OFERTAS Y NUEVOS PRODUCTOS (PROVEEDOR)
-    if not db_vacia:
-        for nombre_clave, datos in prod_a.items():
-            interesa_producto = any(p in nombre_clave for p in PALABRAS_INTERES)
-            if interesa_producto:
-                historial_prov = estado_anterior.get("productos_a", {}).get(nombre_clave, {})
-                era_oferta_antes = historial_prov.get("en_oferta", False)
-                
-                if datos["en_oferta"] and not era_oferta_antes:
-                    msg_oferta = (
-                        f"🏷️ *¡Descuento Detectado en Proveedor!*\n"
-                        f"{datos['nombre_real']}\n\n"
-                        f"💰 *Precio Regular:* ${datos['precio_anterior']:,}\n"
-                        f"🔥 *Precio REBAJADO:* ${datos['precio']:,}\n"
-                        f"⚡ *Info:* Evaluá si te conviene ajustar tus márgenes."
-                    )
-                    enviar_telegram(msg_oferta)
+    # BOLSAS DE ALERTA PARA AGRUPAR POR MENSAJE
+    bloque_ofertas = ""
+    bloque_nuevos = ""
+    bloque_recuperados = ""
+    bloque_precios_bajos = ""
+    bloque_faltantes = ""
 
-                lo_tengo_en_web = any(son_coincidentes_inteligentes(nombre_clave, cb) for cb in prod_b.keys())
-                if not lo_tengo_en_web and nombre_clave not in estado_anterior.get("productos_a", {}):
-                    msg_oportunidad = (
-                        f"🔥 *¡Oportunidad de Stock / Nuevo Producto!*\n"
-                        f"{datos['nombre_real']}\n\n"
-                        f"📦 *El proveedor lo tiene a:* ${datos['precio']:,}\n"
-                        f"⚠️ *Nota:* No lo tenés publicado."
-                    )
-                    enviar_telegram(msg_oportunidad)
+    # 4. ANALIZAR LO QUE TIENE EL PROVEEDOR (Ofertas, Nuevos y Stock Recuperado Real)
+    for nombre_clave, datos in prod_a.items():
+        interesa_producto = any(p in nombre_clave for p in PALABRAS_INTERES)
+        if not interesa_producto:
+            continue
 
-    # 5. COMPARACIÓN GENERAL DE PRECIOS Y STOCK (TU TIENDA VS PROVEEDOR)
+        # Verificar si existía en el ciclo anterior del proveedor
+        estaba_antes_en_proveedor = nombre_clave in historial_a_viejo
+
+        # A) Detectar Oferta Nueva
+        if datos["en_oferta"]:
+            era_oferta_antes = historial_a_viejo.get(nombre_clave, {}).get("en_oferta", False) if estaba_antes_en_proveedor else False
+            if not era_oferta_antes:
+                bloque_ofertas += f"• *{datos['nombre_real']}*\n  💰 Reg: ${datos['precio_anterior']:,} ➔ *🔥 REBAJADO: ${datos['precio']:,}*\n\n"
+
+        # B) Determinar si es un reingreso de Stock o un artículo completamente nuevo
+        lo_tengo_en_web = any(son_coincidentes_inteligentes(nombre_clave, cb) for cb in prod_b.keys())
+        
+        if not estaba_antes_en_proveedor and len(historial_a_viejo) > 0:
+            if not lo_tengo_en_web:
+                # Oportunidad: El proveedor lo sumó y vos no lo tenés publicado
+                bloque_nuevos += f"• *{datos['nombre_real']}*\n  📦 Costo proveedor: ${datos['precio']:,}\n  ⚠️ _Nota: No lo tenés publicado_\n\n"
+            else:
+                # Recuperado: Lo tenés publicado (probablemente figuraba sin stock) y el proveedor volvió a listarlo
+                bloque_recuperados += f"• *{datos['nombre_real']}*\n  📦 Vuelve a tener stock a: ${datos['precio']:,}\n\n"
+
+    # 5. COMPARAR TU WEB CONTRA EL PROVEEDOR (Precios desactualizados y Faltantes)
     for clave_b, datos_b in prod_b.items():
         encontrado_en_proveedor = False
         datos_a_coincidente = None
@@ -401,36 +402,31 @@ def procesar_logica():
 
         if datos_b["stock"]:
             if not encontrado_en_proveedor:
-                msg_stock = (
-                    f"⚠️ *Alerta de Stock:*\n"
-                    f"{datos_b['nombre_real']}\n\n"
-                    f"❌ *Proveedor:* SIN STOCK (Eliminado de su web)\n"
-                    f"✅ *Tu Web:* Disponible"
-                )
-                enviar_telegram(msg_stock)
+                # Tu web dice que tenés, pero el proveedor lo borró o se quedó a cero
+                bloque_faltantes += f"• *{datos_b['nombre_real']}*\n  ❌ _Proveedor se quedó SIN STOCK_\n\n"
             elif datos_a_coincidente and datos_b["precio"] < datos_a_coincidente["precio"]:
-                msg_precio = (
-                    f"📉 *Alerta de precio:*\n"
-                    f"{datos_b['nombre_real']}\n\n"
-                    f"📱 *Tu web:* ${datos_b['precio']:,}\n"
-                    f"📦 *Web proveedor:* ${datos_a_coincidente['precio']:,}"
-                )
-                enviar_telegram(msg_precio)
-        else:
-            if encontrado_en_proveedor and datos_a_coincidente:
-                estaba_en_proveedor_antes = clave_b in estado_anterior.get("productos_a", {}) or any(son_coincidentes_inteligentes(clave_b, ca) for ca in estado_anterior.get("productos_a", {}).keys())
-                if not estaba_en_proveedor_antes or db_vacia:
-                    msg_recuperado = (
-                        f"🔄 *¡Stock Recuperado en Proveedor!*\n"
-                        f"{datos_b['nombre_real']}\n\n"
-                        f"📦 *Proveedor:* Vuelve a tener stock a ${datos_a_coincidente['precio']:,}\n"
-                        f"📱 *Tu Web:* Actualmente figura 'Sin Stock'."
-                    )
-                    enviar_telegram(msg_recuperado)
+                # Estás vendiendo más barato de lo que te cuesta comprarle al proveedor
+                bloque_precios_bajos += f"• *{datos_b['nombre_real']}*\n  📱 Tu web: ${datos_b['precio']:,} ➔ 📦 Proveedor: ${datos_a_coincidente['precio']:,}\n\n"
 
-    # Guardamos el estado para el siguiente ciclo de control
-    guardar_estado_actual({"productos_a": prod_a, "productos_b": prod_b, "pedidos_procesados": pedidos_procesados})
-    print("--- ✅ Ciclo completado e informe procesado ---")
+    # 6. DESPACHAR MENSAJES CONSOLIDADOS (Solo si contienen datos)
+    if bloque_ofertas:
+        enviar_telegram(f"🏷️ *¡Nuevos Descuentos en el Proveedor!*\n\n{bloque_ofertas}")
+        
+    if bloque_nuevos:
+        enviar_telegram(f"🔥 *¡Oportunidades de Stock / Nuevos Productos!*\n\n{bloque_nuevos}")
+        
+    if bloque_recuperados:
+        enviar_telegram(f"🔄 *¡Stock Recuperado en Proveedor!*\n\n{bloque_recuperados}")
+        
+    if bloque_precios_bajos:
+        enviar_telegram(f"📉 *¡Alerta de precios desactualizados en tu Web!*\n_Estás vendiendo por debajo del costo del proveedor:_\n\n{bloque_precios_bajos}")
+        
+    if bloque_faltantes:
+        enviar_telegram(f"⚠️ *¡Alerta de Stock Crítica!*\n_Tenés disponible algo que el proveedor ya no tiene:_\n\n{bloque_faltantes}")
+
+    # Guardamos el estado actual para la comparación del próximo ciclo
+    guardar_estado_actual({"productos_a": prod_a, "productos_b": prod_b, "pedidos_processed": pedidos_procesados, "pedidos_procesados": pedidos_procesados})
+    print("--- ✅ Ciclo completado e informe agrupado procesado ---")
 
 
 if __name__ == "__main__":
@@ -439,3 +435,4 @@ if __name__ == "__main__":
         procesar_logica()
         print("💤 Esperando 15 minutos hasta el próximo control...")
         time.sleep(900)
+
