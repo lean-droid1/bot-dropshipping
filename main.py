@@ -230,4 +230,272 @@ def verificar_pedido_contra_proveedor(pedido, prod_proveedor):
                 datos_prov = datos_a
                 break
                 
-        if encontrado and
+        if encontrado and datos_prov:
+            reporte += (
+                f"✅ *{item['nombre']}* (Cant: {item['cantidad']})\n"
+                f"• Proveedor: *CON STOCK* disponible a ${datos_prov['precio']:,}\n\n"
+            )
+        else:
+            todo_ok = False
+            reporte += (
+                f"❌ *{item['nombre']}* (Cant: {item['cantidad']})\n"
+                f"• Proveedor: 🔥 *SIN STOCK / NO DETECTADO*\n\n"
+            )
+            
+    if todo_ok:
+        reporte += "🚀 *Verificación:* El proveedor tiene stock de todo. ¡Podés armar el pedido!"
+    else:
+        reporte += "⚠️ *Verificación:* ¡Atención! Hay faltantes en la web del proveedor."
+    return reporte
+
+
+def extraer_variaciones_woocommerce(url_producto):
+    """
+    Función optimizada para desmenuzar las propiedades reales y 
+    controlar de forma estricta los faltantes ocultos en RXZ.
+    """
+    variaciones = {}
+    target_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={url_producto}"
+    try:
+        response = requests.get(target_url, timeout=30, verify=False)
+        if response.status_code != 200: return variaciones
+        
+        soup = BeautifulSoup(response.text, 'lxml')
+        form_variaciones = soup.find('form', class_='variations_form')
+        
+        if form_variaciones and form_variaciones.get('data-product_variations'):
+            raw_json = form_variaciones['data-product_variations']
+            data_variations = json.loads(raw_json)
+            
+            for var in data_variations:
+                # Capturar Atributos (ej: iPhone 11, Módulo V1SE)
+                atributos = [str(v).replace('-', ' ').replace('_', ' ').strip() for k, v in var.get('attributes', {}).items() if v]
+                if not atributos: 
+                    continue
+                texto_atributos = " - ".join(atributos).title()
+                
+                precio_display = var.get('display_price', 0)
+                
+                # Control estricto de Stock para RXZ
+                is_in_stock = var.get('is_in_stock', True)
+                html_variacion = var.get('variation_html', '').lower()
+                
+                if "agotado" in html_variacion or "out-of-stock" in html_variacion:
+                    is_in_stock = False
+                
+                if precio_display > 0 and is_in_stock:
+                    variaciones[texto_atributos] = {
+                        "precio": int(precio_display),
+                        "stock": True
+                    }
+    except Exception as e:
+        print(f"⚠️ Error desmenuzando variantes del link {url_producto}: {e}")
+    return variaciones
+
+
+def scrapear_web_a():
+    productos = {}
+    if not SCRAPERAPI_KEY:
+        print("❌ ERROR CRÍTICO: SCRAPERAPI_KEY no configurada.")
+        return productos
+
+    target_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={URL_A}"
+    try:
+        print("Consultando Web A (Proveedor) mediante túnel ScraperAPI...")
+        response = requests.get(target_url, timeout=60, verify=False)
+        if response.status_code != 200: return productos
+        
+        soup = BeautifulSoup(response.text, 'lxml')
+        items = soup.select('.product') or soup.find_all(['li', 'div'], class_=lambda x: x and 'product' in x)
+
+        for item in items:
+            title_el = item.find(['h2', 'h3', 'h4', 'a', 'p'], class_=lambda x: x and ('title' in x or 'woocommerce-loop' in x or 'name' in x))
+            price_el = item.find(class_=lambda x: x and ('price' in x or 'precio' in x))
+            link_el = item.find('a', href=True)
+            
+            if not title_el: title_el = item.find(['h2', 'h3', 'h4'])
+
+            if title_el and title_el.text.strip():
+                nombre_original = title_el.text.strip()
+                if len(nombre_original) < 4 or nombre_original.lower() == "productos": continue
+                nombre_clave = " ".join(nombre_original.lower().split())
+                
+                interesa = any(p in nombre_clave for p in PALABRAS_INTERES)
+                
+                es_variable = False
+                add_to_cart_el = item.find('a', class_='product_type_variable')
+                if add_to_cart_el or (price_el and "–" in price_el.text):
+                    es_variable = True
+
+                if interesa and es_variable and link_el:
+                    print(f"🔎 Producto variable detectado: '{nombre_original}'. Escaneando propiedades...")
+                    id_variaciones = extraer_variaciones_woocommerce(link_el['href'])
+                    
+                    for nombre_var, datos_var in id_variaciones.items():
+                        nombre_combinado = f"{nombre_original} ({nombre_var})"
+                        clave_combinada = nombre_combinado.lower()
+                        productos[clave_combinada] = {
+                            "nombre_real": nombre_combined = nombre_combinado,
+                            "precio": datos_var["precio"],
+                            "precio_anterior": 0,
+                            "en_oferta": False,
+                            "stock": datos_var["stock"]
+                        }
+                    time.sleep(1.0)
+                else:
+                    if price_el:
+                        precio, precio_anterior, en_oferta = procesar_html_precio(price_el)
+                        if precio > 0:
+                            productos[nombre_clave] = {
+                                "nombre_real": nombre_original,
+                                "precio": precio,
+                                "precio_anterior": precio_anterior,
+                                "en_oferta": en_oferta,
+                                "stock": True
+                            }
+    except Exception as e:
+        print(f"❌ Error en scraping de Web A: {e}")
+    return productos
+
+
+def scrapear_web_b():
+    productos = {}
+    pagina_actual = 1
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+    while True:
+        url = URL_B if pagina_actual == 1 else f"{URL_B}?page={pagina_actual}"
+        try:
+            print(f"Scrapeando Tu Tienda (Web B) - Página {pagina_actual}...")
+            response = requests.get(url, headers=headers, timeout=30)
+            if response.status_code != 200: break
+            soup = BeautifulSoup(response.text, 'lxml')
+            items = soup.find_all(['div', 'li', 'article', 'form'])
+            productos_en_pagina = 0
+            for item in items:
+                title_el = item.find(['h2', 'h3', 'h1', 'a'], class_=lambda x: x and ('title' in x or 'name' in x or 'producto' in x))
+                price_el = item.find(class_=lambda x: x and ('price' in x or 'precio' in x or 'money' in x))
+                if title_el and price_el and title_el.text.strip():
+                    nombre_original = title_el.text.strip()
+                    if len(nombre_original) < 4 or nombre_original.lower() == "productos": continue
+                    nombre_clave = " ".join(nombre_original.lower().split())
+                    if nombre_clave not in productos:
+                        precio, _, _ = procesar_html_precio(price_el)
+                        texto_producto = item.text.lower()
+                        tiene_stock = "sin stock" not in texto_producto and "agotado" not in texto_producto
+                        if precio > 0:
+                            productos[nombre_clave] = {
+                                "nombre_real": nombre_original,
+                                "precio": precio,
+                                "stock": tiene_stock
+                            }
+                            productos_en_pagina += 1
+            if productos_en_pagina == 0: break
+            pagina_actual += 1
+            time.sleep(0.5)
+        except Exception as e:
+            print(f"❌ Error en scraping de Web B: {e}")
+            break
+    return productos
+
+
+def procesar_logica():
+    print("\n--- 🔄 Iniciando Nuevo Ciclo de Monitoreo ---")
+    estado_anterior = cargar_estado_anterior()
+    pedidos_procesados = estado_anterior.get("pedidos_procesados", [])
+    historial_a_viejo = estado_anterior.get("productos_a", {})
+
+    # 1. CORREOS GMAIL
+    pedidos_nuevos = chequear_nuevos_pedidos_gmail()
+
+    # 2. ESCANEO DE AMBAS TIENDAS
+    prod_a = scrapear_web_a()
+    prod_b = scrapear_web_b()
+    
+    print(f"📊 Resumen: Web A (Con Variantes): {len(prod_a)} | Web B (Tu tienda): {len(prod_b)}")
+    if len(prod_a) == 0:
+        print("⚠️ Freno preventivo: El proveedor devolvió 0 productos.")
+        return
+
+    # 3. VERIFICAR COMPRAS RECIBIDAS
+    for ped in pedidos_nuevos:
+        if ped["id_mail"] not in pedidos_procesados:
+            msg_reporte = verificar_pedido_contra_proveedor(ped, prod_a)
+            enviar_telegram(msg_reporte)
+            pedidos_procesados.append(ped["id_mail"])
+
+    # BOLSAS CONSOLIDADAS
+    bloque_ofertas = ""
+    bloque_nuevos = ""
+    bloque_recuperados = ""
+    bloque_precios_bajos = ""
+    bloque_faltantes = ""
+
+    # 4. CRUCE DE ALERTAS DESDE EL PROVEEDOR
+    for nombre_clave, datos in prod_a.items():
+        interesa_producto = any(p in nombre_clave for p in PALABRAS_INTERES)
+        if not interesa_producto:
+            continue
+
+        estaba_antes_en_proveedor = nombre_clave in historial_a_viejo
+
+        # Ofertas Nuevas
+        if datos["en_oferta"]:
+            era_oferta_antes = historial_a_viejo.get(nombre_clave, {}).get("en_oferta", False) if estaba_antes_en_proveedor else False
+            if not era_oferta_antes:
+                bloque_ofertas += f"• *{datos['nombre_real']}*\n  💰 Reg: ${datos['precio_anterior']:,} ➔ *🔥 REBAJADO: ${datos['precio']:,}*\n\n"
+
+        # Variaciones u Oportunidades contra tu Inventario
+        lo_tengo_en_web = any(son_coincidentes_inteligentes(nombre_clave, cb) for cb in prod_b.keys())
+        
+        if not lo_tengo_en_web:
+            precio_anterior_prov = historial_a_viejo.get(nombre_clave, {}).get("precio", 0) if estaba_antes_en_proveedor else 0
+            if not estaba_antes_en_proveedor or precio_anterior_prov == 0:
+                bloque_nuevos += f"• *{datos['nombre_real']}*\n  📦 Costo proveedor: ${datos['precio']:,}\n  ⚠️ _Nota: No tenés esta propiedad cargada_\n\n"
+        else:
+            if not estaba_antes_en_proveedor and len(historial_a_viejo) > 0:
+                bloque_recuperados += f"• *{datos['nombre_real']}*\n  📦 Vuelve a tener stock a: ${datos['precio']:,}\n\n"
+
+    # 5. CONTROL DE PRECIOS Y FALTANTES EN TU TIENDA
+    for clave_b, datos_b in prod_b.items():
+        encontrado_en_proveedor = False
+        datos_a_coincidente = None
+        
+        for clave_a, datos_a in prod_a.items():
+            if son_coincidentes_inteligentes(clave_b, clave_a):
+                encontrado_en_proveedor = True
+                datos_a_coincidente = datos_a
+                break
+
+        if datos_b["stock"]:
+            if not encontrado_en_proveedor:
+                bloque_faltantes += f"• *{datos_b['nombre_real']}*\n  ❌ _Proveedor se quedó SIN STOCK_\n\n"
+            elif datos_a_coincidente and datos_b["precio"] < datos_a_coincidente["precio"]:
+                bloque_precios_bajos += f"• *{datos_b['nombre_real']}*\n  📱 Tu web: ${datos_b['precio']:,} ➔ 📦 Proveedor: ${datos_a_coincidente['precio']:,}\n\n"
+
+    # 6. ENVIAR REPORTES AGRUPADOS
+    if bloque_ofertas:
+        enviar_telegram(f"🏷️ *¡Nuevos Descuentos en el Proveedor!*\n\n{bloque_ofertas}")
+    if bloque_nuevos:
+        enviar_telegram(f"🔥 *¡Oportunidades de Stock / Nuevos Productos!*\n_Propiedades o productos del proveedor que NO tenés cargados en tu web:_\n\n{bloque_nuevos}")
+    if bloque_recuperados:
+        enviar_telegram(f"🔄 *¡Stock Recuperado en Proveedor!*\n\n{bloque_recuperados}")
+    if bloque_precios_bajos:
+        enviar_telegram(f"📉 *¡Alerta de precios desactualizados en tu Web!*\n_Estás vendiendo por debajo del costo:_\n\n{bloque_precios_bajos}")
+    if bloque_faltantes:
+        enviar_telegram(f"⚠️ *¡Alerta de Stock Crítica!*\n_Tenés disponible algo que el proveedor ya agotó:_\n\n{bloque_faltantes}")
+
+    # Guardado de base de datos limpia
+    guardar_estado_actual({
+        "productos_a": prod_a, 
+        "productos_b": prod_b, 
+        "pedidos_procesados": pedidos_procesados
+    })
+    print("--- ✅ Ciclo completado con desglose de variaciones estructurado ---")
+
+
+if __name__ == "__main__":
+    print("🚀 Bot de Control Iniciado Espectacularmente...")
+    while True:
+        procesar_logica()
+        print("💤 Esperando 15 minutos hasta el próximo control...")
+        time.sleep(900)
