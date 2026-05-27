@@ -141,7 +141,7 @@ def son_coincidentes_inteligentes(nombre1, nombre2):
     if not palabras_n1 or not palabras_n2: return False
     comunes = palabras_n1.intersection(palabras_n2)
     
-    # CONTROL DE NÚMEROS ESPECÍFICOS EN EL NÚCLEO (Ej: que no cruce serie 11 con 12)
+    # CONTROL DE NÚMEROS ESPECÍFICOS EN EL NÚCLEO
     numeros_n1 = {w for w in palabras_n1 if any(char.isdigit() for char in w)}
     numeros_n2 = {w for w in palabras_n2 if any(char.isdigit() for char in w)}
     if numeros_n1 or numeros_n2:
@@ -352,6 +352,7 @@ def scrapear_web_a():
                         clave_combinada = nombre_combinado.lower()
                         productos[clave_combinada] = {
                             "nombre_real": nombre_combinado,
+                            "nombre_base_proveedor": nombre_clave,  # Clave base limpia de marcas/modelo
                             "precio": datos_var["precio"],
                             "precio_anterior": 0,
                             "en_oferta": False,
@@ -364,6 +365,7 @@ def scrapear_web_a():
                         if precio > 0:
                             productos[nombre_clave] = {
                                 "nombre_real": nombre_original,
+                                "nombre_base_proveedor": nombre_clave,
                                 "precio": precio,
                                 "precio_anterior": precio_anterior,
                                 "en_oferta": en_oferta,
@@ -476,17 +478,34 @@ def procesar_logica():
         encontrado_en_proveedor = False
         datos_a_coincidente = None
         
+        # Primero buscamos coincidencia normal/exacta
         for clave_a, datos_a in prod_a.items():
             if son_coincidentes_inteligentes(clave_b, clave_a):
                 encontrado_en_proveedor = True
                 datos_a_coincidente = datos_a
                 break
+        
+        # --- PARCHE SEGURO PARA ENLAZAR PRODUCTO SIMPLE VS VARIANTES ---
+        if not encontrado_en_proveedor:
+            variantes_proveedor = []
+            for clave_a, datos_a in prod_a.items():
+                base_prov = datos_a.get("nombre_base_proveedor", "")
+                
+                # Usamos la lógica de aproximación inteligente sobre el nombre base puro del proveedor
+                if son_coincidentes_inteligentes(clave_b, base_prov):
+                    variantes_proveedor.append(datos_a)
+            
+            if variantes_proveedor:
+                encontrado_en_proveedor = True
+                # Usamos la variante de menor precio como referencia de costo
+                datos_a_coincidente = min(variantes_proveedor, key=lambda x: x["precio"])
+        # -----------------------------------------------------------
 
         if datos_b["stock"]:
             if not encontrado_en_proveedor:
                 bloque_faltantes += f"• *{datos_b['nombre_real']}*\n  ❌ _Proveedor se quedó SIN STOCK_\n\n"
             elif datos_a_coincidente and datos_b["precio"] < datos_a_coincidente["precio"]:
-                bloque_precios_bajos += f"• *{datos_b['nombre_real']}*\n  📱 Tu web: ${datos_b['precio']:,} ➔ 📦 Proveedor: ${datos_a_coincidente['precio']:,}\n\n"
+                bloque_precios_bajos += f"• *{datos_b['nombre_real']}*\n  📱 Tu web: ${datos_b['precio']:,} ➔ 📦 Proveedor (Min): ${datos_a_coincidente['precio']:,}\n\n"
 
     # 6. ENVIAR REPORTES AGRUPADOS
     if bloque_ofertas:
