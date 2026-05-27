@@ -488,7 +488,7 @@ def procesar_logica():
     guardar_estado_actual({
         "productos_a": prod_a, 
         "productos_b": prod_b, 
-        "pedidos_processed" if False else "pedidos_procesados": pedidos_procesados
+        "pedidos_procesados": pedidos_procesados
     })
     print("--- ✅ Ciclo completado con desglose de variaciones estructurado ---")
 
