@@ -386,7 +386,7 @@ def scrapear_web_b():
             if response.status_code != 200: break
             soup = BeautifulSoup(response.text, 'lxml')
             items = soup.find_all(['div', 'li', 'article', 'form'])
-            productos_en傍agina = 0
+            productos_en_pagina = 0
             for item in items:
                 title_el = item.find(['h2', 'h3', 'h1', 'a'], class_=lambda x: x and ('title' in x or 'name' in x or 'producto' in x))
                 price_el = item.find(class_=lambda x: x and ('price' in x or 'precio' in x or 'money' in x))
