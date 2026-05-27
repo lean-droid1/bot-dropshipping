@@ -104,13 +104,23 @@ def son_coincidentes_inteligentes(nombre1, nombre2):
     n1 = nombre1.lower()
     n2 = nombre2.lower()
     
+    # 1. CONTROL DE VARIANTES OCULTAS EN PARÉNTESIS (Ej: "producto (variante)")
+    # Extraemos lo que está afuera para comparar el núcleo del producto base
+    base_n1 = n1.split('(')[0].strip() if '(' in n1 else n1
+    base_n2 = n2.split('(')[0].strip() if '(' in n2 else n2
+    
+    # Palabras críticas de hardware que cambian por completo el producto
     palabras_criticas = ['mini', 'pro', 'plus', 'max', 'kit', 'ultra', 'xl', 'lw-a1']
+    
+    # Si estamos comparando el producto base puro, no dejamos que salte por palabras críticas del paréntesis
     for pc in palabras_criticas:
-        if (pc in n1 and pc not in n2) or (pc in n2 and pc not in n1):
-            return False
+        if (pc in base_n1 and pc not in base_n2) or (pc in base_n2 and pc not in base_n1):
+            if pc in base_n1 or pc in base_n2:
+                return False
 
-    n1_clean = re.sub(r'[^a-z0-9 ]', ' ', n1)
-    n2_clean = re.sub(r'[^a-z0-9 ]', ' ', n2)
+    # 2. LIMPIEZA DE STRINGS
+    n1_clean = re.sub(r'[^a-z0-9 ]', ' ', base_n1)
+    n2_clean = re.sub(r'[^a-z0-9 ]', ' ', base_n2)
     palabras_n1 = set(n1_clean.split())
     palabras_n2 = set(n2_clean.split())
     
@@ -121,13 +131,17 @@ def son_coincidentes_inteligentes(nombre1, nombre2):
     if not palabras_n1 or not palabras_n2: return False
     comunes = palabras_n1.intersection(palabras_n2)
     
+    # 3. CONTROL DE NÚMEROS (Ej: que no cruce iPhone 11 con iPhone 12)
     numeros_n1 = {w for w in palabras_n1 if any(char.isdigit() for char in w)}
     numeros_n2 = {w for w in palabras_n2 if any(char.isdigit() for char in w)}
     if numeros_n1 or numeros_n2:
         if numeros_n1 != numeros_n2: return False
             
+    # 4. TOLERANCIA DE COINCIDENCIA (Si el núcleo del nombre base coincide en un 80%, es el mismo producto)
     menor_cantidad = min(len(palabras_n1), len(palabras_n2))
-    return (len(comunes) / menor_cantidad) >= 0.85
+    if menor_cantidad == 0: return False
+    
+    return (len(comunes) / menor_cantidad) >= 0.80
 
 
 def extraer_productos_del_mail(cuerpo_texto):
