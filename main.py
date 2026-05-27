@@ -352,7 +352,7 @@ def scrapear_web_a():
                         clave_combinada = nombre_combinado.lower()
                         productos[clave_combinada] = {
                             "nombre_real": nombre_combinado,
-                            "nombre_base_proveedor": nombre_clave,  # Clave base limpia de marcas/modelo
+                            "nombre_base_proveedor": nombre_clave,
                             "precio": datos_var["precio"],
                             "precio_anterior": 0,
                             "en_oferta": False,
@@ -463,7 +463,13 @@ def procesar_logica():
                 bloque_ofertas += f"• *{datos['nombre_real']}*\n  💰 Reg: ${datos['precio_anterior']:,} ➔ *🔥 REBAJADO: ${datos['precio']:,}*\n\n"
 
         # Variaciones u Oportunidades contra tu Inventario
-        lo_tengo_en_web = any(son_coincidentes_inteligentes(nombre_clave, cb) for cb in prod_b.keys())
+        # --- PARCHE PARA EVITAR ALERTA DE NUEVO SI YA TENÉS EL BASE ---
+        base_prov = datos.get("nombre_base_proveedor", nombre_clave)
+        lo_tengo_en_web = any(
+            son_coincidentes_inteligentes(nombre_clave, cb) or son_coincidentes_inteligentes(base_prov, cb) 
+            for cb in prod_b.keys()
+        )
+        # -------------------------------------------------------------
         
         if not lo_tengo_en_web:
             precio_anterior_prov = historial_a_viejo.get(nombre_clave, {}).get("precio", 0) if estaba_antes_en_proveedor else 0
@@ -490,14 +496,11 @@ def procesar_logica():
             variantes_proveedor = []
             for clave_a, datos_a in prod_a.items():
                 base_prov = datos_a.get("nombre_base_proveedor", "")
-                
-                # Usamos la lógica de aproximación inteligente sobre el nombre base puro del proveedor
                 if son_coincidentes_inteligentes(clave_b, base_prov):
                     variantes_proveedor.append(datos_a)
             
             if variantes_proveedor:
                 encontrado_en_proveedor = True
-                # Usamos la variante de menor precio como referencia de costo
                 datos_a_coincidente = min(variantes_proveedor, key=lambda x: x["precio"])
         # -----------------------------------------------------------
 
