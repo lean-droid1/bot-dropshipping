@@ -104,17 +104,11 @@ def son_coincidentes_inteligentes(nombre1, nombre2):
     n1 = nombre1.lower()
     n2 = nombre2.lower()
     
-    # --- FILTRO SEPARADOR CRÍTICO (Evita cruzar Baterías con Face ID) ---
-    es_bateria1 = 'bateria' in n1 or 'battery' in n1 or 'bat' in n1
-    es_bateria2 = 'bateria' in n2 or 'battery' in n2 or 'bat' in n2
-    if es_bateria1 != es_bateria2:
-        return False
-
-    es_face1 = 'face' in n1 or 'id' in n1
-    es_face2 = 'face' in n2 or 'id' in n2
-    if es_face1 != es_face2:
-        return False
-    # -----------------------------------------------------------------
+    # --- FILTRO SEPARADOR CRÍTICO (Evita cruzar Baterías con Face ID o Manerales) ---
+    palabras_raiz = ['bateria', 'battery', 'bat', 'face', 'id', 'maneral', 'mango', 'zocalo', 'board']
+    for pr in palabras_raiz:
+        if (pr in n1 and pr not in n2) or (pr in n2 and pr not in n1):
+            return False
 
     # CONTROL DE VARIANTES OCULTAS EN PARÉNTESIS (Ej: "producto (variante)")
     base_n1 = n1.split('(')[0].strip() if '(' in n1 else n1
@@ -125,8 +119,7 @@ def son_coincidentes_inteligentes(nombre1, nombre2):
     
     for pc in palabras_criticas:
         if (pc in base_n1 and pc not in base_n2) or (pc in base_n2 and pc not in base_n1):
-            if pc in base_n1 or pc in base_n2:
-                return False
+            return False
 
     # LIMPIEZA DE STRINGS
     n1_clean = re.sub(r'[^a-z0-9 ]', ' ', base_n1)
@@ -172,7 +165,7 @@ def extraer_productos_del_mail(cuerpo_texto):
                 if match:
                     nombre_prod = match.group(1).strip()
                     cantidad = int(match.group(2).strip())
-                    productos_encontrados.append({"nombre": nombre_prod, "cantidad": cantidad})
+                    productos_encontrados.append({"nombre": nombre_prod, "cantidad": quantity})
     return productos_encontrados
 
 
@@ -385,7 +378,6 @@ def scrapear_web_b():
         url = URL_B if pagina_actual == 1 else f"{URL_B}?page={pagina_actual}"
         html_obtenido = None
         
-        # --- BLINDAJE ANTIFALLAS: Sistema de hasta 3 reintentos con delay ---
         for intento in range(1, 4):
             try:
                 print(f"Scrapeando Tu Tienda (Web B) - Página {pagina_actual} (Intento {intento})...")
@@ -400,7 +392,6 @@ def scrapear_web_b():
             time.sleep(2)
         
         if not html_obtenido:
-            print(f"🛑 Fin de paginación alcanzado o página inaccesible en la {pagina_actual}.")
             break
             
         soup = BeautifulSoup(html_obtenido, 'lxml')
@@ -448,9 +439,15 @@ def procesar_logica():
     prod_b = scrapear_web_b()
     
     print(f"📊 Resumen: Web A (Con Variantes): {len(prod_a)} | Web B (Tu tienda): {len(prod_b)}")
+    
+    # --- PROTECCIÓN ULTRA CONTRA CAÍDAS DEL PROVEEDOR ---
     if len(prod_a) == 0:
-        print("⚠️ Freno preventivo: El proveedor devolvió 0 productos.")
+        print("⚠️ Freno preventivo: El proveedor devolvió 0 productos. No pisamos el historial viejo.")
         return
+        
+    # Combinamos inteligentemente el historial para que errores parciales de ScraperAPI no causen falsas alarmas de stock recuperado
+    historial_proveedor_consolidado = historial_a_viejo.copy()
+    historial_proveedor_consolidado.update(prod_a)
 
     # 3. VERIFICAR COMPRAS RECIBIDAS
     for ped in pedidos_nuevos:
@@ -492,7 +489,9 @@ def procesar_logica():
             if not estaba_antes_en_proveedor or precio_anterior_prov == 0:
                 bloque_nuevos += f"• *{datos['nombre_real']}*\n  📦 Costo proveedor: ${datos['precio']:,}\n  ⚠️ _Nota: No tenés esta propiedad cargada_\n\n"
         else:
-            if not estaba_antes_en_proveedor and len(historial_a_viejo) > 0:
+            # Solo alertar de stock recuperado si REALMENTE estuvo en cero en el historial persistente de confianza
+            era_invalido_o_sin_stock = historial_a_viejo.get(nombre_clave, {}).get("stock", False) == False if estaba_antes_en_proveedor else False
+            if estaba_antes_en_proveedor and era_invalido_o_sin_stock:
                 bloque_recuperados += f"• *{datos['nombre_real']}*\n  📦 Vuelve a tener stock a: ${datos['precio']:,}\n\n"
 
     # 5. CONTROL DE PRECIOS Y FALTANTES EN TU TIENDA
@@ -500,14 +499,14 @@ def procesar_logica():
         encontrado_en_proveedor = False
         datos_a_coincidente = None
         
-        # Primero buscamos coincidencia normal/exacta
+        # Buscamos coincidencia normal/exacta
         for clave_a, datos_a in prod_a.items():
             if son_coincidentes_inteligentes(clave_b, clave_a):
                 encontrado_en_proveedor = True
                 datos_a_coincidente = datos_a
                 break
         
-        # Parche seguro para enlazar producto simple vs variantes
+        # Enlace seguro para producto simple vs variantes
         if not encontrado_en_proveedor:
             variantes_proveedor = []
             for clave_a, datos_a in prod_a.items():
@@ -537,13 +536,13 @@ def procesar_logica():
     if bloque_faltantes:
         enviar_telegram(f"⚠️ *¡Alerta de Stock Crítica!*\n_Tenés disponible algo que el proveedor ya agotó:_\n\n{bloque_faltantes}")
 
-    # Guardado de base de datos limpia
+    # Guardado seguro consolidado
     guardar_estado_actual({
-        "productos_a": prod_a, 
+        "productos_a": historial_proveedor_consolidado, 
         "productos_b": prod_b, 
         "pedidos_procesados": pedidos_procesados
     })
-    print("--- ✅ Ciclo completado con desglose de variaciones estructurado ---")
+    print("--- ✅ Ciclo completado sin bucles de falsos positivos ---")
 
 
 if __name__ == "__main__":
