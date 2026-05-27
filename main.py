@@ -104,21 +104,31 @@ def son_coincidentes_inteligentes(nombre1, nombre2):
     n1 = nombre1.lower()
     n2 = nombre2.lower()
     
-    # 1. CONTROL DE VARIANTES OCULTAS EN PARÉNTESIS (Ej: "producto (variante)")
-    # Extraemos lo que está afuera para comparar el núcleo del producto base
+    # --- FILTRO SEPARADOR CRÍTICO (Evita cruzar Baterías con Face ID) ---
+    es_bateria1 = 'bateria' in n1 or 'battery' in n1 or 'bat' in n1
+    es_bateria2 = 'bateria' in n2 or 'battery' in n2 or 'bat' in n2
+    if es_bateria1 != es_bateria2:
+        return False
+
+    es_face1 = 'face' in n1 or 'id' in n1
+    es_face2 = 'face' in n2 or 'id' in n2
+    if es_face1 != es_face2:
+        return False
+    # -----------------------------------------------------------------
+
+    # CONTROL DE VARIANTES OCULTAS EN PARÉNTESIS (Ej: "producto (variante)")
     base_n1 = n1.split('(')[0].strip() if '(' in n1 else n1
     base_n2 = n2.split('(')[0].strip() if '(' in n2 else n2
     
     # Palabras críticas de hardware que cambian por completo el producto
     palabras_criticas = ['mini', 'pro', 'plus', 'max', 'kit', 'ultra', 'xl', 'lw-a1']
     
-    # Si estamos comparando el producto base puro, no dejamos que salte por palabras críticas del paréntesis
     for pc in palabras_criticas:
         if (pc in base_n1 and pc not in base_n2) or (pc in base_n2 and pc not in base_n1):
             if pc in base_n1 or pc in base_n2:
                 return False
 
-    # 2. LIMPIEZA DE STRINGS
+    # LIMPIEZA DE STRINGS
     n1_clean = re.sub(r'[^a-z0-9 ]', ' ', base_n1)
     n2_clean = re.sub(r'[^a-z0-9 ]', ' ', base_n2)
     palabras_n1 = set(n1_clean.split())
@@ -131,13 +141,12 @@ def son_coincidentes_inteligentes(nombre1, nombre2):
     if not palabras_n1 or not palabras_n2: return False
     comunes = palabras_n1.intersection(palabras_n2)
     
-    # 3. CONTROL DE NÚMEROS (Ej: que no cruce iPhone 11 con iPhone 12)
+    # CONTROL DE NÚMEROS ESPECÍFICOS EN EL NÚCLEO (Ej: que no cruce serie 11 con 12)
     numeros_n1 = {w for w in palabras_n1 if any(char.isdigit() for char in w)}
     numeros_n2 = {w for w in palabras_n2 if any(char.isdigit() for char in w)}
     if numeros_n1 or numeros_n2:
         if numeros_n1 != numeros_n2: return False
             
-    # 4. TOLERANCIA DE COINCIDENCIA (Si el núcleo del nombre base coincide en un 80%, es el mismo producto)
     menor_cantidad = min(len(palabras_n1), len(palabras_n2))
     if menor_cantidad == 0: return False
     
@@ -264,10 +273,6 @@ def verificar_pedido_contra_proveedor(pedido, prod_proveedor):
 
 
 def extraer_variaciones_woocommerce(url_producto):
-    """
-    Función optimizada para desmenuzar las propiedades reales y 
-    controlar de forma estricta los faltantes ocultos en RXZ.
-    """
     variaciones = {}
     target_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={url_producto}"
     try:
@@ -282,15 +287,12 @@ def extraer_variaciones_woocommerce(url_producto):
             data_variations = json.loads(raw_json)
             
             for var in data_variations:
-                # Capturar Atributos (ej: iPhone 11, Módulo V1SE)
                 atributos = [str(v).replace('-', ' ').replace('_', ' ').strip() for k, v in var.get('attributes', {}).items() if v]
                 if not atributos: 
                     continue
                 texto_atributos = " - ".join(atributos).title()
                 
                 precio_display = var.get('display_price', 0)
-                
-                # Control estricto de Stock para RXZ
                 is_in_stock = var.get('is_in_stock', True)
                 html_variacion = var.get('variation_html', '').lower()
                 
@@ -384,7 +386,7 @@ def scrapear_web_b():
             if response.status_code != 200: break
             soup = BeautifulSoup(response.text, 'lxml')
             items = soup.find_all(['div', 'li', 'article', 'form'])
-            productos_en_pagina = 0
+            productos_en傍agina = 0
             for item in items:
                 title_el = item.find(['h2', 'h3', 'h1', 'a'], class_=lambda x: x and ('title' in x or 'name' in x or 'producto' in x))
                 price_el = item.find(class_=lambda x: x and ('price' in x or 'precio' in x or 'money' in x))
