@@ -380,39 +380,57 @@ def scrapear_web_b():
     productos = {}
     pagina_actual = 1
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+    
     while True:
         url = URL_B if pagina_actual == 1 else f"{URL_B}?page={pagina_actual}"
-        try:
-            print(f"Scrapeando Tu Tienda (Web B) - Página {pagina_actual}...")
-            response = requests.get(url, headers=headers, timeout=30)
-            if response.status_code != 200: break
-            soup = BeautifulSoup(response.text, 'lxml')
-            items = soup.find_all(['div', 'li', 'article', 'form'])
-            productos_en_pagina = 0
-            for item in items:
-                title_el = item.find(['h2', 'h3', 'h1', 'a'], class_=lambda x: x and ('title' in x or 'name' in x or 'producto' in x))
-                price_el = item.find(class_=lambda x: x and ('price' in x or 'precio' in x or 'money' in x))
-                if title_el and price_el and title_el.text.strip():
-                    nombre_original = title_el.text.strip()
-                    if len(nombre_original) < 4 or nombre_original.lower() == "productos": continue
-                    nombre_clave = " ".join(nombre_original.lower().split())
-                    if nombre_clave not in productos:
-                        precio, _, _ = procesar_html_precio(price_el)
-                        texto_producto = item.text.lower()
-                        tiene_stock = "sin stock" not in texto_producto and "agotado" not in texto_producto
-                        if precio > 0:
-                            productos[nombre_clave] = {
-                                "nombre_real": nombre_original,
-                                "precio": precio,
-                                "stock": tiene_stock
-                            }
-                            productos_en_pagina += 1
-            if productos_en_pagina == 0: break
-            pagina_actual += 1
-            time.sleep(0.5)
-        except Exception as e:
-            print(f"❌ Error en scraping de Web B: {e}")
+        html_obtenido = None
+        
+        # --- BLINDAJE ANTIFALLAS: Sistema de hasta 3 reintentos con delay ---
+        for intento in range(1, 4):
+            try:
+                print(f"Scrapeando Tu Tienda (Web B) - Página {pagina_actual} (Intento {intento})...")
+                response = requests.get(url, headers=headers, timeout=20)
+                if response.status_code == 200:
+                    html_obtenido = response.text
+                    break
+                elif response.status_code == 404:
+                    break
+            except Exception as e:
+                print(f"⚠️ Alerta temporal en Página {pagina_actual}: {e}")
+            time.sleep(2)
+        
+        if not html_obtenido:
+            print(f"🛑 Fin de paginación alcanzado o página inaccesible en la {pagina_actual}.")
             break
+            
+        soup = BeautifulSoup(html_obtenido, 'lxml')
+        items = soup.find_all(['div', 'li', 'article', 'form'])
+        productos_en_pagina = 0
+        
+        for item in items:
+            title_el = item.find(['h2', 'h3', 'h1', 'a'], class_=lambda x: x and ('title' in x or 'name' in x or 'producto' in x))
+            price_el = item.find(class_=lambda x: x and ('price' in x or 'precio' in x or 'money' in x))
+            if title_el and price_el and title_el.text.strip():
+                nombre_original = title_el.text.strip()
+                if len(nombre_original) < 4 or nombre_original.lower() == "productos": continue
+                nombre_clave = " ".join(nombre_original.lower().split())
+                if nombre_clave not in productos:
+                    precio, _, _ = procesar_html_precio(price_el)
+                    texto_producto = item.text.lower()
+                    tiene_stock = "sin stock" not in texto_producto and "agotado" not in texto_producto
+                    if precio > 0:
+                        productos[nombre_clave] = {
+                            "nombre_real": nombre_original,
+                            "precio": precio,
+                            "stock": tiene_stock
+                        }
+                        productos_en_pagina += 1
+                        
+        if productos_en_pagina == 0: 
+            break
+        pagina_actual += 1
+        time.sleep(0.5)
+        
     return productos
 
 
@@ -463,13 +481,11 @@ def procesar_logica():
                 bloque_ofertas += f"• *{datos['nombre_real']}*\n  💰 Reg: ${datos['precio_anterior']:,} ➔ *🔥 REBAJADO: ${datos['precio']:,}*\n\n"
 
         # Variaciones u Oportunidades contra tu Inventario
-        # --- PARCHE PARA EVITAR ALERTA DE NUEVO SI YA TENÉS EL BASE ---
         base_prov = datos.get("nombre_base_proveedor", nombre_clave)
         lo_tengo_en_web = any(
             son_coincidentes_inteligentes(nombre_clave, cb) or son_coincidentes_inteligentes(base_prov, cb) 
             for cb in prod_b.keys()
         )
-        # -------------------------------------------------------------
         
         if not lo_tengo_en_web:
             precio_anterior_prov = historial_a_viejo.get(nombre_clave, {}).get("precio", 0) if estaba_antes_en_proveedor else 0
@@ -491,7 +507,7 @@ def procesar_logica():
                 datos_a_coincidente = datos_a
                 break
         
-        # --- PARCHE SEGURO PARA ENLAZAR PRODUCTO SIMPLE VS VARIANTES ---
+        # Parche seguro para enlazar producto simple vs variantes
         if not encontrado_en_proveedor:
             variantes_proveedor = []
             for clave_a, datos_a in prod_a.items():
@@ -502,7 +518,6 @@ def procesar_logica():
             if variantes_proveedor:
                 encontrado_en_proveedor = True
                 datos_a_coincidente = min(variantes_proveedor, key=lambda x: x["precio"])
-        # -----------------------------------------------------------
 
         if datos_b["stock"]:
             if not encontrado_en_proveedor:
