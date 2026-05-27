@@ -104,26 +104,26 @@ def son_coincidentes_inteligentes(nombre1, nombre2):
     n1 = nombre1.lower()
     n2 = nombre2.lower()
     
-    # --- FILTRO SEPARADOR CRÍTICO (Evita cruzar Baterías con Face ID o Manerales) ---
+    # Si son exactamente iguales tras limpiar espacios, matchean directo
+    if " ".join(n1.split()) == " ".join(n2.split()):
+        return True
+    
+    # --- FILTRO SEPARADOR CRÍTICO ---
     palabras_raiz = ['bateria', 'battery', 'bat', 'face', 'id', 'maneral', 'mango', 'zocalo', 'board']
     for pr in palabras_raiz:
         if (pr in n1 and pr not in n2) or (pr in n2 and pr not in n1):
             return False
 
-    # CONTROL DE VARIANTES OCULTAS EN PARÉNTESIS (Ej: "producto (variante)")
     base_n1 = n1.split('(')[0].strip() if '(' in n1 else n1
     base_n2 = n2.split('(')[0].strip() if '(' in n2 else n2
     
-    # Palabras críticas de hardware que cambian por completo el producto
     palabras_criticas = ['mini', 'pro', 'plus', 'max', 'kit', 'ultra', 'xl', 'lw-a1']
-    
     for pc in palabras_criticas:
-        if (pc in base_n1 and pc not in base_n2) or (pc in base_n2 and pc not in base_n1):
+        if (pc in n1 and pc not in n2) or (pc in n2 and pc not in n1):
             return False
 
-    # LIMPIEZA DE STRINGS
-    n1_clean = re.sub(r'[^a-z0-9 ]', ' ', base_n1)
-    n2_clean = re.sub(r'[^a-z0-9 ]', ' ', base_n2)
+    n1_clean = re.sub(r'[^a-z0-9 ]', ' ', n1)
+    n2_clean = re.sub(r'[^a-z0-9 ]', ' ', n2)
     palabras_n1 = set(n1_clean.split())
     palabras_n2 = set(n2_clean.split())
     
@@ -134,7 +134,6 @@ def son_coincidentes_inteligentes(nombre1, nombre2):
     if not palabras_n1 or not palabras_n2: return False
     comunes = palabras_n1.intersection(palabras_n2)
     
-    # CONTROL DE NÚMEROS ESPECÍFICOS EN EL NÚCLEO
     numeros_n1 = {w for w in palabras_n1 if any(char.isdigit() for char in w)}
     numeros_n2 = {w for w in palabras_n2 if any(char.isdigit() for char in w)}
     if numeros_n1 or numeros_n2:
@@ -143,7 +142,7 @@ def son_coincidentes_inteligentes(nombre1, nombre2):
     menor_cantidad = min(len(palabras_n1), len(palabras_n2))
     if menor_cantidad == 0: return False
     
-    return (len(comunes) / menor_cantidad) >= 0.80
+    return (len(comunes) / menor_cantidad) >= 0.85
 
 
 def extraer_productos_del_mail(cuerpo_texto):
@@ -165,7 +164,7 @@ def extraer_productos_del_mail(cuerpo_texto):
                 if match:
                     nombre_prod = match.group(1).strip()
                     cantidad = int(match.group(2).strip())
-                    productos_encontrados.append({"nombre": nombre_prod, "cantidad": quantity})
+                    productos_encontrados.append({"nombre": nombre_prod, "cantidad": cantidad})
     return productos_encontrados
 
 
@@ -378,6 +377,9 @@ def scrapear_web_b():
         url = URL_B if pagina_actual == 1 else f"{URL_B}?page={pagina_actual}"
         html_obtenido = None
         
+        # Corrección crítica: Inicializamos la variable siempre para evitar UnboundLocalError
+        productos_en_pagina = 0
+        
         for intento in range(1, 4):
             try:
                 print(f"Scrapeando Tu Tienda (Web B) - Página {pagina_actual} (Intento {intento})...")
@@ -396,7 +398,6 @@ def scrapear_web_b():
             
         soup = BeautifulSoup(html_obtenido, 'lxml')
         items = soup.find_all(['div', 'li', 'article', 'form'])
-        productos_en_pagina = 0
         
         for item in items:
             title_el = item.find(['h2', 'h3', 'h1', 'a'], class_=lambda x: x and ('title' in x or 'name' in x or 'producto' in x))
@@ -445,7 +446,6 @@ def procesar_logica():
         print("⚠️ Freno preventivo: El proveedor devolvió 0 productos. No pisamos el historial viejo.")
         return
         
-    # Combinamos inteligentemente el historial para que errores parciales de ScraperAPI no causen falsas alarmas de stock recuperado
     historial_proveedor_consolidado = historial_a_viejo.copy()
     historial_proveedor_consolidado.update(prod_a)
 
@@ -489,7 +489,6 @@ def procesar_logica():
             if not estaba_antes_en_proveedor or precio_anterior_prov == 0:
                 bloque_nuevos += f"• *{datos['nombre_real']}*\n  📦 Costo proveedor: ${datos['precio']:,}\n  ⚠️ _Nota: No tenés esta propiedad cargada_\n\n"
         else:
-            # Solo alertar de stock recuperado si REALMENTE estuvo en cero en el historial persistente de confianza
             era_invalido_o_sin_stock = historial_a_viejo.get(nombre_clave, {}).get("stock", False) == False if estaba_antes_en_proveedor else False
             if estaba_antes_en_proveedor and era_invalido_o_sin_stock:
                 bloque_recuperados += f"• *{datos['nombre_real']}*\n  📦 Vuelve a tener stock a: ${datos['precio']:,}\n\n"
@@ -499,14 +498,12 @@ def procesar_logica():
         encontrado_en_proveedor = False
         datos_a_coincidente = None
         
-        # Buscamos coincidencia normal/exacta
         for clave_a, datos_a in prod_a.items():
             if son_coincidentes_inteligentes(clave_b, clave_a):
                 encontrado_en_proveedor = True
                 datos_a_coincidente = datos_a
                 break
         
-        # Enlace seguro para producto simple vs variantes
         if not encontrado_en_proveedor:
             variantes_proveedor = []
             for clave_a, datos_a in prod_a.items():
