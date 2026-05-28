@@ -9,9 +9,9 @@ import imaplib
 import email
 from email.header import decode_header
 from datetime import datetime, timedelta
-import threading  # <-- CRÍTICO: Para correr los comandos en paralelo sin congelar el scraping
+import threading
 
-# Desactivar advertencias de certificados SSL para evitar ruidos en consola
+# Desactivar advertencias de certificados SSL
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # Configuración de URLs y Base de Datos local
@@ -19,12 +19,12 @@ URL_A = "https://rxzweb.com/tienda/?et_per_page=-1"
 URL_B = "https://leandroid.tiendanegocio.com/productos"
 DB_FILE = "estado_productos.json"
 
-# CONFIGURACIÓN NATIVA API (TIENDA DEMO)
-URL_API_OAUTH = "https://developers.tiendanegocio.com/v1/oauth/token"
-URL_API_PRODUCTS = "https://developers.tiendanegocio.com/v1/products"
+# CONFIGURACIÓN NATIVA API CORREGIDA (TIENDA NEGOCIO)
+URL_API_OAUTH = "https://api.tiendanegocio.com/v1/oauth/token"
+URL_API_PRODUCTS = "https://api.tiendanegocio.com/v1/products"
 USER_AGENT_API = "dropshipping (lean.6roid@gmail.com)"
 
-# LISTA DE MARCAS Y PALABRAS DE INTERÉS PARA ALERTAS DE NUEVOS/OFERTAS
+# LISTA DE MARCAS Y PALABRAS DE INTERÉS
 PALABRAS_INTERES = [
     'ma ant', 'amaoe', '2uul', 'goot wick', 'mijing', 'louwei', 
     'rf4', 'jakemy', 'kailiwei', 'kslid', 'aifen', 'sugon', 'jcid', 'jc',
@@ -32,7 +32,7 @@ PALABRAS_INTERES = [
     'organizador', 'cinta', 'silla', 'mesa', 'puas', 'hilo', 'cepillo'
 ]
 
-# Captura limpia de variables de entorno de Railway
+# Captura de variables de entorno de Railway
 TELEGRAM_TOKEN = None
 CHAT_ID = None
 SCRAPERAPI_KEY = None
@@ -63,12 +63,7 @@ def enviar_telegram(mensaje):
         print(f"❌ Error al enviar a Telegram: {e}")
 
 
-# =========================================================================
-# 🧪 NUEVAS FUNCIONES: INTERFAZ API TIENDA DEMO Y COMANDOS EN VIVO
-# =========================================================================
-
 def intercambiar_codigo_por_token(auth_code):
-    """Llamada nativa a TiendaNegocio para obtener el Access Token."""
     headers = {
         "Content-Type": "application/json; charset=utf-8",
         "User-Agent": USER_AGENT_API
@@ -92,18 +87,15 @@ def intercambiar_codigo_por_token(auth_code):
 
 
 def buscar_id_por_nombre_api(token, nombre_buscado):
-    """Busca el ID interno de un producto en la tienda demo usando su nombre."""
     headers = {
         "Authorization": f"Bearer {token}",
         "User-Agent": USER_AGENT_API
     }
     try:
-        # Buscamos en la lista de productos por API
         response = requests.get(f"{URL_API_PRODUCTS}?per_page=100", headers=headers, timeout=15)
         if response.status_code == 200:
             productos = response.json().get("results", [])
             for p in productos:
-                # Comparamos usando tu misma lógica inteligente
                 if son_coincidentes_inteligentes(p.get("name", ""), nombre_buscado):
                     return p.get("id")
         return None
@@ -113,7 +105,6 @@ def buscar_id_por_nombre_api(token, nombre_buscado):
 
 
 def modificar_stock_api(token, producto_id, nuevo_stock):
-    """Cambia el stock en la tienda demo por API."""
     headers = {
         "Authorization": f"Bearer {token}",
         "Content-Type": "application/json; charset=utf-8",
@@ -130,14 +121,11 @@ def modificar_stock_api(token, producto_id, nuevo_stock):
 
 
 def bucle_escucha_telegram():
-    """Hilo paralelo que atiende tus mensajes en Telegram en tiempo real."""
     if not TELEGRAM_TOKEN:
         return
-        
     offset = 0
     url_updates = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
     print("📡 Hilo de escucha de comandos de Telegram activado en vivo...")
-    
     while True:
         try:
             response = requests.get(f"{url_updates}?offset={offset}&timeout=10", timeout=15)
@@ -148,53 +136,38 @@ def bucle_escucha_telegram():
                     message = update.get("message", {})
                     texto = message.get("text", "")
                     chat_id_remitente = str(message.get("chat", {}).get("id", ""))
-                    
-                    # Solo respondemos si el mensaje viene de tu CHAT_ID configurado
                     if chat_id_remitente != CHAT_ID:
                         continue
-                        
                     if "?code=" in texto:
-                        # Extraemos el código de la URL
                         auth_code = texto.split("?code=")[1].split("&")[0].strip()
                         enviar_telegram("🧪 *[ENTORNO DE PRUEBAS]*\nCódigo detectado en tiempo real. Autenticando con la API...")
-                        
                         token = intercambiar_codigo_por_token(auth_code)
                         if token:
-                            enviar_telegram("🧪 *[ENTORNO DE PRUEBAS]*\n¡Conexión Exitosa con la API! Buscando 'Programadora JC V1S Pro' en tu catálogo espejo...")
-                            
-                            # Buscamos el ID real de la programadora en tu tienda demo
+                            enviar_telegram("🧪 *[ENTORNO DE PRUEBAS]*\n¡Conexión Exitosa con la API! Buscando 'Programadora JC V1S Pro'...")
                             prod_id = buscar_id_por_nombre_api(token, "Programadora JC V1S Pro")
-                            
                             if prod_id:
-                                # Le clavamos stock 0 para la prueba
                                 exito = modificar_stock_api(token, prod_id, 0)
                                 if exito:
                                     enviar_telegram("🧪 *[ENTORNO DE PRUEBAS]*\n📦 *Sincronización Completa*\nLa 'Programadora JC V1S Pro' se modificó correctamente a *Stock: 0* vía API.")
                                 else:
-                                    enviar_telegram("❌ *[ENTORNO DE PRUEBAS]*\nEl token es correcto, pero TiendaNegocio rechazó el comando PUT de modificación.")
+                                    enviar_telegram("❌ *[ENTORNO DE PRUEBAS]*\nEl token es correcto, pero TiendaNegocio rechazó el comando PUT.")
                             else:
-                                enviar_telegram("❌ *[ENTORNO DE PRUEBAS]*\nNo encontré ningún producto que coincida con 'Programadora JC V1S Pro' en el Excel que subiste.")
+                                enviar_telegram("❌ *[ENTORNO DE PRUEBAS]*\nNo encontré el producto 'Programadora JC V1S Pro' en tu catálogo.")
                         else:
-                            enviar_telegram("❌ *[ENTORNO DE PRUEBAS]*\nError al generar el Token definitivo. El código de la URL ya expiró o las credenciales fallaron.")
+                            enviar_telegram("❌ *[ENTORNO DE PRUEBAS]*\nError al generar el Token definitivo. Revisá la URL de la API.")
         except Exception as e:
             print(f"⚠️ Alerta en hilo de Telegram: {e}")
         time.sleep(1)
 
-# =========================================================================
-# LÓGICA DE MONITOREO ORIGINAL (MANTENIDA COMPLETAMENTE INTACTA)
-# =========================================================================
 
 def cargar_estado_anterior():
     if os.path.exists(DB_FILE):
         try:
             with open(DB_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                if "pedidos_procesados" not in data:
-                    data["pedidos_procesados"] = []
-                if "productos_a" not in data:
-                    data["productos_a"] = {}
-                if "productos_b" not in data:
-                    data["productos_b"] = {}
+                if "pedidos_procesados" not in data: data["pedidos_procesados"] = []
+                if "productos_a" not in data: data["productos_a"] = {}
+                if "productos_b" not in data: data["productos_b"] = {}
                 return data
         except Exception:
             return {"productos_a": {}, "productos_b": {}, "pedidos_procesados": []}
@@ -234,18 +207,15 @@ def procesar_html_precio(html_precio):
 def son_coincidentes_inteligentes(nombre1, nombre2):
     n1 = nombre1.lower()
     n2 = nombre2.lower()
-    if " ".join(n1.split()) == " ".join(n2.split()):
-        return True
+    if " ".join(n1.split()) == " ".join(n2.split()): return True
     palabras_raiz = ['bateria', 'battery', 'bat', 'face', 'id', 'maneral', 'mango', 'zocalo', 'board']
     for pr in palabras_raiz:
-        if (pr in n1 and pr not in n2) or (pr in n2 and pr not in n1):
-            return False
+        if (pr in n1 and pr not in n2) or (pr in n2 and pr not in n1): return False
     base_n1 = n1.split('(')[0].strip() if '(' in n1 else n1
     base_n2 = n2.split('(')[0].strip() if '(' in n2 else n2
     palabras_criticas = ['mini', 'pro', 'plus', 'max', 'kit', 'ultra', 'xl', 'lw-a1']
     for pc in palabras_criticas:
-        if (pc in n1 and pc not in n2) or (pc in n2 and pc not in n1):
-            return False
+        if (pc in n1 and pc not in n2) or (pc in n2 and pc not in n1): return False
     n1_clean = re.sub(r'[^a-z0-9 ]', ' ', n1)
     n2_clean = re.sub(r'[^a-z0-9 ]', ' ', n2)
     palabras_n1 = set(n1_clean.split())
@@ -288,8 +258,7 @@ def extraer_productos_del_mail(cuerpo_texto):
 
 def chequear_nuevos_pedidos_gmail():
     pedidos = []
-    if not GMAIL_USER or not GMAIL_PASS:
-        return pedidos
+    if not GMAIL_USER or not GMAIL_PASS: return pedidos
     try:
         mail = imaplib.IMAP4_SSL("imap.gmail.com")
         mail.login(GMAIL_USER, GMAIL_PASS)
@@ -309,8 +278,7 @@ def chequear_nuevos_pedidos_gmail():
             raw_email = data[0][1]
             msg = email.message_from_bytes(raw_email)
             subject, encoding = decode_header(msg["Subject"])[0]
-            if isinstance(subject, bytes):
-                subject = subject.decode(encoding or "utf-8")
+            if isinstance(subject, bytes): subject = subject.decode(encoding or "utf-8")
             asunto_minuscula = subject.lower()
             if any(palabra in asunto_minuscula for palabra in ["compra", "realizó", "pedido", "venta"]):
                 match_orden = re.search(r'#(\d+)', subject)
@@ -325,11 +293,7 @@ def chequear_nuevos_pedidos_gmail():
                     cuerpo = msg.get_payload(decode=True).decode("utf-8", errors="ignore")
                 lista_items = extraer_productos_del_mail(cuerpo)
                 if lista_items:
-                    pedidos.append({
-                        "id_mail": str_id,
-                        "num_orden": num_orden_tienda,
-                        "productos": lista_items
-                    })
+                    pedidos.append({"id_mail": str_id, "num_orden": num_orden_tienda, "productos": lista_items})
         mail.close()
         mail.logout()
     except Exception as e:
@@ -379,8 +343,7 @@ def extraer_variaciones_woocommerce(url_producto):
                 precio_display = var.get('display_price', 0)
                 is_in_stock = var.get('is_in_stock', True)
                 html_variacion = var.get('variation_html', '').lower()
-                if "agotado" in html_variacion or "out-of-stock" in html_variacion:
-                    is_in_stock = False
+                if "agotado" in html_variacion or "out-of-stock" in html_variacion: is_in_stock = False
                 if precio_display > 0 and is_in_stock:
                     variaciones[texto_atributos] = {"precio": int(precio_display), "stock": True}
     except Exception as e:
@@ -390,12 +353,10 @@ def extraer_variaciones_woocommerce(url_producto):
 
 def scrapear_web_a():
     productos = {}
-    if not SCRAPERAPI_KEY:
-        print("❌ ERROR CRÍTICO: SCRAPERAPI_KEY no configurada.")
-        return productos
+    if not SCRAPERAPI_KEY: return productos
     target_url = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={URL_A}"
     try:
-        print("Consultando Web A (Proveedor) mediante túnel ScraperAPI...")
+        print("Consultando Web A (Proveedor)...")
         response = requests.get(target_url, timeout=60, verify=False)
         if response.status_code != 200: return productos
         soup = BeautifulSoup(response.text, 'lxml')
@@ -410,17 +371,12 @@ def scrapear_web_a():
                 if len(nombre_original) < 4 or nombre_original.lower() == "productos": continue
                 nombre_clave = " ".join(nombre_original.lower().split())
                 interesa = any(p in nombre_clave for p in PALABRAS_INTERES)
-                es_variable = False
-                add_to_cart_el = item.find('a', class_='product_type_variable')
-                if add_to_cart_el or (price_el and "–" in price_el.text):
-                    es_variable = True
+                es_variable = item.find('a', class_='product_type_variable') or (price_el and "–" in price_el.text)
                 if interesa and es_variable and link_el:
-                    print(f"🔎 Producto variable detectado: '{nombre_original}'. Escaneando propiedades...")
                     id_variaciones = extraer_variaciones_woocommerce(link_el['href'])
                     for nombre_var, datos_var in id_variaciones.items():
                         nombre_combinado = f"{nombre_original} ({nombre_var})"
-                        clave_combinada = nombre_combinado.lower()
-                        productos[clave_combinada] = {
+                        productos[nombre_combinado.lower()] = {
                             "nombre_real": nombre_combinado,
                             "nombre_base_proveedor": nombre_clave,
                             "precio": datos_var["precio"],
@@ -456,18 +412,17 @@ def scrapear_web_b():
         productos_en_pagina = 0
         for intento in range(1, 4):
             try:
-                print(f"Scrapeando Tu Tienda (Web B) - Página {pagina_actual} (Intento {intento})...")
+                print(f"Scrapeando Tu Tienda (Web B) - Página {pagina_actual}...")
                 response = requests.get(url, headers=headers, timeout=20)
                 if response.status_code == 200:
                     html_obtenido = response.text
                     break
                 elif response.status_code == 404:
                     break
-            except Exception as e:
-                print(f"⚠️ Alerta temporal en Página {pagina_actual}: {e}")
+            except Exception:
+                pass
             time.sleep(2)
-        if not html_obtenido:
-            break
+        if not html_obtenido: break
         soup = BeautifulSoup(html_obtenido, 'lxml')
         items = soup.find_all(['div', 'li', 'article', 'form'])
         for item in items:
@@ -484,8 +439,7 @@ def scrapear_web_b():
                     if precio > 0:
                         productos[nombre_clave] = {"nombre_real": nombre_original, "precio": precio, "stock": tiene_stock}
                         productos_en_pagina += 1
-        if productos_en_pagina == 0: 
-            break
+        if productos_en_pagina == 0: break
         pagina_actual += 1
         time.sleep(0.5)
     return productos
@@ -497,106 +451,67 @@ def procesar_logica():
     pedidos_procesados = estado_anterior.get("pedidos_procesados", [])
     historial_a_viejo = estado_anterior.get("productos_a", {})
 
-    # 1. CORREOS GMAIL
     pedidos_nuevos = chequear_nuevos_pedidos_gmail()
-
-    # 2. ESCANEO DE AMBAS TIENDAS
     prod_a = scrapear_web_a()
     prod_b = scrapear_web_b()
-    print(f"📊 Resumen: Web A (Con Variantes): {len(prod_a)} | Web B (Tu tienda): {len(prod_b)}")
     
     if len(prod_a) == 0:
-        print("⚠️ Freno preventivo: El proveedor devolvió 0 productos. No pisamos el historial viejo.")
+        print("⚠️ Freno preventivo: El proveedor devolvió 0 productos.")
         return
         
     historial_proveedor_consolidado = historial_a_viejo.copy()
     historial_proveedor_consolidado.update(prod_a)
 
-    # 3. VERIFICAR COMPRAS RECIBIDAS
     for ped in pedidos_nuevos:
         if ped["id_mail"] not in pedidos_procesados:
             msg_reporte = verificar_pedido_contra_proveedor(ped, prod_a)
             enviar_telegram(msg_reporte)
             pedidos_procesados.append(ped["id_mail"])
 
-    bloque_ofertas = ""
-    bloque_nuevos = ""
-    bloque_recuperados = ""
-    bloque_precios_bajos = ""
-    bloque_faltantes = ""
+    bloque_ofertas, bloque_nuevos, bloque_recuperados, bloque_precios_bajos, bloque_faltantes = "", "", "", "", ""
 
-    # 4. CRUCE DE ALERTAS DESDE EL PROVEEDOR
     for nombre_clave, datos in prod_a.items():
-        interesa_producto = any(p in nombre_clave for p in PALABRAS_INTERES)
-        if not interesa_producto: continue
-
+        if not any(p in nombre_clave for p in PALABRAS_INTERES): continue
         estaba_antes_en_proveedor = nombre_clave in historial_a_viejo
-        if datos["en_oferta"]:
-            era_oferta_antes = historial_a_viejo.get(nombre_clave, {}).get("en_oferta", False) if estaba_antes_en_proveedor else False
-            if not era_oferta_antes:
-                bloque_ofertas += f"• *{datos['nombre_real']}*\n  💰 Reg: ${datos['precio_anterior']:,} ➔ *🔥 REBAJADO: ${datos['precio']:,}*\n\n"
+        if datos["en_oferta"] and not (historial_a_viejo.get(nombre_clave, {}).get("en_oferta", False) if estaba_antes_en_proveedor else False):
+            bloque_ofertas += f"• *{datos['nombre_real']}*\n  💰 Reg: ${datos['precio_anterior']:,} ➔ *🔥 REBAJADO: ${datos['precio']:,}*\n\n"
 
         base_prov = datos.get("nombre_base_proveedor", nombre_clave)
         lo_tengo_en_web = any(son_coincidentes_inteligentes(nombre_clave, cb) or son_coincidentes_inteligentes(base_prov, cb) for cb in prod_b.keys())
-        
-        if not lo_tengo_en_web:
-            precio_anterior_prov = historial_a_viejo.get(nombre_clave, {}).get("precio", 0) if estaba_antes_en_proveedor else 0
-            if not estaba_antes_en_proveedor or precio_anterior_prov == 0:
-                bloque_nuevos += f"• *{datos['nombre_real']}*\n  📦 Costo proveedor: ${datos['precio']:,}\n  ⚠️ _Nota: No tenés esta propiedad cargada_\n\n"
-        else:
-            era_invalido_o_sin_stock = historial_a_viejo.get(nombre_clave, {}).get("stock", False) == False if estaba_antes_en_proveedor else False
-            if estaba_antes_en_proveedor and era_invalido_o_sin_stock:
-                bloque_recuperados += f"• *{datos['nombre_real']}*\n  📦 Vuelve a tener stock a: ${datos['precio']:,}\n\n"
+        if not lo_tengo_en_web and (not estaba_antes_en_proveedor or historial_a_viejo.get(nombre_clave, {}).get("precio", 0) == 0):
+            bloque_nuevos += f"• *{datos['nombre_real']}*\n  📦 Costo proveedor: ${datos['precio']:,}\n\n"
+        elif lo_tengo_en_web and estaba_antes_en_proveedor and not historial_a_viejo.get(nombre_clave, {}).get("stock", False):
+            bloque_recuperados += f"• *{datos['nombre_real']}*\n  📦 Vuelve a tener stock a: ${datos['precio']:,}\n\n"
 
-    # 5. CONTROL DE PRECIOS Y FALTANTES EN TU TIENDA
     for clave_b, datos_b in prod_b.items():
-        encontrado_en_proveedor = False
-        datos_a_coincidente = None
+        encontrado, datos_a_coincidente = False, None
         for clave_a, datos_a in prod_a.items():
             if son_coincidentes_inteligentes(clave_b, clave_a):
-                encontrado_en_proveedor = True
-                datos_a_coincidente = datos_a
+                encontrado, datos_a_coincidente = True, datos_a
                 break
-        if not encontrado_en_proveedor:
-            variantes_proveedor = []
-            for clave_a, datos_a in prod_a.items():
-                base_prov = datos_a.get("nombre_base_proveedor", "")
-                if son_coincidentes_inteligentes(clave_b, base_prov):
-                    variantes_proveedor.append(datos_a)
-            if variantes_proveedor:
-                encontrado_en_proveedor = True
-                datos_a_coincidente = min(variantes_proveedor, key=lambda x: x["precio"])
+        if not encontrado:
+            variantes = [d for c, d in prod_a.items() if son_coincidentes_inteligentes(clave_b, d.get("nombre_base_proveedor", ""))]
+            if variantes: encontrado, datos_a_coincidente = True, min(variantes, key=lambda x: x["precio"])
 
         if datos_b["stock"]:
-            if not encontrado_en_proveedor:
-                bloque_faltantes += f"• *{datos_b['nombre_real']}*\n  ❌ _Proveedor se quedó SIN STOCK_\n\n"
+            if not encontrado: bloque_faltantes += f"• *{datos_b['nombre_real']}*\n  ❌ _Proveedor se quedó SIN STOCK_\n\n"
             elif datos_a_coincidente and datos_b["precio"] < datos_a_coincidente["precio"]:
-                bloque_precios_bajos += f"• *{datos_b['nombre_real']}*\n  📱 Tu web: ${datos_b['precio']:,} ➔ 📦 Proveedor (Min): ${datos_a_coincidente['precio']:,}\n\n"
+                bloque_precios_bajos += f"• *{datos_b['nombre_real']}*\n  📱 Tu web: ${datos_b['precio']:,} ➔ 📦 Proveedor: ${datos_a_coincidente['precio']:,}\n\n"
 
-    # 6. ENVIAR REPORTES AGRUPADOS
     if bloque_ofertas: enviar_telegram(f"🏷️ *¡Nuevos Descuentos en el Proveedor!*\n\n{bloque_ofertas}")
-    if bloque_nuevos: enviar_telegram(f"🔥 *¡Oportunidades de Stock / Nuevos Productos!*\n_Propiedades o productos del proveedor que NO tenés cargados en tu web:_\n\n{bloque_nuevos}")
+    if bloque_nuevos: enviar_telegram(f"🔥 *¡Oportunidades de Stock / Nuevos Productos!*\n\n{bloque_nuevos}")
     if bloque_recuperados: enviar_telegram(f"🔄 *¡Stock Recuperado en Proveedor!*\n\n{bloque_recuperados}")
-    if bloque_precios_bajos: enviar_telegram(f"📉 *¡Alerta de precios desactualizados en tu Web!*\n_Estás vendiendo por debajo del costo:_\n\n{bloque_precios_bajos}")
-    if bloque_faltantes: enviar_telegram(f"⚠️ *¡Alerta de Stock Crítica!*\n_Tenés disponible algo que el proveedor ya agotó:_\n\n{bloque_faltantes}")
+    if bloque_precios_bajos: enviar_telegram(f"📉 *¡Alerta de precios desactualizados en tu Web!*\n\n{bloque_precios_bajos}")
+    if bloque_faltantes: enviar_telegram(f"⚠️ *¡Alerta de Stock Crítica!*\n\n{bloque_faltantes}")
 
-    guardar_estado_actual({
-        "productos_a": historial_proveedor_consolidado, 
-        "productos_b": prod_b, 
-        "pedidos_procesados": pedidos_procesados
-    })
+    guardar_estado_actual({"productos_a": historial_proveedor_consolidado, "productos_b": prod_b, "pedidos_procesados": pedidos_procesados})
     print("--- ✅ Ciclo completado sin bucles de falsos positivos ---")
 
 
 if __name__ == "__main__":
     print("🚀 Bot de Control Iniciado Espectacularmente...")
-    
-    # --- ACTIVACIÓN DEL HILO DE TELEGRAM EN PARALELO ---
-    # Corre de fondo atendiendo tus links/comandos instantáneamente
     hilo_comandos = threading.Thread(target=bucle_escucha_telegram, daemon=True)
     hilo_comandos.start()
-    
-    # Bucle principal de Scraping (Sigue corriendo cada 15 minutos)
     while True:
         procesar_logica()
         print("💤 Esperando 15 minutos hasta el próximo control...")
