@@ -20,8 +20,8 @@ URL_B = "https://leandroid.tiendanegocio.com/productos"
 DB_FILE = "estado_productos.json"
 
 # CONFIGURACIÓN NATIVA API CORREGIDA (TIENDA NEGOCIO)
-URL_API_OAUTH = "https://api.tiendanegocio.com/v1/oauth/token"
-URL_API_PRODUCTS = "https://api.tiendanegocio.com/v1/products"
+URL_API_OAUTH = "https://www.tiendanegocio.com/apps/authorize/token"
+URL_API_PRODUCTS = "https://www.tiendanegocio.com/api/v1/products"
 USER_AGENT_API = "dropshipping (lean.6roid@gmail.com)"
 
 # LISTA DE MARCAS Y PALABRAS DE INTERÉS
@@ -116,7 +116,7 @@ def modificar_stock_api(token, producto_id, nuevo_stock):
         response = requests.put(url_put, json=payload, headers=headers, timeout=15)
         return response.status_code == 200
     except Exception as e:
-        print(f"❌ Error modificando stock: {e}")
+        print(f"❌ Error modifying stock: {e}")
         return False
 
 
