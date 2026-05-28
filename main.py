@@ -64,26 +64,46 @@ def enviar_telegram(mensaje):
 
 
 def intercambiar_codigo_por_token(auth_code):
-    headers = {
-        "Content-Type": "application/json; charset=utf-8",
-        "User-Agent": USER_AGENT_API
-    }
+    """
+    Intenta intercambiar el código de autorización por el token definitivo.
+    Prueba primero con el estándar x-www-form-urlencoded (típico de OAuth2) y luego con JSON si falla.
+    """
     payload = {
         "client_id": CLIENT_ID,
         "client_secret": CLIENT_SECRET,
         "code": auth_code,
         "grant_type": "authorization_code"
     }
+    
+    # Intento 1: Formulario Estándar (OAuth2 estricto)
+    headers_form = {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "User-Agent": USER_AGENT_API
+    }
     try:
-        response = requests.post(URL_API_OAUTH, json=payload, headers=headers, timeout=15)
+        print(f"🔄 Intentando OAuth via Form Data a {URL_API_OAUTH}...")
+        response = requests.post(URL_API_OAUTH, data=payload, headers=headers_form, timeout=15)
         if response.status_code == 200:
             return response.json().get("access_token")
-        else:
-            print(f"❌ Error OAuth [{response.status_code}]: {response.text}")
-            return None
+        print(f"⚠️ Intento 1 (Form) falló con estado {response.status_code}: {response.text}")
     except Exception as e:
-        print(f"❌ Excepción en OAuth: {e}")
-        return None
+        print(f"⚠️ Excepción en Intento 1 de OAuth: {e}")
+
+    # Intento 2: JSON Payload (Por si la plataforma corre una estructura personalizada)
+    headers_json = {
+        "Content-Type": "application/json; charset=utf-8",
+        "User-Agent": USER_AGENT_API
+    }
+    try:
+        print(f"🔄 Intentando OAuth via JSON Payload...")
+        response = requests.post(URL_API_OAUTH, json=payload, headers=headers_json, timeout=15)
+        if response.status_code == 200:
+            return response.json().get("access_token")
+        print(f"❌ Intento 2 (JSON) también falló [{response.status_code}]: {response.text}")
+    except Exception as e:
+        print(f"❌ Excepción en Intento 2 de OAuth: {e}")
+        
+    return None
 
 
 def buscar_id_por_nombre_api(token, nombre_buscado):
