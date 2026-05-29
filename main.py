@@ -53,14 +53,14 @@ def _cargar_token_desde_db():
     if t and u:
         _api_token   = t
         _api_user_id = u
-        URL_API_PRODUCTS = f"https://developers.tiendanegocio.com/v1/{u}/products"
+        URL_API_PRODUCTS = "https://developers.tiendanegocio.com/v1/products"
         print(f"✅ Token API cargado desde DB (user_id={u})")
 
 def _guardar_token_en_db(token, user_id):
     global _api_token, _api_user_id, URL_API_PRODUCTS
     _api_token   = token
     _api_user_id = user_id
-    URL_API_PRODUCTS = f"https://developers.tiendanegocio.com/v1/{user_id}/products"
+    URL_API_PRODUCTS = "https://developers.tiendanegocio.com/v1/products"
     estado = cargar_estado_anterior()
     estado["api_token"]   = token
     estado["api_user_id"] = user_id
