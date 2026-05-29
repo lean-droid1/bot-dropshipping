@@ -238,11 +238,12 @@ def obtener_catalogo_api(forzar=False):
         nombre_norm = " ".join(str(nombre).lower().split())
         variantes   = p.get("variants", [])
         catalogo[nombre_norm] = {
-            "nombre_real": str(nombre),
-            "product_id":  p.get("id"),
-            "variant_ids": [v.get("id") for v in variantes if v.get("id")],
-            "precio_base": float(variantes[0].get("price", 0) or 0) if variantes else float(p.get("price", 0) or 0),
-            "published":   p.get("published", True)
+            "nombre_real":       str(nombre),
+            "product_id":        p.get("id"),
+            "variant_ids":       [v.get("id") for v in variantes if v.get("id")],
+            "variantes_completas": variantes,   # ← guardamos completas para matching de precios
+            "precio_base":       float(variantes[0].get("price", 0) or 0) if variantes else float(p.get("price", 0) or 0),
+            "published":         p.get("published", True)
         }
 
     print(f"   ✅ Catálogo listo: {len(catalogo)} productos.")
@@ -250,28 +251,35 @@ def obtener_catalogo_api(forzar=False):
     _tiempo_cache = time.time()
     return catalogo
 
-def actualizar_todas_las_variantes(product_id, variant_ids, nuevo_precio=None, nuevo_stock=None):
+def actualizar_todas_las_variantes(product_id, variant_ids, nuevo_precio=None,
+                                    nuevo_stock=None, precios_por_variante=None):
     """
-    ✅ Actualiza TODAS las variantes de un producto.
-    Respeta el rate limit con pausa entre llamadas.
+    Actualiza TODAS las variantes de un producto.
+    - nuevo_precio: mismo precio para todas
+    - precios_por_variante: dict {variant_id: precio} para precios individuales
+    - nuevo_stock: mismo stock para todas
     """
     if not _api_token or not variant_ids: return False
     exitos = 0
-    payload = {}
-    if nuevo_precio is not None: payload["price"] = str(nuevo_precio)
-    if nuevo_stock  is not None:
-        payload["stock"]            = int(nuevo_stock)
-        payload["stock_management"] = True
-    if not payload: return False
 
     for variant_id in variant_ids:
+        payload = {}
+        # Precio individual si está disponible, sino precio único
+        if precios_por_variante and variant_id in precios_por_variante:
+            payload["price"] = str(precios_por_variante[variant_id])
+        elif nuevo_precio is not None:
+            payload["price"] = str(nuevo_precio)
+        if nuevo_stock is not None:
+            payload["stock"]            = int(nuevo_stock)
+            payload["stock_management"] = True
+        if not payload: continue
+
         resp = _api_put(f"{URL_API_VARIANTS}/{variant_id}", payload)
         if resp and resp.status_code in (200, 201):
             exitos += 1
         else:
-            status = resp.status_code if resp else "None"
-            print(f"   ⚠️ Variante {variant_id}: HTTP {status}")
-        time.sleep(0.5)  # Respetar rate limit: max 2 req/seg
+            print(f"   ⚠️ Variante {variant_id}: HTTP {resp.status_code if resp else 'None'}")
+        time.sleep(0.5)
 
     print(f"   ✅ {exitos}/{len(variant_ids)} variantes actualizadas.")
     return exitos > 0
@@ -302,6 +310,57 @@ def redondear_precio(precio):
     elif precio >= 10000: return round(precio / 500) * 500
     elif precio >= 1000:  return round(precio / 100) * 100
     else:                 return round(precio / 50) * 50
+
+def buscar_precios_por_variante(nombre_norm_api, variantes_api, prod_a):
+    """
+    Para productos con variantes, intenta asignar el precio correcto a cada variante
+    buscando la entrada específica del proveedor que incluye el nombre de la variante.
+    
+    Ejemplo:
+      API producto: "Maneral Mango MiJing C210-C115-C245"
+        variante 1: values=[{es:"C245"}] → busca en prod_a la entrada con "(c245)" → precio X
+        variante 2: values=[{es:"C210"}] → busca en prod_a la entrada con "(c210)" → precio Y
+    
+    Devuelve: {variant_id: precio_objetivo} o {} si no se pueden distinguir precios
+    """
+    precios = {}
+    if not variantes_api: return precios
+
+    # Recolectar todas las entradas del proveedor que coinciden con este producto
+    entradas_prov = {}  # {valor_variante_norm: precio}
+    for clave_a, da in prod_a.items():
+        base = da.get("nombre_base_proveedor", clave_a)
+        if not (son_coincidentes(nombre_norm_api, base) or son_coincidentes(nombre_norm_api, clave_a)):
+            continue
+        # Extraer el nombre de la variante del proveedor (entre paréntesis)
+        if '(' in clave_a:
+            variant_part = clave_a.split('(')[-1].rstrip(')')
+            variant_norm = " ".join(variant_part.lower().split())
+            entradas_prov[variant_norm] = da["precio"]
+
+    if not entradas_prov: return precios  # Producto simple, sin variantes en proveedor
+
+    # Matchear cada variante de la API con su entrada del proveedor
+    for var in variantes_api:
+        variant_id = var.get("id")
+        if not variant_id: continue
+        values = var.get("values", [])
+        # Construir el nombre de la variante de la API
+        value_name = " ".join(
+            str(v.get("es", v.get("en", ""))).lower()
+            for v in values
+            if v.get("es") or v.get("en")
+        ).strip()
+        if not value_name: continue
+
+        # Buscar en las entradas del proveedor
+        for prov_variant_norm, precio_prov in entradas_prov.items():
+            if son_coincidentes(value_name, prov_variant_norm):
+                precios[variant_id] = redondear_precio(precio_prov / 0.78)
+                break
+
+    return precios
+
 
 def sincronizacion_completa(prod_a):
     """
@@ -351,22 +410,35 @@ def sincronizacion_completa(prod_a):
                 lineas_sin_match.append(nombre_real)
             continue
 
-        # Tiene match → calcular precio objetivo
-        precio_objetivo = redondear_precio(datos_prov["precio"] / 0.78)
-
+        # Tiene match → calcular precios
         if not variant_ids:
             lineas_sin_match.append(f"{nombre_real} (sin variantes)")
             continue
 
-        ok = actualizar_todas_las_variantes(product_id, variant_ids, nuevo_precio=precio_objetivo)
+        # Intentar precios individuales por variante (si el proveedor los tiene)
+        # Para esto necesitamos las variantes completas del catálogo
+        variantes_api  = catalogo.get(nombre_norm, {}).get("variantes_completas", [])
+        precios_var    = buscar_precios_por_variante(nombre_norm, variantes_api, prod_a)
+        precio_base    = redondear_precio(datos_prov["precio"] / 0.78)
+
+        if precios_var and len(precios_var) == len(variant_ids):
+            # Tenemos precio individual para cada variante
+            ok = actualizar_todas_las_variantes(product_id, variant_ids,
+                                                precios_por_variante=precios_var)
+            precio_resumen = f"variado (${min(precios_var.values()):,}–${max(precios_var.values()):,})"
+        else:
+            # Precio único para todas las variantes
+            ok = actualizar_todas_las_variantes(product_id, variant_ids, nuevo_precio=precio_base)
+            precio_resumen = f"${precio_base:,}"
+
         if ok:
-            sincronizados[nombre_real] = {"precio": precio_objetivo}
-            if int(precio_web) != precio_objetivo:
+            sincronizados[nombre_real] = {"precio": precio_base}
+            if int(precio_web) != precio_base:
                 lineas_precios.append(
                     f"• *{nombre_real}* ({len(variant_ids)} var.)\n"
                     f"  Proveedor: ${datos_prov['precio']:,} | "
                     f"Anterior: ${int(precio_web):,} | "
-                    f"*Nuevo: ${precio_objetivo:,}*"
+                    f"*Nuevo: {precio_resumen}*"
                 )
         else:
             errores.append(nombre_real)
@@ -770,20 +842,31 @@ def guardar_estado(estado):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 def son_coincidentes(nombre1, nombre2):
+    """
+    Matching flexible. Ejemplos que ahora funcionan:
+      "Microscopio RF4 RF-6558x" vs "Microscopio RF4 RF-6558x + Barlow 0.7X"
+      "JC V1S Pro"               vs "Programadora JC V1S Pro (V1 - V1S Pro)"
+    """
     n1 = str(nombre1).lower(); n2 = str(nombre2).lower()
     if " ".join(n1.split()) == " ".join(n2.split()): return True
-    for pr in ['bateria','battery','bat','face','id','maneral','mango','zocalo','board']:
-        if (pr in n1) != (pr in n2): return False
-    for pc in ['mini','pro','plus','max','kit','ultra','xl','lw-a1']:
-        if (pc in n1) != (pc in n2): return False
-    stop = {'de','para','con','el','la','los','las','un','una','y','en','del','al'}
+    stop = {'de','para','con','el','la','los','las','un','una','y','en','del','al','a','o','e'}
     n1c = set(re.sub(r'[^a-z0-9 ]', ' ', n1).split()) - stop
     n2c = set(re.sub(r'[^a-z0-9 ]', ' ', n2).split()) - stop
     if not n1c or not n2c: return False
+    # Palabras críticas: si están en uno y no en el otro son productos distintos
+    criticas = ['bateria','battery','bat','face','maneral','mango','zocalo','board',
+                'mini','plus','max','kit','ultra','xl','lw-a1']
+    for pc in criticas:
+        if (pc in n1c) != (pc in n2c): return False
+    # Números: todos los del nombre MÁS CORTO deben estar en el más largo
     nums1 = {w for w in n1c if any(c.isdigit() for c in w)}
     nums2 = {w for w in n2c if any(c.isdigit() for c in w)}
-    if (nums1 or nums2) and nums1 != nums2: return False
-    return len(n1c & n2c) / min(len(n1c), len(n2c)) >= 0.85
+    if nums1 and nums2:
+        corto = nums1 if len(n1c) <= len(n2c) else nums2
+        largo = nums2 if len(n1c) <= len(n2c) else nums1
+        if not corto.issubset(largo): return False
+    # Overlap: al menos 75% del nombre más corto debe estar en el otro
+    return len(n1c & n2c) / min(len(n1c), len(n2c)) >= 0.75
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # SCRAPING DEL PROVEEDOR
