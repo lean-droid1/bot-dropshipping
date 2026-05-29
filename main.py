@@ -336,7 +336,7 @@ def generar_excel_precios():
             sin_match += 1
             continue
 
-        precio_nuevo   = redondear_precio(datos_a["precio"] * 1.22)
+        precio_nuevo = redondear_precio(datos_a["precio"] / 0.78)
         precio_actual  = datos_b["precio"]
 
         if precio_nuevo == precio_actual:
@@ -908,7 +908,7 @@ def procesar_logica():
         )
 
         if not lo_tengo_web and (not estaba or viejo.get("precio", 0) == 0):
-            precio_ideal = redondear_precio(datos['precio'] * 1.22)
+            precio_ideal = redondear_precio(datos['precio'] / 0.78)
             bloque_nuevos += f"• *{datos['nombre_real']}*\n  Costo proveedor: ${datos['precio']:,} → *Sugerido Web (+22%): ${precio_ideal:,}*\n\n"
 
         elif lo_tengo_web and estaba and not viejo.get("stock", False) and datos["stock"]:
@@ -933,7 +933,7 @@ def procesar_logica():
             bloque_faltantes += f"• *{datos_b['nombre_real']}*\n  ❌ Proveedor SIN STOCK\n\n"
             sincronizar_producto(datos_b['nombre_real'], {}, "ocultar")
         else:
-            precio_objetivo = redondear_precio(datos_a["precio"] * 1.22)
+            precio_objetivo = redondear_precio(datos_a["precio"] / 0.78)
             if datos_b["precio"] != precio_objetivo:
                 diff = precio_objetivo - datos_b["precio"]
                 if datos_b["precio"] < precio_objetivo:
