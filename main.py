@@ -194,43 +194,43 @@ def _paginar(url, params_base):
 
 def obtener_catalogo_api(forzar=False):
     """
-    ✅ Usa la API para obtener el catálogo completo de la tienda.
-    - Pagina correctamente hasta el final (no corta por cantidad de items)
-    - Obtiene variantes por separado si no vienen en la respuesta de productos
+    ✅ Descarga el catálogo completo en dos pasos:
+    1. GET /products (sin variantes) → trae los 297 productos paginados
+    2. GET /products/{id}/variants → trae variantes de cada producto
     Devuelve dict: {nombre_norm: {product_id, variant_ids, precio_base, published}}
     """
     global _cache_api, _tiempo_cache
     if not forzar and _cache_api and (time.time() - _tiempo_cache) < 300:
         return _cache_api
-
     if not _api_token:
         return {}
 
-    print("⏳ Descargando catálogo completo desde API...")
+    # ── Paso 1: traer todos los productos (sin variantes para evitar límite de 50) ──
+    print("⏳ Paso 1: descargando lista de productos...")
+    todos = _paginar(URL_API_PRODUCTS, {"per_page": 200})
+    print(f"   📦 {len(todos)} productos encontrados.")
 
-    # Paso 1: Traer todos los productos (con variantes incluidas si la API lo soporta)
-    todos = _paginar(URL_API_PRODUCTS, {"per_page": 50, "with_variants": "true"})
+    if not todos:
+        return {}
 
-    # Verificar si las variantes vinieron incluidas
-    variantes_incluidas = any(len(p.get("variants", [])) > 0 for p in todos)
-    print(f"   📦 {len(todos)} productos. Variantes incluidas: {variantes_incluidas}")
+    # ── Paso 2: traer variantes de cada producto ────────────────────────────
+    print("⏳ Paso 2: descargando variantes...")
+    for i, p in enumerate(todos):
+        product_id = p.get("id")
+        if not product_id:
+            p["variants"] = []; continue
+        resp = _api_get(f"{URL_API_PRODUCTS}/{product_id}/variants", params={"per_page": 200})
+        if resp and resp.status_code == 200:
+            data = resp.json()
+            variantes = data.get("results", data) if isinstance(data, dict) else data
+            p["variants"] = variantes if isinstance(variantes, list) else []
+        else:
+            p["variants"] = []
+        if (i + 1) % 50 == 0:
+            print(f"   Variantes: [{i+1}/{len(todos)}]")
+        time.sleep(0.5)   # Respetar rate limit
 
-    # Paso 2: Si no vinieron variantes, buscarlas por separado
-    if not variantes_incluidas and todos:
-        print("   🔄 Obteniendo variantes por separado...")
-        for i, p in enumerate(todos):
-            product_id = p.get("id")
-            if not product_id: continue
-            resp = _api_get(f"{URL_API_PRODUCTS}/{product_id}/variants", params={"per_page": 200})
-            if resp and resp.status_code == 200:
-                data = resp.json()
-                variantes = data.get("results", data) if isinstance(data, dict) else data
-                p["variants"] = variantes if isinstance(variantes, list) else []
-            if (i + 1) % 20 == 0:
-                print(f"   Variantes: {i+1}/{len(todos)}")
-            time.sleep(0.5)
-
-    # Construir índice nombre_normalizado → datos
+    # ── Construir índice ────────────────────────────────────────────────────
     catalogo = {}
     for p in todos:
         nombre = p.get("name", {})
