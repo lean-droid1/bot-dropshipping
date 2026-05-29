@@ -180,27 +180,46 @@ def _api_headers():
 def obtener_todos_los_productos_api():
     if not _api_token or not URL_API_PRODUCTS:
         return []
+
     todos = []
     pagina = 1
+
     while True:
         try:
-            url  = f"{URL_API_PRODUCTS}?per_page=200&page={pagina}"
-            resp = requests.get(url, headers=_api_headers(), timeout=20)
+            url = f"{URL_API_PRODUCTS}?page={pagina}&per_page=50"
+
+            resp = requests.get(
+                url,
+                headers=_api_headers(),
+                timeout=20
+            )
+
             if resp.status_code != 200:
-                print(f"❌ API productos HTTP {resp.status_code}: {resp.text[:100]}")
+                print(f"❌ API productos HTTP {resp.status_code}: {resp.text[:200]}")
                 break
+
             data = resp.json()
-            lote = data if isinstance(data, list) else data.get("results", [])
+
+            lote = data.get("results", [])
+            pagination = data.get("pagination", {})
+
+            print(f"📄 Página {pagina}: {len(lote)} productos")
+
             if not lote:
                 break
+
             todos.extend(lote)
-            if len(lote) < 200:
+
+            if not pagination.get("next_page"):
                 break
-            pagina += 1
+
+            pagina = pagination["next_page"]
+
         except Exception as e:
             print(f"❌ Error paginando productos: {e}")
             break
-    print(f"   📦 Total productos traídos de la API: {len(todos)}")
+
+    print(f"📦 Total productos traídos de la API: {len(todos)}")
     return todos
 
 def buscar_producto_api(nombre_buscado):
