@@ -46,15 +46,29 @@ _api_token   = None
 _api_user_id = None
 
 def _cargar_token_desde_db():
+    """Al arrancar, intenta recuperar el token guardado (prioriza Variables de Entorno)."""
     global _api_token, _api_user_id, URL_API_PRODUCTS
+    
+    # 1. Intentar primero desde variables de entorno de Railway para sobrevivir a redespliegues
+    env_token = os.environ.get("API_TOKEN")
+    env_user_id = os.environ.get("API_USER_ID")
+    
+    if env_token and env_user_id:
+        _api_token = env_token.strip()
+        _api_user_id = env_user_id.strip()
+        URL_API_PRODUCTS = f"https://api.tiendanube.com/2025-03/{_api_user_id}/products"
+        print(f"✅ Token API cargado desde Variables de Entorno de Railway (user_id={_api_user_id})")
+        return
+
+    # 2. Si no están en el entorno, buscar en el archivo local JSON
     estado = cargar_estado_anterior()
     t = estado.get("api_token")
     u = estado.get("api_user_id")
     if t and u:
         _api_token   = t
         _api_user_id = u
-        URL_API_PRODUCTS = "https://developers.tiendanegocio.com/v1/products"
-        print(f"✅ Token API cargado desde DB (user_id={u})")
+        URL_API_PRODUCTS = f"https://api.tiendanube.com/2025-03/{u}/products"
+        print(f"✅ Token API cargado desde DB JSON (user_id={u})")
 
 def _guardar_token_en_db(token, user_id):
     global _api_token, _api_user_id, URL_API_PRODUCTS
@@ -167,67 +181,89 @@ def intercambiar_codigo_por_token(auth_code):
         return None
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# API — TIENDANUBE / TIENDANEGOCIO
+# API — TIENDANUBE / TIENDANEGOCIO (OPTIMIZADA ANTI-429 Y PAGINACIÓN CORREGIDA)
 # ═══════════════════════════════════════════════════════════════════════════════
+
+# Caché global para no saturar la API
+_cache_productos_api = None
+_tiempo_cache_api = 0
 
 def _api_headers():
     return {
-        "Authorization": f"Bearer {_api_token}",
-        "User-Agent": USER_AGENT_API,
-        "Content-Type": "application/json"
+        "Authentication": f"bearer {_api_token}",
+        "User-Agent":     USER_AGENT_API,
+        "Content-Type":   "application/json"
     }
 
-def obtener_todos_los_productos_api():
+def obtener_todos_los_productos_api(forzar_recarga=False):
+    """
+    Trae TODOS los productos de la tienda usando caché para no saturar la API.
+    Corrige parámetros para la v. 2025-03.
+    """
+    global _cache_productos_api, _tiempo_cache_api
+    
+    # Si tenemos caché fresco (menos de 5 min) y no forzamos recarga, usamos caché
+    if not forzar_recarga and _cache_productos_api is not None and (time.time() - _tiempo_cache_api) < 300:
+        return _cache_productos_api
+
     if not _api_token or not URL_API_PRODUCTS:
         return []
 
     todos = []
     pagina = 1
-
+    # La API nueva puede requerir 50 como máximo en algunos endpoints, probamos con 50.
+    limite_por_pagina = 50 
+    
+    print("⏳ Descargando catálogo desde API Tiendanube (sin saturar)...")
     while True:
         try:
-            url = f"{URL_API_PRODUCTS}?page={pagina}&per_page=50"
-
-            resp = requests.get(
-                url,
-                headers=_api_headers(),
-                timeout=20
-            )
-
+            # Paginación simplificada para evitar Error 400
+            url = f"{URL_API_PRODUCTS}?per_page={limite_por_pagina}&page={pagina}"
+            resp = requests.get(url, headers=_api_headers(), timeout=20)
+            
+            if resp.status_code == 429:
+                print("   ⚠️ Límite de velocidad (429). Esperando 5 seg...")
+                time.sleep(5)
+                continue
+                
             if resp.status_code != 200:
-                print(f"❌ API productos HTTP {resp.status_code}: {resp.text[:200]}")
+                print(f"❌ API productos HTTP {resp.status_code}: {resp.text[:100]}")
                 break
-
+                
             data = resp.json()
-
-            lote = data.get("results", [])
-            pagination = data.get("pagination", {})
-
-            print(f"📄 Página {pagina}: {len(lote)} productos")
-
+            lote = data if isinstance(data, list) else data.get("results", [])
+            
             if not lote:
                 break
-
+                
             todos.extend(lote)
-
-            if not pagination.get("next_page"):
-                break
-
-            pagina = pagination["next_page"]
-
+            
+            if len(lote) < limite_por_pagina:
+                break # Última página alcanzada
+                
+            pagina += 1
+            time.sleep(0.5) # Pausa cortita entre páginas
+            
         except Exception as e:
             print(f"❌ Error paginando productos: {e}")
             break
-
-    print(f"📦 Total productos traídos de la API: {len(todos)}")
+            
+    print(f"   📦 Total catálogo en caché API: {len(todos)} productos.")
+    
+    # Guardamos en caché
+    _cache_productos_api = todos
+    _tiempo_cache_api = time.time()
     return todos
 
 def buscar_producto_api(nombre_buscado):
-    productos = obtener_todos_los_productos_api()
+    """Busca en el caché local en lugar de consultar a la web cada vez."""
+    # NO forzamos recarga acá, usa el caché
+    productos = obtener_todos_los_productos_api() 
     for p in productos:
         nombre_api = p.get("name", {})
         if isinstance(nombre_api, dict):
             nombre_api = next(iter(nombre_api.values()), "")
+            
         if son_coincidentes_inteligentes(str(nombre_api), nombre_buscado):
             product_id = p.get("id")
             variantes  = p.get("variants", [])
@@ -238,7 +274,7 @@ def buscar_producto_api(nombre_buscado):
 def modificar_stock_api(product_id, variant_id, nuevo_stock):
     if not _api_token or not URL_API_PRODUCTS:
         return False
-    url = f"https://developers.tiendanegocio.com/v1/{_api_user_id}/variants/{variant_id}"
+    url = f"{URL_API_PRODUCTS}/{product_id}/variants/{variant_id}"
     try:
         resp = requests.put(url, json={"stock": int(nuevo_stock)}, headers=_api_headers(), timeout=15)
         ok = resp.status_code in (200, 201)
@@ -251,14 +287,19 @@ def modificar_stock_api(product_id, variant_id, nuevo_stock):
 def modificar_precio_api(product_id, variant_id, nuevo_precio):
     if not _api_token or not URL_API_PRODUCTS:
         return False
-    url = f"https://developers.tiendanegocio.com/v1/{_api_user_id}/variants/{variant_id}"
+    url = f"{URL_API_PRODUCTS}/{product_id}/variants/{variant_id}"
     try:
         resp = requests.put(url, json={"price": str(nuevo_precio)}, headers=_api_headers(), timeout=15)
+        if resp.status_code == 429:
+            print("   ⚠️ Pausa por límite de API (429) al cambiar precio...")
+            time.sleep(3)
+            resp = requests.put(url, json={"price": str(nuevo_precio)}, headers=_api_headers(), timeout=15)
+            
         ok = resp.status_code in (200, 201)
-        print(f"{'✅' if ok else '❌'} Precio → ${nuevo_precio} (HTTP {resp.status_code})")
+        print(f"{'✅' if ok else '❌'} Precio → ${nuevo_precio:,} (HTTP {resp.status_code})")
         return ok
     except Exception as e:
-        print(f"❌ Error modifying precio: {e}")
+        print(f"❌ Error modificando precio: {e}")
         return False
 
 def ocultar_producto_api(product_id):
@@ -484,7 +525,14 @@ def procesar_comando(texto):
         enviar_telegram("🔄 Canjeando código OAuth...")
         token = intercambiar_codigo_por_token(auth_code)
         if token:
-            enviar_telegram(f"✅ *¡Token obtenido!* Ya puedo modificar tu tienda automáticamente.\nUser ID: `{_api_user_id}`")
+            # Mensaje optimizado para copiar los datos directamente a Railway
+            msg_exito = (
+                f"✅ *¡Token obtenido!*\n\n"
+                f"Para que NO se borre nunca al modificar el código, copiá estos dos valores y agregalos en la sección *Variables* de tu panel de Railway:\n\n"
+                f"• Nombre: `API_USER_ID`\n  Valor: `{_api_user_id}`\n\n"
+                f"• Nombre: `API_TOKEN`\n  Valor: `{token}`"
+            )
+            enviar_telegram(msg_exito)
         else:
             enviar_telegram("❌ No pude obtener el token. Revisá que el código no haya vencido (dura 5 min).")
         return
