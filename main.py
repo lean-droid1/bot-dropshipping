@@ -167,11 +167,37 @@ def _api_put(url, data):
             print(f"❌ PUT {url}: {e}"); time.sleep(1)
     return None
 
+def _paginar(url, params_base):
+    """
+    Pagina un endpoint hasta que no haya más next_page.
+    Respeta el rate limit con pausa entre páginas.
+    ✅ Condición de corte: solo cuando next_page es null/vacío.
+    """
+    todos  = []
+    pagina = 1
+    while True:
+        params = {**params_base, "page": pagina}
+        resp   = _api_get(url, params=params)
+        if not resp or resp.status_code != 200:
+            print(f"❌ Paginación HTTP {resp.status_code if resp else 'None'}"); break
+        data = resp.json()
+        lote = data.get("results", []) if isinstance(data, dict) else (data if isinstance(data, list) else [])
+        if not lote: break
+        todos.extend(lote)
+        print(f"   Página {pagina}: {len(lote)} items (total acumulado: {len(todos)})")
+        next_page = data.get("pagination", {}).get("next_page") if isinstance(data, dict) else None
+        if not next_page:   # ✅ Solo cortamos cuando no hay más páginas
+            break
+        pagina += 1
+        time.sleep(0.6)     # Respetar rate limit: 2 req/seg
+    return todos
+
 def obtener_catalogo_api(forzar=False):
     """
-    ✅ Usa la API (no scraping) para obtener el catálogo completo de la tienda.
-    Devuelve dict: {nombre_norm: {product_id, variant_ids, precios, published}}
-    Esto elimina el problema de "sin match en API".
+    ✅ Usa la API para obtener el catálogo completo de la tienda.
+    - Pagina correctamente hasta el final (no corta por cantidad de items)
+    - Obtiene variantes por separado si no vienen en la respuesta de productos
+    Devuelve dict: {nombre_norm: {product_id, variant_ids, precio_base, published}}
     """
     global _cache_api, _tiempo_cache
     if not forzar and _cache_api and (time.time() - _tiempo_cache) < 300:
@@ -180,23 +206,29 @@ def obtener_catalogo_api(forzar=False):
     if not _api_token:
         return {}
 
-    print("⏳ Descargando catálogo desde API...")
-    todos   = []
-    pagina  = 1
-    while True:
-        resp = _api_get(URL_API_PRODUCTS, params={"per_page": 200, "page": pagina, "with_variants": "true"})
-        if not resp or resp.status_code != 200:
-            print(f"❌ API HTTP {resp.status_code if resp else 'None'}"); break
-        data = resp.json()
-        lote = data.get("results", []) if isinstance(data, dict) else data
-        if not lote: break
-        todos.extend(lote)
-        next_page = data.get("pagination", {}).get("next_page") if isinstance(data, dict) else None
-        if not next_page or len(lote) < 200: break
-        pagina += 1
-        time.sleep(0.5)
+    print("⏳ Descargando catálogo completo desde API...")
 
-    print(f"   📦 {len(todos)} productos en catálogo.")
+    # Paso 1: Traer todos los productos (con variantes incluidas si la API lo soporta)
+    todos = _paginar(URL_API_PRODUCTS, {"per_page": 50, "with_variants": "true"})
+
+    # Verificar si las variantes vinieron incluidas
+    variantes_incluidas = any(len(p.get("variants", [])) > 0 for p in todos)
+    print(f"   📦 {len(todos)} productos. Variantes incluidas: {variantes_incluidas}")
+
+    # Paso 2: Si no vinieron variantes, buscarlas por separado
+    if not variantes_incluidas and todos:
+        print("   🔄 Obteniendo variantes por separado...")
+        for i, p in enumerate(todos):
+            product_id = p.get("id")
+            if not product_id: continue
+            resp = _api_get(f"{URL_API_PRODUCTS}/{product_id}/variants", params={"per_page": 200})
+            if resp and resp.status_code == 200:
+                data = resp.json()
+                variantes = data.get("results", data) if isinstance(data, dict) else data
+                p["variants"] = variantes if isinstance(variantes, list) else []
+            if (i + 1) % 20 == 0:
+                print(f"   Variantes: {i+1}/{len(todos)}")
+            time.sleep(0.5)
 
     # Construir índice nombre_normalizado → datos
     catalogo = {}
@@ -205,16 +237,15 @@ def obtener_catalogo_api(forzar=False):
         if isinstance(nombre, dict): nombre = next(iter(nombre.values()), "")
         nombre_norm = " ".join(str(nombre).lower().split())
         variantes   = p.get("variants", [])
-        precios_var = {v.get("id"): float(v.get("price", 0) or 0) for v in variantes if v.get("id")}
         catalogo[nombre_norm] = {
             "nombre_real": str(nombre),
             "product_id":  p.get("id"),
             "variant_ids": [v.get("id") for v in variantes if v.get("id")],
-            "precios":     precios_var,
-            "precio_base": float(variantes[0].get("price", 0) or 0) if variantes else 0.0,
+            "precio_base": float(variantes[0].get("price", 0) or 0) if variantes else float(p.get("price", 0) or 0),
             "published":   p.get("published", True)
         }
 
+    print(f"   ✅ Catálogo listo: {len(catalogo)} productos.")
     _cache_api    = catalogo
     _tiempo_cache = time.time()
     return catalogo
