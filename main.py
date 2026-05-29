@@ -115,37 +115,52 @@ def enviar_archivo_telegram(buffer_bytes, nombre_archivo, caption=""):
 # ═══════════════════════════════════════════════════════════════════════════════
 
 OAUTH_ENDPOINTS = [
-    "https://www.tiendanube.com/apps/authorize/token",
-    "https://www.tiendanegocio.com/apps/authorize/token",
+    "https://developers.tiendanegocio.com/v1/oauth/app/token"
 ]
 
 def intercambiar_codigo_por_token(auth_code):
     payload = {
-        "client_id":     CLIENT_ID,
+        "client_id": CLIENT_ID,
         "client_secret": CLIENT_SECRET,
-        "code":          auth_code,
-        "grant_type":    "authorization_code"
+        "grant_type": "authorization_code",
+        "code": auth_code
     }
-    for endpoint in OAUTH_ENDPOINTS:
-        for content_type, use_json in [("application/x-www-form-urlencoded", False),
-                                       ("application/json; charset=utf-8",    True)]:
-            try:
-                print(f"🔄 Probando {endpoint} ({'JSON' if use_json else 'Form'})...")
-                headers = {"Content-Type": content_type, "User-Agent": USER_AGENT_API}
-                resp = requests.post(endpoint, json=payload if use_json else None,
-                                     data=None if use_json else payload,
-                                     headers=headers, timeout=15)
-                print(f"   → HTTP {resp.status_code}: {resp.text[:120]}")
-                if resp.status_code == 200:
-                    data    = resp.json()
-                    token   = data.get("access_token")
-                    user_id = str(data.get("user_id", ""))
-                    if token and user_id:
-                        _guardar_token_en_db(token, user_id)
-                        return token
-            except Exception as e:
-                print(f"   ⚠️ Excepción: {e}")
-    return None
+
+    try:
+        endpoint = "https://developers.tiendanegocio.com/v1/oauth/app/token"
+
+        print(f"🔄 Canjeando código OAuth en {endpoint}")
+
+        headers = {
+            "Content-Type": "application/json",
+            "User-Agent": USER_AGENT_API
+        }
+
+        resp = requests.post(
+            endpoint,
+            json=payload,
+            headers=headers,
+            timeout=30
+        )
+
+        print(f"HTTP {resp.status_code}")
+        print(resp.text)
+
+        if resp.status_code == 200:
+            data = resp.json()
+
+            token = data.get("access_token")
+            user_id = str(data.get("client_id", ""))
+
+            if token:
+                _guardar_token_en_db(token, user_id)
+                return token
+
+        return None
+
+    except Exception as e:
+        print(f"❌ Error OAuth: {e}")
+        return None
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # API — TIENDANUBE / TIENDANEGOCIO
