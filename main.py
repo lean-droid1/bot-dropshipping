@@ -53,14 +53,14 @@ def _cargar_token_desde_db():
     if t and u:
         _api_token   = t
         _api_user_id = u
-        URL_API_PRODUCTS = f"https://api.tiendanube.com/2025-03/{u}/products"
+        URL_API_PRODUCTS = f"https://developers.tiendanegocio.com/v1/{u}/products"
         print(f"✅ Token API cargado desde DB (user_id={u})")
 
 def _guardar_token_en_db(token, user_id):
     global _api_token, _api_user_id, URL_API_PRODUCTS
     _api_token   = token
     _api_user_id = user_id
-    URL_API_PRODUCTS = f"https://api.tiendanube.com/2025-03/{user_id}/products"
+    URL_API_PRODUCTS = f"https://developers.tiendanegocio.com/v1/{user_id}/products"
     estado = cargar_estado_anterior()
     estado["api_token"]   = token
     estado["api_user_id"] = user_id
@@ -172,9 +172,9 @@ def intercambiar_codigo_por_token(auth_code):
 
 def _api_headers():
     return {
-        "Authentication": f"bearer {_api_token}",
-        "User-Agent":     USER_AGENT_API,
-        "Content-Type":   "application/json"
+        "Authorization": f"Bearer {_api_token}",
+        "User-Agent": USER_AGENT_API,
+        "Content-Type": "application/json"
     }
 
 def obtener_todos_los_productos_api():
@@ -219,7 +219,7 @@ def buscar_producto_api(nombre_buscado):
 def modificar_stock_api(product_id, variant_id, nuevo_stock):
     if not _api_token or not URL_API_PRODUCTS:
         return False
-    url = f"{URL_API_PRODUCTS}/{product_id}/variants/{variant_id}"
+    url = f"https://developers.tiendanegocio.com/v1/{_api_user_id}/variants/{variant_id}"
     try:
         resp = requests.put(url, json={"stock": int(nuevo_stock)}, headers=_api_headers(), timeout=15)
         ok = resp.status_code in (200, 201)
@@ -232,7 +232,7 @@ def modificar_stock_api(product_id, variant_id, nuevo_stock):
 def modificar_precio_api(product_id, variant_id, nuevo_precio):
     if not _api_token or not URL_API_PRODUCTS:
         return False
-    url = f"{URL_API_PRODUCTS}/{product_id}/variants/{variant_id}"
+    url = f"https://developers.tiendanegocio.com/v1/{_api_user_id}/variants/{variant_id}"
     try:
         resp = requests.put(url, json={"price": str(nuevo_precio)}, headers=_api_headers(), timeout=15)
         ok = resp.status_code in (200, 201)
