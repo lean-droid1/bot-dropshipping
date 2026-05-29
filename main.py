@@ -15,12 +15,15 @@ import io
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ─── URLs ────────────────────────────────────────────────────────────────────
-URL_A          = "https://rxzweb.com/tienda/?et_per_page=-1"
-URL_B          = "https://leandroid.tiendanegocio.com/productos"
-DB_FILE        = "estado_productos.json"
-USER_AGENT_API = "dropshipping (lean.6roid@gmail.com)"
+URL_A            = "https://rxzweb.com/tienda/?et_per_page=-1"
+URL_B            = "https://leandroid.tiendanegocio.com/productos"
+DB_FILE          = "estado_productos.json"
+USER_AGENT_API   = "dropshipping (lean.6roid@gmail.com)"
 
-URL_API_PRODUCTS = None
+# ✅ URLs correctas de Tienda Negocio
+URL_API_BASE     = "https://developers.tiendanegocio.com/v1"
+URL_API_PRODUCTS = f"{URL_API_BASE}/products"
+URL_API_VARIANTS = f"{URL_API_BASE}/variants"
 
 # ─── Variables de entorno (Railway) ──────────────────────────────────────────
 TELEGRAM_TOKEN = None
@@ -46,40 +49,34 @@ _api_token   = None
 _api_user_id = None
 
 def _cargar_token_desde_db():
-    """Al arrancar, intenta recuperar el token guardado (prioriza Variables de Entorno)."""
-    global _api_token, _api_user_id, URL_API_PRODUCTS
-    
-    # 1. Intentar primero desde variables de entorno de Railway para sobrevivir a redespliegues
-    env_token = os.environ.get("API_TOKEN")
+    global _api_token, _api_user_id
+    # 1. Primero desde variables de entorno de Railway
+    env_token   = os.environ.get("API_TOKEN")
     env_user_id = os.environ.get("API_USER_ID")
-    
     if env_token and env_user_id:
-        _api_token = env_token.strip()
+        _api_token   = env_token.strip()
         _api_user_id = env_user_id.strip()
-        URL_API_PRODUCTS = f"https://api.tiendanube.com/2025-03/{_api_user_id}/products"
-        print(f"✅ Token API cargado desde Variables de Entorno de Railway (user_id={_api_user_id})")
+        # ✅ URL fija, no depende del user_id
+        print(f"✅ Token API cargado desde Variables de Entorno de Railway (store_id={_api_user_id})")
         return
-
-    # 2. Si no están en el entorno, buscar en el archivo local JSON
+    # 2. Si no, desde el JSON local
     estado = cargar_estado_anterior()
     t = estado.get("api_token")
     u = estado.get("api_user_id")
     if t and u:
         _api_token   = t
         _api_user_id = u
-        URL_API_PRODUCTS = f"https://api.tiendanube.com/2025-03/{u}/products"
-        print(f"✅ Token API cargado desde DB JSON (user_id={u})")
+        print(f"✅ Token API cargado desde DB JSON (store_id={u})")
 
 def _guardar_token_en_db(token, user_id):
-    global _api_token, _api_user_id, URL_API_PRODUCTS
+    global _api_token, _api_user_id
     _api_token   = token
     _api_user_id = user_id
-    URL_API_PRODUCTS = "https://developers.tiendanegocio.com/v1/products"
     estado = cargar_estado_anterior()
     estado["api_token"]   = token
     estado["api_user_id"] = user_id
     guardar_estado_actual(estado)
-    print(f"💾 Token guardado en DB (user_id={user_id})")
+    print(f"💾 Token guardado en DB (store_id={user_id})")
 
 # ─── Palabras de interés ─────────────────────────────────────────────────────
 PALABRAS_INTERES = [
@@ -105,7 +102,6 @@ def enviar_telegram(mensaje):
         print(f"❌ Error Telegram: {e}")
 
 def enviar_archivo_telegram(buffer_bytes, nombre_archivo, caption=""):
-    """Envía un archivo (bytes) por Telegram como documento."""
     if not TELEGRAM_TOKEN or not CHAT_ID:
         return False
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
@@ -128,142 +124,93 @@ def enviar_archivo_telegram(buffer_bytes, nombre_archivo, caption=""):
 # OAUTH — CANJE DE TOKEN
 # ═══════════════════════════════════════════════════════════════════════════════
 
-OAUTH_ENDPOINTS = [
-    "https://developers.tiendanegocio.com/v1/oauth/app/token"
-]
-
 def intercambiar_codigo_por_token(auth_code):
     payload = {
-        "client_id": CLIENT_ID,
+        "client_id":     CLIENT_ID,
         "client_secret": CLIENT_SECRET,
-        "grant_type": "authorization_code",
-        "code": auth_code
+        "grant_type":    "authorization_code",
+        "code":          auth_code
     }
-
     try:
         endpoint = "https://developers.tiendanegocio.com/v1/oauth/app/token"
-
         print(f"🔄 Canjeando código OAuth en {endpoint}")
-
-        headers = {
-            "Content-Type": "application/json",
-            "User-Agent": USER_AGENT_API
-        }
-
-        resp = requests.post(
-            endpoint,
-            json=payload,
-            headers=headers,
-            timeout=30
-        )
-
-        print(f"HTTP {resp.status_code}")
-        print(resp.text)
-
+        headers = {"Content-Type": "application/json", "User-Agent": USER_AGENT_API}
+        resp = requests.post(endpoint, json=payload, headers=headers, timeout=30)
+        print(f"HTTP {resp.status_code}: {resp.text[:200]}")
         if resp.status_code in (200, 201):
-            data = resp.json()
-
-            api_data = data.get("data", {})
-
-            token = api_data.get("access_token")
-            user_id = str(api_data.get("store_id", ""))
-
-            print(f"Store ID: {user_id}")
-
+            data     = resp.json()
+            api_data = data.get("data", data)
+            token    = api_data.get("access_token")
+            user_id  = str(api_data.get("store_id") or api_data.get("user_id") or "")
             if token and user_id:
                 _guardar_token_en_db(token, user_id)
                 return token
-
         return None
-
     except Exception as e:
         print(f"❌ Error OAuth: {e}")
         return None
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# API — TIENDANUBE / TIENDANEGOCIO (OPTIMIZADA ANTI-429 Y PAGINACIÓN CORREGIDA)
+# API — TIENDA NEGOCIO
 # ═══════════════════════════════════════════════════════════════════════════════
 
 # Caché global para no saturar la API
 _cache_productos_api = None
-_tiempo_cache_api = 0
+_tiempo_cache_api    = 0
 
 def _api_headers():
+    # ✅ Authorization con Bearer mayúscula (no Authentication)
     return {
-        "Authentication": f"bearer {_api_token}",
-        "User-Agent":     USER_AGENT_API,
-        "Content-Type":   "application/json"
+        "Authorization": f"Bearer {_api_token}",
+        "User-Agent":    USER_AGENT_API,
+        "Content-Type":  "application/json"
     }
 
 def obtener_todos_los_productos_api(forzar_recarga=False):
-    """
-    Trae TODOS los productos de la tienda usando caché para no saturar la API.
-    Corrige parámetros para la v. 2025-03.
-    """
     global _cache_productos_api, _tiempo_cache_api
-    
-    # Si tenemos caché fresco (menos de 5 min) y no forzamos recarga, usamos caché
+    # Caché de 5 minutos
     if not forzar_recarga and _cache_productos_api is not None and (time.time() - _tiempo_cache_api) < 300:
         return _cache_productos_api
-
-    if not _api_token or not URL_API_PRODUCTS:
+    if not _api_token:
         return []
-
-    todos = []
+    todos  = []
     pagina = 1
-    # La API nueva puede requerir 50 como máximo en algunos endpoints, probamos con 50.
-    limite_por_pagina = 50 
-    
-    print("⏳ Descargando catálogo desde API Tiendanube (sin saturar)...")
+    print("⏳ Descargando catálogo desde API Tienda Negocio...")
     while True:
         try:
-            # Paginación simplificada para evitar Error 400
-            url = f"{URL_API_PRODUCTS}?per_page={limite_por_pagina}&page={pagina}"
+            url  = f"{URL_API_PRODUCTS}?per_page=50&page={pagina}&with_variants=true"
             resp = requests.get(url, headers=_api_headers(), timeout=20)
-            
             if resp.status_code == 429:
-                print("   ⚠️ Límite de velocidad (429). Esperando 5 seg...")
+                print("   ⚠️ Rate limit (429). Esperando 5 seg...")
                 time.sleep(5)
                 continue
-                
             if resp.status_code != 200:
-                print(f"❌ API productos HTTP {resp.status_code}: {resp.text[:100]}")
+                print(f"❌ API productos HTTP {resp.status_code}: {resp.text[:150]}")
                 break
-                
             data = resp.json()
-            lote = data if isinstance(data, list) else data.get("results", [])
-            
+            lote = data.get("results", data) if isinstance(data, dict) else data
             if not lote:
                 break
-                
             todos.extend(lote)
-            
-            if len(lote) < limite_por_pagina:
-                break # Última página alcanzada
-                
+            pagination = data.get("pagination", {}) if isinstance(data, dict) else {}
+            if not pagination.get("next_page") or len(lote) < 50:
+                break
             pagina += 1
-            time.sleep(0.5) # Pausa cortita entre páginas
-            
+            time.sleep(0.5)
         except Exception as e:
             print(f"❌ Error paginando productos: {e}")
             break
-            
-    print(f"   📦 Total catálogo en caché API: {len(todos)} productos.")
-    
-    # Guardamos en caché
+    print(f"   📦 Total catálogo: {len(todos)} productos.")
     _cache_productos_api = todos
-    _tiempo_cache_api = time.time()
+    _tiempo_cache_api    = time.time()
     return todos
 
 def buscar_producto_api(nombre_buscado):
-    """Busca en el caché local en lugar de consultar a la web cada vez."""
-    # NO forzamos recarga acá, usa el caché
-    productos = obtener_todos_los_productos_api() 
+    productos = obtener_todos_los_productos_api()
     for p in productos:
         nombre_api = p.get("name", {})
         if isinstance(nombre_api, dict):
             nombre_api = next(iter(nombre_api.values()), "")
-            
         if son_coincidentes_inteligentes(str(nombre_api), nombre_buscado):
             product_id = p.get("id")
             variantes  = p.get("variants", [])
@@ -272,11 +219,13 @@ def buscar_producto_api(nombre_buscado):
     return None, None
 
 def modificar_stock_api(product_id, variant_id, nuevo_stock):
-    if not _api_token or not URL_API_PRODUCTS:
+    """✅ PUT /variants/{variant_id}"""
+    if not _api_token:
         return False
-    url = f"{URL_API_PRODUCTS}/{product_id}/variants/{variant_id}"
+    url = f"{URL_API_VARIANTS}/{variant_id}"
     try:
-        resp = requests.put(url, json={"stock": int(nuevo_stock)}, headers=_api_headers(), timeout=15)
+        resp = requests.put(url, json={"stock": int(nuevo_stock), "stock_management": True},
+                            headers=_api_headers(), timeout=15)
         ok = resp.status_code in (200, 201)
         print(f"{'✅' if ok else '❌'} Stock → {nuevo_stock} (HTTP {resp.status_code})")
         return ok
@@ -285,16 +234,18 @@ def modificar_stock_api(product_id, variant_id, nuevo_stock):
         return False
 
 def modificar_precio_api(product_id, variant_id, nuevo_precio):
-    if not _api_token or not URL_API_PRODUCTS:
+    """✅ PUT /variants/{variant_id}"""
+    if not _api_token:
         return False
-    url = f"{URL_API_PRODUCTS}/{product_id}/variants/{variant_id}"
+    url = f"{URL_API_VARIANTS}/{variant_id}"
     try:
-        resp = requests.put(url, json={"price": str(nuevo_precio)}, headers=_api_headers(), timeout=15)
+        resp = requests.put(url, json={"price": str(nuevo_precio)},
+                            headers=_api_headers(), timeout=15)
         if resp.status_code == 429:
-            print("   ⚠️ Pausa por límite de API (429) al cambiar precio...")
+            print("   ⚠️ Rate limit (429) al cambiar precio. Reintentando...")
             time.sleep(3)
-            resp = requests.put(url, json={"price": str(nuevo_precio)}, headers=_api_headers(), timeout=15)
-            
+            resp = requests.put(url, json={"price": str(nuevo_precio)},
+                                headers=_api_headers(), timeout=15)
         ok = resp.status_code in (200, 201)
         print(f"{'✅' if ok else '❌'} Precio → ${nuevo_precio:,} (HTTP {resp.status_code})")
         return ok
@@ -303,7 +254,8 @@ def modificar_precio_api(product_id, variant_id, nuevo_precio):
         return False
 
 def ocultar_producto_api(product_id):
-    if not _api_token or not URL_API_PRODUCTS:
+    """✅ PUT /products/{product_id}"""
+    if not _api_token:
         return False
     url = f"{URL_API_PRODUCTS}/{product_id}"
     try:
@@ -316,7 +268,8 @@ def ocultar_producto_api(product_id):
         return False
 
 def publicar_producto_api(product_id):
-    if not _api_token or not URL_API_PRODUCTS:
+    """✅ PUT /products/{product_id}"""
+    if not _api_token:
         return False
     url = f"{URL_API_PRODUCTS}/{product_id}"
     try:
@@ -363,12 +316,6 @@ def redondear_precio(precio):
         return round(precio / 50) * 50
 
 def generar_excel_precios():
-    """
-    Lee productos_a (proveedor) y productos_b (mi tienda) del JSON,
-    cruza nombres, calcula proveedor +22% y genera un Excel listo
-    para importar en Tienda Negocio.
-    Devuelve (bytes_del_excel, resumen_texto) o (None, mensaje_error).
-    """
     try:
         import openpyxl
         from openpyxl.styles import Font, PatternFill, Alignment
@@ -403,8 +350,7 @@ def generar_excel_precios():
         datos_a = None
         for clave_a, da in prod_a.items():
             if son_coincidentes_inteligentes(clave_b, clave_a):
-                datos_a = da
-                break
+                datos_a = da; break
         if datos_a is None:
             variantes = [d for c, d in prod_a.items()
                          if son_coincidentes_inteligentes(clave_b, d.get("nombre_base_proveedor", ""))]
@@ -415,17 +361,16 @@ def generar_excel_precios():
             sin_match += 1
             continue
 
-        precio_nuevo = redondear_precio(datos_a["precio"] / 0.78)
-        precio_actual  = datos_b["precio"]
+        precio_nuevo  = redondear_precio(datos_a["precio"] / 0.78)
+        precio_actual = datos_b["precio"]
 
         if precio_nuevo == precio_actual:
             igual_precio += 1
             continue
 
         filas.append({
-            "Hash":                   clave_b,
-            "Nombre del producto":    datos_b["nombre_real"],
-            "Precio":                 precio_nuevo,
+            "Hash": clave_b, "Nombre del producto": datos_b["nombre_real"],
+            "Precio": precio_nuevo,
             "Oferta": "", "Stock": "", "Visibilidad (Visible o Oculto)": "",
             "Descripción": "", "SKU": "", "Peso en KG": "",
             "Alto en CM": "", "Ancho en CM": "", "Profundidad en CM": "",
@@ -451,8 +396,7 @@ def generar_excel_precios():
     header_font = Font(bold=True, color="FFFFFF", name="Arial", size=10)
     ws.append(columnas)
     for cell in ws[1]:
-        cell.fill      = header_fill
-        cell.font      = header_font
+        cell.fill = header_fill; cell.font = header_font
         cell.alignment = Alignment(horizontal="center", vertical="center")
     ws.row_dimensions[1].height = 25
 
@@ -469,10 +413,9 @@ def generar_excel_precios():
         ws.cell(row=i, column=3).font          = font_precio
         ws.cell(row=i, column=3).number_format = '#,##0'
 
-    anchos = {'A': 38, 'B': 48, 'C': 12, 'D': 8, 'E': 8,
-              'F': 12, 'G': 8, 'H': 8, 'I': 8, 'J': 8,
-              'K': 8, 'L': 8, 'M': 20, 'N': 22, 'O': 20,
-              'P': 22, 'Q': 20, 'R': 22, 'S': 30}
+    anchos = {'A': 38, 'B': 48, 'C': 12, 'D': 8, 'E': 8, 'F': 12, 'G': 8,
+              'H': 8, 'I': 8, 'J': 8, 'K': 8, 'L': 8, 'M': 20, 'N': 22,
+              'O': 20, 'P': 22, 'Q': 20, 'R': 22, 'S': 30}
     for col, w in anchos.items():
         ws.column_dimensions[col].width = w
 
@@ -525,16 +468,14 @@ def procesar_comando(texto):
         enviar_telegram("🔄 Canjeando código OAuth...")
         token = intercambiar_codigo_por_token(auth_code)
         if token:
-            # Mensaje optimizado para copiar los datos directamente a Railway
-            msg_exito = (
+            enviar_telegram(
                 f"✅ *¡Token obtenido!*\n\n"
-                f"Para que NO se borre nunca al modificar el código, copiá estos dos valores y agregalos en la sección *Variables* de tu panel de Railway:\n\n"
-                f"• Nombre: `API_USER_ID`\n  Valor: `{_api_user_id}`\n\n"
-                f"• Nombre: `API_TOKEN`\n  Valor: `{token}`"
+                f"Guardá estas variables en Railway para que no se pierdan:\n\n"
+                f"• `API_USER_ID` = `{_api_user_id}`\n"
+                f"• `API_TOKEN` = `{token}`"
             )
-            enviar_telegram(msg_exito)
         else:
-            enviar_telegram("❌ No pude obtener el token. Revisá que el código no haya vencido (dura 5 min).")
+            enviar_telegram("❌ No pude obtener el token. Revisá que el código no haya vencido (dura 1 min).")
         return
 
     cmd = texto.lower().split()
@@ -546,9 +487,9 @@ def procesar_comando(texto):
 
     elif cmd[0] == "/estado_api":
         if _api_token:
-            enviar_telegram(f"✅ *Token activo*\nUser ID: `{_api_user_id}`\nToken: `{_api_token[:12]}...`")
+            enviar_telegram(f"✅ *Token activo*\nStore ID: `{_api_user_id}`\nToken: `{_api_token[:12]}...`")
         else:
-            enviar_telegram("❌ No hay token guardado. Instalá la app en tu tienda y mandá el `?code=` aquí.")
+            enviar_telegram("❌ No hay token guardado.")
 
     elif cmd[0] == "/borrar_token":
         _api_token = _api_user_id = None
@@ -560,10 +501,10 @@ def procesar_comando(texto):
 
     elif cmd[0] == "/listar":
         if not _api_token:
-            enviar_telegram("❌ Necesito el token primero. Usá `/estado_api` para verificar.")
+            enviar_telegram("❌ Necesito el token primero.")
             return
         enviar_telegram("⏳ Buscando productos...")
-        productos = obtener_todos_los_productos_api()
+        productos = obtener_todos_los_productos_api(forzar_recarga=True)
         if not productos:
             enviar_telegram("No encontré productos o hubo un error.")
             return
@@ -572,8 +513,8 @@ def procesar_comando(texto):
             nombre = p.get("name", {})
             if isinstance(nombre, dict): nombre = next(iter(nombre.values()), "")
             variantes   = p.get("variants", [])
-            stock_total = sum(v.get("stock", 0) or 0 for v in variantes)
-            precio      = variantes[0].get("price", "?") if variantes else "?"
+            stock_total = sum((v.get("stock") or 0) for v in variantes)
+            precio      = variantes[0].get("price", "?") if variantes else p.get("price", "?")
             published   = "✅" if p.get("published") else "🚫"
             lineas.append(f"{published} *{nombre}* — ${precio} — Stock: {stock_total}")
         msg = f"📦 *Tus productos ({len(productos)} total):*\n\n" + "\n".join(lineas)
@@ -595,7 +536,7 @@ def procesar_comando(texto):
             if ocultar_producto_api(product_id):
                 enviar_telegram(f"🚫 *{nombre}* ocultado correctamente.")
             else:
-                enviar_telegram(f"❌ No pude ocultar *{nombre}*. Revisá los permisos de la app.")
+                enviar_telegram(f"❌ No pude ocultar *{nombre}*.")
         else:
             enviar_telegram(f"❌ No encontré *{nombre}* en tu tienda.")
 
@@ -629,7 +570,7 @@ def procesar_comando(texto):
             nuevo_stock = int(partes[-1])
             nombre      = " ".join(partes[1:-1])
         except ValueError:
-            enviar_telegram("El último parámetro tiene que ser un número. Ej: `/stock Cepillo 5`")
+            enviar_telegram("El último parámetro tiene que ser un número.")
             return
         enviar_telegram(f"🔍 Buscando *{nombre}*...")
         product_id, variant_id = buscar_producto_api(nombre)
@@ -653,7 +594,7 @@ def procesar_comando(texto):
             nuevo_precio = int(partes[-1])
             nombre       = " ".join(partes[1:-1])
         except ValueError:
-            enviar_telegram("El último parámetro tiene que ser un número. Ej: `/precio Cepillo 1500`")
+            enviar_telegram("El último parámetro tiene que ser un número.")
             return
         enviar_telegram(f"🔍 Buscando *{nombre}*...")
         product_id, variant_id = buscar_producto_api(nombre)
@@ -672,7 +613,7 @@ def procesar_comando(texto):
             fecha = datetime.now().strftime("%d-%m-%Y")
             nombre_archivo = f"precios_actualizados_{fecha}.xlsx"
             if not enviar_archivo_telegram(excel_bytes, nombre_archivo, caption=resumen):
-                enviar_telegram("❌ El Excel se generó pero falló el envío. Revisá los logs.")
+                enviar_telegram("❌ El Excel se generó pero falló el envío.")
         else:
             enviar_telegram(resumen)
 
@@ -889,9 +830,9 @@ def scrapear_web_a():
             nombre_original = title_el.text.strip()
             if len(nombre_original) < 4 or nombre_original.lower() == "productos": continue
             nombre_clave = " ".join(nombre_original.lower().split())
-            interesa   = any(p in nombre_clave for p in PALABRAS_INTERES)
+            interesa    = any(p in nombre_clave for p in PALABRAS_INTERES)
             es_variable = (item.find('a', class_='product_type_variable')
-                        or (price_el and "–" in price_el.text))
+                           or (price_el and "–" in price_el.text))
             if interesa and es_variable and link_el:
                 for nombre_var, datos_var in extraer_variaciones_woocommerce(link_el['href']).items():
                     nc = f"{nombre_original} ({nombre_var})"
@@ -975,7 +916,6 @@ def procesar_logica():
         return
 
     historial_consolidado = {**historial_a_viejo, **prod_a}
-
     bloque_ofertas = bloque_nuevos = bloque_recuperados = ""
     bloque_precios_bajos = bloque_faltantes = ""
 
@@ -1062,9 +1002,9 @@ if __name__ == "__main__":
     _cargar_token_desde_db()
 
     if _api_token:
-        enviar_telegram(f"🟢 *Bot iniciado* — Token API activo (user_id: `{_api_user_id}`)\nMandá `/ayuda` para ver los comandos.")
+        enviar_telegram(f"🟢 *Bot iniciado* — Token API activo (store_id: `{_api_user_id}`)\nMandá `/ayuda` para ver los comandos.")
     else:
-        enviar_telegram("🟡 *Bot iniciado* — Sin token API todavía.\nInstalá la app en tu tienda demo y mandá el `?code=` aquí.\nMandá `/ayuda` para ver los comandos.")
+        enviar_telegram("🟡 *Bot iniciado* — Sin token API.\nInstalá la app en tu tienda y mandá el `?code=` aquí.\nMandá `/ayuda` para ver los comandos.")
 
     hilo = threading.Thread(target=bucle_escucha_telegram, daemon=True)
     hilo.start()
