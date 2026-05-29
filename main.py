@@ -147,18 +147,18 @@ def intercambiar_codigo_por_token(auth_code):
         print(resp.text)
 
         if resp.status_code in (200, 201):
-    data = resp.json()
+            data = resp.json()
 
-    api_data = data.get("data", {})
+            api_data = data.get("data", {})
 
-    token = api_data.get("access_token")
-    user_id = str(api_data.get("store_id", ""))
+            token = api_data.get("access_token")
+            user_id = str(api_data.get("store_id", ""))
 
-    print(f"Store ID: {user_id}")
+            print(f"Store ID: {user_id}")
 
-    if token and user_id:
-        _guardar_token_en_db(token, user_id)
-        return token
+            if token and user_id:
+                _guardar_token_en_db(token, user_id)
+                return token
 
         return None
 
