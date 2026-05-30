@@ -911,6 +911,7 @@ AYUDA = f"""
 """.strip()
 
 def procesar_cmd(texto):
+    global _token, _store_id
     texto = texto.strip()
 
     # ── OAuth ──────────────────────────────────────────────────────────────
@@ -943,7 +944,6 @@ def procesar_cmd(texto):
 
     # ── /borrar_token ────────────────────────────────────────────────────────
     elif cmd[0] == "/borrar_token":
-        global _token, _store_id
         _token = _store_id = None
         db = leer_db()
         db.pop("api_token", None); db.pop("api_user_id", None)
