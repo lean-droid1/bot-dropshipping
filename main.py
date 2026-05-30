@@ -449,12 +449,11 @@ def calcular_precios_variantes(nombre_api_norm, variantes_api, indice_prov):
 
     if precios:
         return precios
-    # Si no se pudo matchear ninguna variante pero el producto existe en el proveedor,
-    # aplicar precio_fallback a todas las variantes disponibles
     if variantes_api:
+        # No se matcheó ninguna variante individualmente → precio_fallback para todas
         return {v["id"]: precio_fallback for v in variantes_api if v.get("id")}
-    # Producto sin variantes en la API → devolver dict con product_id como clave
-    return {}  # Se maneja en sincronizacion_completa con actualizar_precio_producto_directo
+    # Producto sin variantes en API → señal especial para actualizar precio directo
+    return {"__directo__": precio_fallback}
 
 
 def sincronizacion_completa(prod_a):
@@ -500,7 +499,7 @@ def sincronizacion_completa(prod_a):
             else:
                 ok_stock = sin_stock_producto_directo(product_id)
             if ok_stock:
-                sincronizados[nombre_real] = {"sin_stock": True}
+                sincronizados[nombre_real] = {"sin_stock": True, "sin_stock_ts": time.time()}
                 etiqueta = f"({len(variant_ids)} var.)" if variant_ids else "(sin variantes)"
                 lineas_sin_stock.append(f"• *{nombre_real}* {etiqueta}")
             else:
@@ -508,22 +507,26 @@ def sincronizacion_completa(prod_a):
             continue
 
         # Tiene match → aplicar precios
-        if variant_ids:
+        es_directo = "__directo__" in precios_var
+        if es_directo:
+            precio_directo = precios_var["__directo__"]
+            ok = actualizar_precio_producto_directo(product_id, precio_directo)
+            precios_efectivos = {product_id: precio_directo}
+        elif variant_ids:
             ok = actualizar_todas_las_variantes(product_id, variant_ids,
                                                 precios_por_variante=precios_var)
+            precios_efectivos = precios_var
         else:
-            # Producto sin variantes → precio directo en el producto
-            precio_directo = list(precios_var.values())[0] if precios_var else redondear_precio(list(indice_prov.values())[0][0]["precio"] / 0.78)
-            ok = actualizar_precio_producto_directo(product_id, precio_directo)
-            precios_var = {product_id: precio_directo}
+            errores.append(nombre_real)
+            continue
 
-        if ok and precios_var:
-            precio_min = min(precios_var.values())
-            precio_max = max(precios_var.values())
+        if ok and precios_efectivos:
+            precio_min = min(precios_efectivos.values())
+            precio_max = max(precios_efectivos.values())
             precio_resumen = f"${precio_min:,}" if precio_min == precio_max else f"${precio_min:,}–${precio_max:,}"
             sincronizados[nombre_real] = {"precio": precio_min}
             if int(precio_web) != precio_min:
-                etiqueta = f"({len(variant_ids)} var.)" if variant_ids else "(sin variantes)"
+                etiqueta = "(sin variantes)" if es_directo else f"({len(variant_ids)} var.)"
                 lineas_precios.append(
                     f"• *{nombre_real}* {etiqueta}\n"
                     f"  Anterior: ${int(precio_web):,} → *Nuevo: {precio_resumen}*"
@@ -1254,14 +1257,18 @@ def procesar_logica():
         precios_var = calcular_precios_variantes(nombre_norm, variantes_api, indice_prov_ciclo)
 
         if precios_var is None:
-            # Proveedor no tiene → marcar sin stock (solo si no lo hicimos ya)
-            if not sync_actual.get("sin_stock", False) and _api_token:
+            # Proveedor no tiene → marcar sin stock
+            # Anti-spam: solo actuar si no lo hicimos en las últimas 6 horas
+            ultimo_sin_stock = sync_actual.get("sin_stock_ts", 0)
+            ya_marcado       = sync_actual.get("sin_stock", False)
+            hace_6h          = time.time() - 21600
+            if (not ya_marcado or ultimo_sin_stock < hace_6h) and _api_token:
                 if variant_ids:
                     ok_stock = actualizar_todas_las_variantes(datos_web["product_id"], variant_ids, nuevo_stock=0)
                 else:
                     ok_stock = sin_stock_producto_directo(datos_web["product_id"])
                 if ok_stock:
-                    sincronizados[nombre_real] = {"sin_stock": True}
+                    sincronizados[nombre_real] = {"sin_stock": True, "sin_stock_ts": time.time()}
                     etiqueta = f"({len(variant_ids)} var.)" if variant_ids else "(sin variantes)"
                     lineas_sin_stock.append(f"• *{nombre_real}* {etiqueta}")
         else:
@@ -1269,26 +1276,32 @@ def procesar_logica():
             if sync_actual.get("sin_stock", False):
                 sincronizados.pop(nombre_real, None)
 
-            # Si precios_var vino vacío no hay nada que actualizar
             if not precios_var:
                 continue
 
-            # Actualizar precio solo si cambió respecto al último sync
-            precio_min  = min(precios_var.values())
+            # Detectar si es producto directo (sin variantes)
+            es_directo = "__directo__" in precios_var
+            if es_directo:
+                precio_min = precios_var["__directo__"]
+                precios_efectivos = {datos_web["product_id"]: precio_min}
+            else:
+                precios_efectivos = precios_var
+                precio_min = min(precios_efectivos.values())
+
             ultimo_sync = sync_actual.get("precio")
             if precio_min != ultimo_sync and _api_token:
-                if variant_ids:
-                    ok = actualizar_todas_las_variantes(datos_web["product_id"], variant_ids,
-                                                        precios_por_variante=precios_var)
-                else:
+                if es_directo:
                     ok = actualizar_precio_producto_directo(datos_web["product_id"], precio_min)
+                else:
+                    ok = actualizar_todas_las_variantes(datos_web["product_id"], variant_ids,
+                                                        precios_por_variante=precios_efectivos)
                 if ok:
-                    precio_max = max(precios_var.values())
+                    precio_max = max(precios_efectivos.values())
                     precio_resumen = f"${precio_min:,}" if precio_min == precio_max else f"${precio_min:,}–${precio_max:,}"
                     sincronizados[nombre_real] = {"precio": precio_min}
                     precio_web_actual = int(datos_web["precio_base"])
                     if precio_web_actual != precio_min:
-                        etiqueta = f"({len(variant_ids)} var.)" if variant_ids else "(sin variantes)"
+                        etiqueta = "(sin variantes)" if es_directo else f"({len(variant_ids)} var.)"
                         lineas_precios.append(
                             f"• *{nombre_real}* {etiqueta}\n"
                             f"  Antes: ${precio_web_actual:,} → *Nuevo: {precio_resumen}*"
