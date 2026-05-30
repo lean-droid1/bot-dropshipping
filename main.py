@@ -447,7 +447,14 @@ def calcular_precios_variantes(nombre_api_norm, variantes_api, indice_prov):
         else:
             precios[variant_id] = precio_fallback
 
-    return precios if precios else {v["id"]: precio_fallback for v in variantes_api if v.get("id")}
+    if precios:
+        return precios
+    # Si no se pudo matchear ninguna variante pero el producto existe en el proveedor,
+    # aplicar precio_fallback a todas las variantes disponibles
+    if variantes_api:
+        return {v["id"]: precio_fallback for v in variantes_api if v.get("id")}
+    # Producto sin variantes en la API → devolver dict con product_id como clave
+    return {}  # Se maneja en sincronizacion_completa con actualizar_precio_producto_directo
 
 
 def sincronizacion_completa(prod_a):
@@ -510,7 +517,7 @@ def sincronizacion_completa(prod_a):
             ok = actualizar_precio_producto_directo(product_id, precio_directo)
             precios_var = {product_id: precio_directo}
 
-        if ok:
+        if ok and precios_var:
             precio_min = min(precios_var.values())
             precio_max = max(precios_var.values())
             precio_resumen = f"${precio_min:,}" if precio_min == precio_max else f"${precio_min:,}–${precio_max:,}"
@@ -521,7 +528,7 @@ def sincronizacion_completa(prod_a):
                     f"• *{nombre_real}* {etiqueta}\n"
                     f"  Anterior: ${int(precio_web):,} → *Nuevo: {precio_resumen}*"
                 )
-        else:
+        elif not ok:
             errores.append(nombre_real)
 
     # ── Resumen ──────────────────────────────────────────────────────────────
@@ -1261,6 +1268,10 @@ def procesar_logica():
             # Limpiar flag sin_stock si el proveedor volvió a tener stock
             if sync_actual.get("sin_stock", False):
                 sincronizados.pop(nombre_real, None)
+
+            # Si precios_var vino vacío no hay nada que actualizar
+            if not precios_var:
+                continue
 
             # Actualizar precio solo si cambió respecto al último sync
             precio_min  = min(precios_var.values())
