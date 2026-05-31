@@ -1,1016 +1,1176 @@
-import os
-import time
-import json
+"""
+Bot de Dropshipping — Tienda Negocio
+Compara precios del proveedor (rxzweb.com) con la tienda propia
+y sincroniza precios/stock automáticamente via API.
+"""
+import os, time, json, re, io, threading, imaplib, email
+from email.header import decode_header
+from datetime import datetime, timedelta
 import requests
 from bs4 import BeautifulSoup
 import urllib3
-import re
-import imaplib
-import email
-from email.header import decode_header
-from datetime import datetime, timedelta
-import threading
-import io
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
-# ─── URLs ────────────────────────────────────────────────────────────────────
-URL_A          = "https://rxzweb.com/tienda/?et_per_page=-1"
-URL_B          = "https://leandroid.tiendanegocio.com/productos"
+# ══════════════════════════════════════════════════════════════════════════════
+# CONFIGURACIÓN
+# ══════════════════════════════════════════════════════════════════════════════
 DB_FILE        = "estado_productos.json"
-USER_AGENT_API = "dropshipping (lean.6roid@gmail.com)"
+URL_PROVEEDOR  = "https://rxzweb.com/tienda/?et_per_page=-1"
+API_BASE       = "https://developers.tiendanegocio.com/v1"
+USER_AGENT     = "dropshipping (lean.6roid@gmail.com)"
+# MARGEN: porcentaje que el precio de venta cubre sobre el costo
+# 0.78 = ganancia neta 22% | 0.90 = ganancia neta 10%
+# Configurable por variable de entorno MARGEN en Railway
+MARGEN = float(os.environ.get("MARGEN", "0.78"))
 
-URL_API_PRODUCTS = None
-
-# ─── Variables de entorno (Railway) ──────────────────────────────────────────
-TELEGRAM_TOKEN = None
-CHAT_ID        = None
-SCRAPERAPI_KEY = None
-GMAIL_USER     = None
-GMAIL_PASS     = None
-CLIENT_ID      = None
-CLIENT_SECRET  = None
-
-for k, v in os.environ.items():
-    val = v.strip()
-    if "TELEGRAM_TOKEN" in k: TELEGRAM_TOKEN = val
-    if "CHAT_ID"        in k: CHAT_ID        = val
-    if "SCRAPERAPI_KEY" in k: SCRAPERAPI_KEY = val
-    if "GMAIL_USER"     in k: GMAIL_USER     = val
-    if "GMAIL_PASS"     in k: GMAIL_PASS     = val
-    if "CLIENT_ID"      in k: CLIENT_ID      = val
-    if "CLIENT_SECRET"  in k: CLIENT_SECRET  = val
-
-# ─── Estado global del token API ─────────────────────────────────────────────
-_api_token   = None
-_api_user_id = None
-
-def _cargar_token_desde_db():
-    global _api_token, _api_user_id, URL_API_PRODUCTS
-    estado = cargar_estado_anterior()
-    t = estado.get("api_token")
-    u = estado.get("api_user_id")
-    if t and u:
-        _api_token   = t
-        _api_user_id = u
-        URL_API_PRODUCTS = f"https://api.tiendanube.com/2025-03/{u}/products"
-        print(f"✅ Token API cargado desde DB (user_id={u})")
-
-def _guardar_token_en_db(token, user_id):
-    global _api_token, _api_user_id, URL_API_PRODUCTS
-    _api_token   = token
-    _api_user_id = user_id
-    URL_API_PRODUCTS = f"https://api.tiendanube.com/2025-03/{user_id}/products"
-    estado = cargar_estado_anterior()
-    estado["api_token"]   = token
-    estado["api_user_id"] = user_id
-    guardar_estado_actual(estado)
-    print(f"💾 Token guardado en DB (user_id={user_id})")
-
-# ─── Palabras de interés ─────────────────────────────────────────────────────
 PALABRAS_INTERES = [
-    'ma ant', 'amaoe', '2uul', 'goot wick', 'mijing', 'louwei',
-    'rf4', 'jakemy', 'kailiwei', 'kslid', 'aifen', 'sugon', 'jcid', 'jc',
-    'v1', 'v1s', 'v1se', 'v1 pro', 'programadora',
-    'organizador', 'cinta', 'silla', 'mesa', 'puas', 'hilo', 'cepillo'
+    'ma ant','amaoe','2uul','goot wick','mijing','louwei','rf4','jakemy',
+    'kailiwei','kslid','aifen','sugon','jcid','jc','v1','v1s','v1se',
+    'v1 pro','programadora','organizador','cinta','silla','mesa','puas',
+    'hilo','cepillo'
 ]
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# TELEGRAM
-# ═══════════════════════════════════════════════════════════════════════════════
+# ── Variables de entorno ──────────────────────────────────────────────────────
+def _e(nombre):
+    """Lee variable de entorno por nombre exacto."""
+    return (os.environ.get(nombre) or "").strip() or None
 
-def enviar_telegram(mensaje):
-    if not mensaje or not TELEGRAM_TOKEN or not CHAT_ID:
+TELEGRAM_TOKEN = _e("TELEGRAM_TOKEN")
+CHAT_ID        = _e("CHAT_ID")
+SCRAPERAPI_KEY = _e("SCRAPERAPI_KEY")
+GMAIL_USER     = _e("GMAIL_USER")
+GMAIL_PASS     = _e("GMAIL_PASS")
+CLIENT_ID      = _e("CLIENT_ID")
+CLIENT_SECRET  = _e("CLIENT_SECRET")
+NOMBRE_TIENDA  = _e("NOMBRE_TIENDA") or "🧪 PRUEBA"
+
+# ── Token API (estado global) ─────────────────────────────────────────────────
+_token    = None
+_store_id = None
+
+def cargar_token():
+    global _token, _store_id
+    t = _e("API_TOKEN")
+    u = _e("API_USER_ID")
+    if t and u:
+        _token = t; _store_id = u
+        print(f"✅ Token desde Railway (store_id={u})")
         return
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
-    payload = {"chat_id": CHAT_ID, "text": mensaje, "parse_mode": "Markdown"}
-    try:
-        requests.post(url, json=payload, timeout=15)
-        print("🚀 Mensaje enviado a Telegram.")
-    except Exception as e:
-        print(f"❌ Error Telegram: {e}")
+    db = leer_db()
+    if db.get("api_token") and db.get("api_user_id"):
+        _token    = db["api_token"]
+        _store_id = db["api_user_id"]
+        print(f"✅ Token desde DB (store_id={_store_id})")
 
-def enviar_archivo_telegram(buffer_bytes, nombre_archivo, caption=""):
-    """Envía un archivo (bytes) por Telegram como documento."""
-    if not TELEGRAM_TOKEN or not CHAT_ID:
-        return False
-    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument"
-    try:
-        resp = requests.post(
-            url,
-            data={"chat_id": CHAT_ID, "caption": caption},
-            files={"document": (nombre_archivo, buffer_bytes,
-                   "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
-            timeout=30
-        )
-        ok = resp.status_code == 200
-        print(f"{'✅' if ok else '❌'} Archivo enviado: {nombre_archivo} (HTTP {resp.status_code})")
-        return ok
-    except Exception as e:
-        print(f"❌ Error enviando archivo: {e}")
-        return False
+def guardar_token(token, store_id):
+    global _token, _store_id
+    _token = token; _store_id = store_id
+    db = leer_db()
+    db["api_token"]   = token
+    db["api_user_id"] = store_id
+    escribir_db(db)
+    print(f"💾 Token guardado (store_id={store_id})")
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# OAUTH — CANJE DE TOKEN
-# ═══════════════════════════════════════════════════════════════════════════════
-
-OAUTH_ENDPOINTS = [
-    "https://www.tiendanube.com/apps/authorize/token",
-    "https://www.tiendanegocio.com/apps/authorize/token",
-]
-
-def intercambiar_codigo_por_token(auth_code):
-    payload = {
-        "client_id":     CLIENT_ID,
-        "client_secret": CLIENT_SECRET,
-        "code":          auth_code,
-        "grant_type":    "authorization_code"
-    }
-    for endpoint in OAUTH_ENDPOINTS:
-        for content_type, use_json in [("application/x-www-form-urlencoded", False),
-                                       ("application/json; charset=utf-8",    True)]:
-            try:
-                print(f"🔄 Probando {endpoint} ({'JSON' if use_json else 'Form'})...")
-                headers = {"Content-Type": content_type, "User-Agent": USER_AGENT_API}
-                resp = requests.post(endpoint, json=payload if use_json else None,
-                                     data=None if use_json else payload,
-                                     headers=headers, timeout=15)
-                print(f"   → HTTP {resp.status_code}: {resp.text[:120]}")
-                if resp.status_code == 200:
-                    data    = resp.json()
-                    token   = data.get("access_token")
-                    user_id = str(data.get("user_id", ""))
-                    if token and user_id:
-                        _guardar_token_en_db(token, user_id)
-                        return token
-            except Exception as e:
-                print(f"   ⚠️ Excepción: {e}")
-    return None
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# API — TIENDANUBE / TIENDANEGOCIO
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def _api_headers():
-    return {
-        "Authentication": f"bearer {_api_token}",
-        "User-Agent":     USER_AGENT_API,
-        "Content-Type":   "application/json"
-    }
-
-def obtener_todos_los_productos_api():
-    if not _api_token or not URL_API_PRODUCTS:
-        return []
-    todos = []
-    pagina = 1
-    while True:
-        try:
-            url  = f"{URL_API_PRODUCTS}?per_page=200&page={pagina}"
-            resp = requests.get(url, headers=_api_headers(), timeout=20)
-            if resp.status_code != 200:
-                print(f"❌ API productos HTTP {resp.status_code}: {resp.text[:100]}")
-                break
-            data = resp.json()
-            lote = data if isinstance(data, list) else data.get("results", [])
-            if not lote:
-                break
-            todos.extend(lote)
-            if len(lote) < 200:
-                break
-            pagina += 1
-        except Exception as e:
-            print(f"❌ Error paginando productos: {e}")
-            break
-    print(f"   📦 Total productos traídos de la API: {len(todos)}")
-    return todos
-
-def buscar_producto_api(nombre_buscado):
-    productos = obtener_todos_los_productos_api()
-    for p in productos:
-        nombre_api = p.get("name", {})
-        if isinstance(nombre_api, dict):
-            nombre_api = next(iter(nombre_api.values()), "")
-        if son_coincidentes_inteligentes(str(nombre_api), nombre_buscado):
-            product_id = p.get("id")
-            variantes  = p.get("variants", [])
-            variant_id = variantes[0].get("id") if variantes else None
-            return product_id, variant_id
-    return None, None
-
-def modificar_stock_api(product_id, variant_id, nuevo_stock):
-    if not _api_token or not URL_API_PRODUCTS:
-        return False
-    url = f"{URL_API_PRODUCTS}/{product_id}/variants/{variant_id}"
-    try:
-        resp = requests.put(url, json={"stock": int(nuevo_stock)}, headers=_api_headers(), timeout=15)
-        ok = resp.status_code in (200, 201)
-        print(f"{'✅' if ok else '❌'} Stock → {nuevo_stock} (HTTP {resp.status_code})")
-        return ok
-    except Exception as e:
-        print(f"❌ Error modificando stock: {e}")
-        return False
-
-def modificar_precio_api(product_id, variant_id, nuevo_precio):
-    if not _api_token or not URL_API_PRODUCTS:
-        return False
-    url = f"{URL_API_PRODUCTS}/{product_id}/variants/{variant_id}"
-    try:
-        resp = requests.put(url, json={"price": str(nuevo_precio)}, headers=_api_headers(), timeout=15)
-        ok = resp.status_code in (200, 201)
-        print(f"{'✅' if ok else '❌'} Precio → ${nuevo_precio} (HTTP {resp.status_code})")
-        return ok
-    except Exception as e:
-        print(f"❌ Error modifying precio: {e}")
-        return False
-
-def ocultar_producto_api(product_id):
-    if not _api_token or not URL_API_PRODUCTS:
-        return False
-    url = f"{URL_API_PRODUCTS}/{product_id}"
-    try:
-        resp = requests.put(url, json={"published": False}, headers=_api_headers(), timeout=15)
-        ok = resp.status_code in (200, 201)
-        print(f"{'✅' if ok else '❌'} Producto {product_id} ocultado (HTTP {resp.status_code})")
-        return ok
-    except Exception as e:
-        print(f"❌ Error ocultando producto: {e}")
-        return False
-
-def publicar_producto_api(product_id):
-    if not _api_token or not URL_API_PRODUCTS:
-        return False
-    url = f"{URL_API_PRODUCTS}/{product_id}"
-    try:
-        resp = requests.put(url, json={"published": True}, headers=_api_headers(), timeout=15)
-        ok = resp.status_code in (200, 201)
-        print(f"{'✅' if ok else '❌'} Producto {product_id} publicado (HTTP {resp.status_code})")
-        return ok
-    except Exception as e:
-        print(f"❌ Error publicando producto: {e}")
-        return False
-
-def sincronizar_producto(nombre_web, datos_proveedor, accion, valor=None):
-    if not _api_token:
-        return
-    product_id, variant_id = buscar_producto_api(nombre_web)
-    if not product_id:
-        print(f"⚠️ No encontré '{nombre_web}' en la API para sincronizar.")
-        return
-    if accion == "ocultar":
-        if ocultar_producto_api(product_id):
-            enviar_telegram(f"🤖 *Auto-sync:* Oculté *{nombre_web}* (sin stock en proveedor)")
-    elif accion == "stock_cero":
-        if variant_id and modificar_stock_api(product_id, variant_id, 0):
-            enviar_telegram(f"🤖 *Auto-sync:* Stock → 0 en *{nombre_web}*")
-    elif accion == "precio" and valor is not None:
-        if variant_id and modificar_precio_api(product_id, variant_id, valor):
-            enviar_telegram(f"🤖 *Auto-sync:* Precio actualizado a *${valor:,}* en *{nombre_web}*")
-    elif accion == "publicar":
-        if publicar_producto_api(product_id):
-            enviar_telegram(f"🤖 *Auto-sync:* Publiqué *{nombre_web}* (stock recuperado)")
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# EXPORTAR EXCEL CON PRECIOS PROVEEDOR +22%
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def redondear_precio(precio):
-    """Redondea a número limpio según el rango."""
-    if precio >= 100000:
-        return round(precio / 1000) * 1000
-    elif precio >= 10000:
-        return round(precio / 500) * 500
-    elif precio >= 1000:
-        return round(precio / 100) * 100
-    else:
-        return round(precio / 50) * 50
-
-def generar_excel_precios():
-    """
-    Lee productos_a (proveedor) y productos_b (mi tienda) del JSON,
-    cruza nombres, calcula proveedor +22% y genera un Excel listo
-    para importar en Tienda Negocio.
-    Devuelve (bytes_del_excel, resumen_texto) o (None, mensaje_error).
-    """
-    try:
-        import openpyxl
-        from openpyxl.styles import Font, PatternFill, Alignment
-    except ImportError:
-        return None, "❌ Falta instalar openpyxl en Railway. Agregalo al requirements.txt."
-
-    estado    = cargar_estado_anterior()
-    prod_a    = estado.get("productos_a", {})
-    prod_b    = estado.get("productos_b", {})
-
-    if not prod_a:
-        return None, "❌ El bot todavía no tiene datos del proveedor. Esperá que complete un ciclo de monitoreo primero."
-    if not prod_b:
-        return None, "❌ El bot todavía no tiene datos de tu tienda. Esperá que complete un ciclo de monitoreo primero."
-
-    # Columnas que acepta Tienda Negocio para importar
-    columnas = [
-        "Hash", "Nombre del producto", "Precio", "Oferta", "Stock",
-        "Visibilidad (Visible o Oculto)", "Descripción", "SKU",
-        "Peso en KG", "Alto en CM", "Ancho en CM", "Profundidad en CM",
-        "Nombre de variante #1", "Opción de variante #1",
-        "Nombre de variante #2", "Opción de variante #2",
-        "Nombre de variante #3", "Opción de variante #3",
-        "Categorías > Subcategorías > … > Subcategorías"
-    ]
-
-    filas         = []
-    actualizados  = 0
-    sin_match     = 0
-    igual_precio  = 0
-
-    for clave_b, datos_b in prod_b.items():
-        # Buscar el producto correspondiente en el proveedor
-        datos_a = None
-        for clave_a, da in prod_a.items():
-            if son_coincidentes_inteligentes(clave_b, clave_a):
-                datos_a = da
-                break
-        if datos_a is None:
-            # Intentar por nombre_base_proveedor
-            variantes = [d for c, d in prod_a.items()
-                         if son_coincidentes_inteligentes(clave_b, d.get("nombre_base_proveedor", ""))]
-            if variantes:
-                datos_a = min(variantes, key=lambda x: x["precio"])
-
-        if datos_a is None:
-            sin_match += 1
-            continue  # No hay precio del proveedor, no tocar
-
-        precio_proveedor = datos_a["precio"]
-        precio_nuevo     = redondear_precio(precio_proveedor * 1.22)
-        precio_actual    = datos_b["precio"]
-
-        if precio_nuevo == precio_actual:
-            igual_precio += 1
-            continue  # Ya está en el precio correcto
-
-        # Armar fila en el formato de importación de Tienda Negocio
-        # Hash = clave_b (slug), el resto vacío excepto Precio
-        fila = {
-            "Hash":                   clave_b,
-            "Nombre del producto":    datos_b["nombre_real"],
-            "Precio":                 precio_nuevo,
-            "Oferta":                 "",
-            "Stock":                  "",
-            "Visibilidad (Visible o Oculto)": "",
-            "Descripción":            "",
-            "SKU":                    "",
-            "Peso en KG":             "",
-            "Alto en CM":             "",
-            "Ancho en CM":            "",
-            "Profundidad en CM":      "",
-            "Nombre de variante #1":  "",
-            "Opción de variante #1":  "",
-            "Nombre de variante #2":  "",
-            "Opción de variante #2":  "",
-            "Nombre de variante #3":  "",
-            "Opción de variante #3":  "",
-            "Categorías > Subcategorías > … > Subcategorías": ""
-        }
-        filas.append(fila)
-        actualizados += 1
-
-    if not filas:
-        return None, (
-            f"ℹ️ No hay precios para actualizar.\n"
-            f"• {igual_precio} productos ya tienen el precio correcto (+22% sobre proveedor)\n"
-            f"• {sin_match} productos sin match con el proveedor"
-        )
-
-    # ── Crear el Excel ────────────────────────────────────────────────────
-    wb = openpyxl.Workbook()
-    ws = wb.active
-    ws.title = "Productos"
-
-    # Header
-    header_fill = PatternFill("solid", fgColor="1F6B3B")
-    header_font = Font(bold=True, color="FFFFFF", name="Arial", size=10)
-    ws.append(columnas)
-    for cell in ws[1]:
-        cell.fill      = header_fill
-        cell.font      = header_font
-        cell.alignment = Alignment(horizontal="center", vertical="center")
-    ws.row_dimensions[1].height = 25
-
-    # Filas con colores alternados
-    fill_par   = PatternFill("solid", fgColor="F0F7F2")
-    fill_impar = PatternFill("solid", fgColor="FFFFFF")
-    font_normal = Font(name="Arial", size=9)
-    font_precio = Font(name="Arial", size=9, bold=True, color="1F6B3B")
-
-    for i, fila in enumerate(filas, start=2):
-        ws.append([fila[c] for c in columnas])
-        fill = fill_par if i % 2 == 0 else fill_impar
-        for cell in ws[i]:
-            cell.fill = fill
-            cell.font = font_normal
-        # Precio en verde negrita
-        ws.cell(row=i, column=3).font   = font_precio
-        ws.cell(row=i, column=3).number_format = '#,##0'
-
-    # Anchos
-    anchos = {'A': 38, 'B': 48, 'C': 12, 'D': 8, 'E': 8,
-              'F': 12, 'G': 8, 'H': 8, 'I': 8, 'J': 8,
-              'K': 8, 'L': 8, 'M': 20, 'N': 22, 'O': 20,
-              'P': 22, 'Q': 20, 'R': 22, 'S': 30}
-    for col, w in anchos.items():
-        ws.column_dimensions[col].width = w
-
-    # Guardar en memoria (no en disco)
-    buf = io.BytesIO()
-    wb.save(buf)
-    buf.seek(0)
-
-    resumen = (
-        f"✅ Excel generado:\n"
-        f"• *{actualizados}* productos con precio actualizado\n"
-        f"• *{igual_precio}* ya tenían el precio correcto\n"
-        f"• *{sin_match}* sin coincidencia con el proveedor\n\n"
-        f"Importalo desde: *Productos → Importar y exportar → Importar*"
-    )
-    return buf.getvalue(), resumen
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# COMANDOS TELEGRAM
-# ═══════════════════════════════════════════════════════════════════════════════
-
-AYUDA_MSG = """
-🤖 *Comandos disponibles:*
-
-🔑 *Token / API*
-`?code=XXXX` — Canjear código OAuth por token
-`/estado_api` — Ver si el token está activo
-`/borrar_token` — Eliminar token guardado
-
-📦 *Productos (requiere token)*
-`/listar` — Ver todos los productos de tu tienda
-`/ocultar NOMBRE` — Ocultar un producto
-`/publicar NOMBRE` — Publicar un producto oculto
-`/stock NOMBRE CANTIDAD` — Cambiar stock de un producto
-`/precio NOMBRE VALOR` — Cambiar precio de un producto
-
-📊 *Precios*
-`/exportar_precios` — Excel con todos los precios actualizados a proveedor +22% listo para importar
-
-🔄 *Control del bot*
-`/ciclo` — Forzar un ciclo de monitoreo ahora
-`/ayuda` — Ver este mensaje
-""".strip()
-
-def procesar_comando(texto):
-    global _api_token, _api_user_id
-    texto = texto.strip()
-
-    if "?code=" in texto:
-        auth_code = texto.split("?code=")[1].split("&")[0].strip()
-        enviar_telegram("🔄 Canjeando código OAuth...")
-        token = intercambiar_codigo_por_token(auth_code)
-        if token:
-            enviar_telegram(f"✅ *¡Token obtenido!* Ya puedo modificar tu tienda automáticamente.\nUser ID: `{_api_user_id}`")
-        else:
-            enviar_telegram("❌ No pude obtener el token. Revisá que el código no haya vencido (dura 5 min).")
-        return
-
-    cmd = texto.lower().split()
-    if not cmd:
-        return
-
-    if cmd[0] == "/ayuda":
-        enviar_telegram(AYUDA_MSG)
-
-    elif cmd[0] == "/estado_api":
-        if _api_token:
-            enviar_telegram(f"✅ *Token activo*\nUser ID: `{_api_user_id}`\nToken: `{_api_token[:12]}...`")
-        else:
-            enviar_telegram("❌ No hay token guardado. Instalá la app en tu tienda y mandá el `?code=` aquí.")
-
-    elif cmd[0] == "/borrar_token":
-        _api_token = _api_user_id = None
-        estado = cargar_estado_anterior()
-        estado.pop("api_token", None)
-        estado.pop("api_user_id", None)
-        guardar_estado_actual(estado)
-        enviar_telegram("🗑️ Token eliminado.")
-
-    elif cmd[0] == "/listar":
-        if not _api_token:
-            enviar_telegram("❌ Necesito el token primero. Usá `/estado_api` para verificar.")
-            return
-        enviar_telegram("⏳ Buscando productos...")
-        productos = obtener_todos_los_productos_api()
-        if not productos:
-            enviar_telegram("No encontré productos o hubo un error.")
-            return
-        lineas = []
-        for p in productos[:50]:
-            nombre = p.get("name", {})
-            if isinstance(nombre, dict): nombre = next(iter(nombre.values()), "")
-            variantes   = p.get("variants", [])
-            stock_total = sum(v.get("stock", 0) or 0 for v in variantes)
-            precio      = variantes[0].get("price", "?") if variantes else "?"
-            published   = "✅" if p.get("published") else "🚫"
-            lineas.append(f"{published} *{nombre}* — ${precio} — Stock: {stock_total}")
-        msg = f"📦 *Tus productos ({len(productos)} total):*\n\n" + "\n".join(lineas)
-        if len(productos) > 50:
-            msg += f"\n\n_...y {len(productos)-50} más_"
-        enviar_telegram(msg)
-
-    elif cmd[0] == "/ocultar":
-        if not _api_token:
-            enviar_telegram("❌ Necesito el token primero.")
-            return
-        nombre = " ".join(texto.split()[1:])
-        if not nombre:
-            enviar_telegram("Uso: `/ocultar Nombre del producto`")
-            return
-        enviar_telegram(f"🔍 Buscando *{nombre}*...")
-        product_id, _ = buscar_producto_api(nombre)
-        if product_id:
-            if ocultar_producto_api(product_id):
-                enviar_telegram(f"🚫 *{nombre}* ocultado correctamente.")
-            else:
-                enviar_telegram(f"❌ No pude ocultar *{nombre}*. Revisá los permisos de la app.")
-        else:
-            enviar_telegram(f"❌ No encontré *{nombre}* en tu tienda.")
-
-    elif cmd[0] == "/publicar":
-        if not _api_token:
-            enviar_telegram("❌ Necesito el token primero.")
-            return
-        nombre = " ".join(texto.split()[1:])
-        if not nombre:
-            enviar_telegram("Uso: `/publicar Nombre del producto`")
-            return
-        enviar_telegram(f"🔍 Buscando *{nombre}*...")
-        product_id, _ = buscar_producto_api(nombre)
-        if product_id:
-            if publicar_producto_api(product_id):
-                enviar_telegram(f"✅ *{nombre}* publicado correctamente.")
-            else:
-                enviar_telegram(f"❌ No pude publicar *{nombre}*.")
-        else:
-            enviar_telegram(f"❌ No encontré *{nombre}* en tu tienda.")
-
-    elif cmd[0] == "/stock":
-        if not _api_token:
-            enviar_telegram("❌ Necesito el token primero.")
-            return
-        partes = texto.split()
-        if len(partes) < 3:
-            enviar_telegram("Uso: `/stock Nombre del producto 10`")
-            return
-        try:
-            nuevo_stock = int(partes[-1])
-            nombre      = " ".join(partes[1:-1])
-        except ValueError:
-            enviar_telegram("El último parámetro tiene que ser un número. Ej: `/stock Cepillo 5`")
-            return
-        enviar_telegram(f"🔍 Buscando *{nombre}*...")
-        product_id, variant_id = buscar_producto_api(nombre)
-        if product_id and variant_id:
-            if modificar_stock_api(product_id, variant_id, nuevo_stock):
-                enviar_telegram(f"📦 Stock de *{nombre}* actualizado a *{nuevo_stock}*.")
-            else:
-                enviar_telegram(f"❌ No pude actualizar el stock de *{nombre}*.")
-        else:
-            enviar_telegram(f"❌ No encontré *{nombre}* en tu tienda.")
-
-    elif cmd[0] == "/precio":
-        if not _api_token:
-            enviar_telegram("❌ Necesito el token primero.")
-            return
-        partes = texto.split()
-        if len(partes) < 3:
-            enviar_telegram("Uso: `/precio Nombre del producto 9999`")
-            return
-        try:
-            nuevo_precio = int(partes[-1])
-            nombre       = " ".join(partes[1:-1])
-        except ValueError:
-            enviar_telegram("El último parámetro tiene que ser un número. Ej: `/precio Cepillo 1500`")
-            return
-        enviar_telegram(f"🔍 Buscando *{nombre}*...")
-        product_id, variant_id = buscar_producto_api(nombre)
-        if product_id and variant_id:
-            if modificar_precio_api(product_id, variant_id, nuevo_precio):
-                enviar_telegram(f"💲 Precio de *{nombre}* actualizado a *${nuevo_precio:,}*.")
-            else:
-                enviar_telegram(f"❌ No pude actualizar el precio de *{nombre}*.")
-        else:
-            enviar_telegram(f"❌ No encontré *{nombre}* en tu tienda.")
-
-    elif cmd[0] == "/exportar_precios":
-        enviar_telegram("⏳ Generando Excel con precios proveedor +22%...")
-        excel_bytes, resumen = generar_excel_precios()
-        if excel_bytes:
-            fecha = datetime.now().strftime("%d-%m-%Y")
-            nombre_archivo = f"precios_actualizados_{fecha}.xlsx"
-            if enviar_archivo_telegram(excel_bytes, nombre_archivo, caption=resumen):
-                pass  # El caption ya lleva el resumen
-            else:
-                enviar_telegram("❌ El Excel se generó pero falló el envío. Revisá los logs.")
-        else:
-            enviar_telegram(resumen)  # resumen contiene el mensaje de error
-
-    elif cmd[0] == "/ciclo":
-        enviar_telegram("🔄 Iniciando ciclo de monitoreo manual...")
-        threading.Thread(target=procesar_logica, daemon=True).start()
-
-    else:
-        enviar_telegram(f"❓ No reconozco ese comando. Mandá `/ayuda` para ver los disponibles.")
-
-def bucle_escucha_telegram():
-    if not TELEGRAM_TOKEN:
-        return
-    offset = 0
-    url_updates = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
-    print("📡 Hilo Telegram activo...")
-    while True:
-        try:
-            resp = requests.get(f"{url_updates}?offset={offset}&timeout=10", timeout=15)
-            if resp.status_code == 200:
-                for update in resp.json().get("result", []):
-                    offset = update.get("update_id") + 1
-                    message = update.get("message", {})
-                    texto   = message.get("text", "")
-                    chat_remitente = str(message.get("chat", {}).get("id", ""))
-                    if chat_remitente != CHAT_ID or not texto:
-                        continue
-                    print(f"📨 Comando recibido: {texto[:60]}")
-                    try:
-                        procesar_comando(texto)
-                    except Exception as e:
-                        print(f"❌ Error procesando comando: {e}")
-        except Exception as e:
-            print(f"⚠️ Hilo Telegram: {e}")
-        time.sleep(1)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# BASE DE DATOS LOCAL
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def cargar_estado_anterior():
+# ══════════════════════════════════════════════════════════════════════════════
+# BASE DE DATOS LOCAL (JSON)
+# ══════════════════════════════════════════════════════════════════════════════
+def leer_db():
     if os.path.exists(DB_FILE):
         try:
             with open(DB_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                for k in ["pedidos_procesados", "productos_a", "productos_b"]:
-                    if k not in data: data[k] = [] if k == "pedidos_procesados" else {}
+                data.setdefault("productos_proveedor", {})
+                data.setdefault("sincronizados", {})
+                data.setdefault("pedidos_procesados", [])
                 return data
         except Exception:
             pass
-    return {"productos_a": {}, "productos_b": {}, "pedidos_procesados": []}
+    return {"productos_proveedor": {}, "sincronizados": {}, "pedidos_procesados": []}
 
-def guardar_estado_actual(estado):
+def escribir_db(data):
     try:
         with open(DB_FILE, "w", encoding="utf-8") as f:
-            json.dump(estado, f, ensure_ascii=False, indent=4)
+            json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"❌ Error guardando DB: {e}")
+        print(f"❌ DB write: {e}")
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# UTILIDADES DE PRECIOS Y NOMBRES
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def limpiar_precio_simple(texto):
-    if not texto: return 0
-    if "," in texto: texto = texto.split(",")[0]
-    numeros = ''.join(filter(str.isdigit, texto))
-    return int(numeros) if numeros else 0
-
-def procesar_html_precio(html_precio):
-    if not html_precio: return 0, 0, False
+# ══════════════════════════════════════════════════════════════════════════════
+# TELEGRAM
+# ══════════════════════════════════════════════════════════════════════════════
+def tg(msg):
+    if not msg or not TELEGRAM_TOKEN or not CHAT_ID: return
     try:
-        del_tag = html_precio.find('del')
-        ins_tag = html_precio.find('ins')
-        if del_tag and ins_tag:
-            precio_viejo = limpiar_precio_simple(del_tag.text)
-            precio_nuevo = limpiar_precio_simple(ins_tag.text)
-            if precio_nuevo > 0: return precio_nuevo, precio_viejo, True
-        return limpiar_precio_simple(html_precio.text), 0, False
-    except Exception:
-        return 0, 0, False
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"},
+            timeout=15
+        )
+    except Exception as e:
+        print(f"❌ Telegram: {e}")
 
-def son_coincidentes_inteligentes(nombre1, nombre2):
-    n1 = nombre1.lower()
-    n2 = nombre2.lower()
-    if " ".join(n1.split()) == " ".join(n2.split()): return True
-    palabras_raiz = ['bateria', 'battery', 'bat', 'face', 'id', 'maneral', 'mango', 'zocalo', 'board']
-    for pr in palabras_raiz:
-        if (pr in n1 and pr not in n2) or (pr in n2 and pr not in n1): return False
-    palabras_criticas = ['mini', 'pro', 'plus', 'max', 'kit', 'ultra', 'xl', 'lw-a1']
-    for pc in palabras_criticas:
-        if (pc in n1 and pc not in n2) or (pc in n2 and pc not in n1): return False
-    n1c = set(re.sub(r'[^a-z0-9 ]', ' ', n1).split()) - {'de','para','con','el','la','los','las','un','una','y','en','del','al'}
-    n2c = set(re.sub(r'[^a-z0-9 ]', ' ', n2).split()) - {'de','para','con','el','la','los','las','un','una','y','en','del','al'}
-    if not n1c or not n2c: return False
-    nums1 = {w for w in n1c if any(c.isdigit() for c in w)}
-    nums2 = {w for w in n2c if any(c.isdigit() for c in w)}
-    if (nums1 or nums2) and nums1 != nums2: return False
-    comunes = n1c.intersection(n2c)
-    return (len(comunes) / min(len(n1c), len(n2c))) >= 0.85
+def tg_archivo(data_bytes, nombre, caption=""):
+    if not TELEGRAM_TOKEN or not CHAT_ID: return False
+    try:
+        r = requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendDocument",
+            data={"chat_id": CHAT_ID, "caption": caption},
+            files={"document": (nombre, data_bytes,
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
+            timeout=30
+        )
+        return r.status_code == 200
+    except Exception as e:
+        print(f"❌ Telegram archivo: {e}"); return False
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# GMAIL — CHEQUEO DE PEDIDOS
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# API — TIENDA NEGOCIO
+# ══════════════════════════════════════════════════════════════════════════════
+def _headers():
+    return {
+        "Authorization": f"Bearer {_token}",
+        "User-Agent":    USER_AGENT,
+        "Content-Type":  "application/json"
+    }
 
-def extraer_productos_del_mail(cuerpo):
-    productos = []
-    en_bloque = False
-    for linea in cuerpo.split('\n'):
-        l = linea.strip()
-        if "productos:" in l.lower(): en_bloque = True; continue
-        if en_bloque:
-            if not l or "subtotal:" in l.lower() or "descuento" in l.lower():
-                en_bloque = False; continue
-            if l.startswith('-'):
-                m = re.match(r'-\s*(.+?)\s+x(\d+)\s*-', l)
-                if m: productos.append({"nombre": m.group(1).strip(), "cantidad": int(m.group(2))})
+def _get(url, params=None):
+    for _ in range(3):
+        try:
+            r = requests.get(url, headers=_headers(), params=params, timeout=20)
+            if r.status_code == 429: time.sleep(3); continue
+            return r
+        except Exception as e:
+            print(f"❌ GET {url}: {e}"); time.sleep(1)
+    return None
+
+def _put(url, data):
+    for _ in range(3):
+        try:
+            r = requests.put(url, headers=_headers(), json=data, timeout=15)
+            if r.status_code == 429: time.sleep(3); continue
+            return r
+        except Exception as e:
+            print(f"❌ PUT {url}: {e}"); time.sleep(1)
+    return None
+
+def _post_api(url, data):
+    for _ in range(3):
+        try:
+            r = requests.post(url, headers=_headers(), json=data, timeout=15)
+            if r.status_code == 429: time.sleep(3); continue
+            return r
+        except Exception as e:
+            print(f"❌ POST {url}: {e}"); time.sleep(1)
+    return None
+
+# ── Catálogo de mi tienda ─────────────────────────────────────────────────────
+# Guardamos como lista para no perder productos con nombres similares
+_catalogo_cache     = None
+_catalogo_cache_ts  = 0
+
+def obtener_catalogo(forzar=False):
+    """
+    Devuelve lista de dicts con todos los productos de la tienda.
+    Cada producto tiene:
+      id, nombre, nombre_norm, precio_base,
+      tiene_variantes, variantes:[{id, nombre_variante, precio}], published
+    """
+    global _catalogo_cache, _catalogo_cache_ts
+    if not forzar and _catalogo_cache and (time.time() - _catalogo_cache_ts) < 300:
+        return _catalogo_cache
+    if not _token:
+        return []
+
+    # Paso 1: todos los productos (sin variantes para poder traer 297)
+    print("📥 API Paso 1: productos...")
+    productos_raw = []
+    pagina = 1
+    while True:
+        r = _get(f"{API_BASE}/products", params={"per_page": 200, "page": pagina})
+        if not r or r.status_code != 200:
+            print(f"❌ API productos HTTP {r.status_code if r else 'None'}"); break
+        data = r.json()
+        lote = data.get("results", data) if isinstance(data, dict) else data
+        if not lote: break
+        productos_raw.extend(lote)
+        print(f"   Página {pagina}: {len(lote)} items (total: {len(productos_raw)})")
+        has_next = data.get("pagination", {}).get("next_page") if isinstance(data, dict) else None
+        if not has_next: break
+        pagina += 1
+        time.sleep(0.3)
+
+    print(f"   ✅ {len(productos_raw)} productos encontrados")
+
+    # Paso 2: variantes de cada producto
+    print("📥 API Paso 2: variantes...")
+    catalogo = []
+    for i, p in enumerate(productos_raw):
+        pid   = p.get("id")
+        nombre_raw = p.get("name", {})
+        if isinstance(nombre_raw, dict):
+            nombre = nombre_raw.get("es") or nombre_raw.get("en") or next(iter(nombre_raw.values()), "")
+        else:
+            nombre = str(nombre_raw or "")
+        nombre = nombre.strip()
+        if not nombre or not pid:
+            continue
+
+        nombre_norm = normalizar(nombre)
+
+        # Traer variantes
+        r_var = _get(f"{API_BASE}/products/{pid}/variants", params={"per_page": 200})
+        variantes = []
+        if r_var and r_var.status_code == 200:
+            data_var = r_var.json()
+            lista_var = data_var.get("results", data_var) if isinstance(data_var, dict) else data_var
+            if isinstance(lista_var, list):
+                for v in lista_var:
+                    vid = v.get("id")
+                    if not vid: continue
+                    # Nombre de la variante (campo values[].es o values[].en)
+                    values = v.get("values", [])
+                    nombre_var = " ".join(
+                        str(val.get("es") or val.get("en") or "").strip()
+                        for val in values
+                    ).strip()
+                    variantes.append({
+                        "id":     vid,
+                        "nombre": nombre_var,
+                        "precio": float(v.get("price", 0) or 0)
+                    })
+
+        precio_base = variantes[0]["precio"] if variantes else float(p.get("price", 0) or 0)
+
+        catalogo.append({
+            "id":              pid,
+            "nombre":          nombre,
+            "nombre_norm":     nombre_norm,
+            "precio_base":     precio_base,
+            "tiene_variantes": len(variantes) > 0,
+            "variantes":       variantes,
+            "published":       p.get("published", True)
+        })
+
+        if (i + 1) % 50 == 0:
+            print(f"   Variantes: [{i+1}/{len(productos_raw)}]")
+        time.sleep(0.4)
+
+    print(f"   ✅ Catálogo listo: {len(catalogo)} productos con datos")
+    _catalogo_cache    = catalogo
+    _catalogo_cache_ts = time.time()
+    return catalogo
+
+# ── Actualizar precio ─────────────────────────────────────────────────────────
+def set_precio_variante(variant_id, precio):
+    r = _put(f"{API_BASE}/variants/{variant_id}", {"price": str(int(precio))})
+    ok = r and r.status_code in (200, 201)
+    if not ok: print(f"  ⚠️ variant {variant_id} precio HTTP {r.status_code if r else 'None'}")
+    return ok
+
+def set_precio_producto(product_id, precio):
+    """Para productos SIN variantes: actualiza precio directo en el producto."""
+    r = _put(f"{API_BASE}/products/{product_id}", {"price": str(int(precio))})
+    ok = r and r.status_code in (200, 201)
+    if not ok: print(f"  ⚠️ product {product_id} precio HTTP {r.status_code if r else 'None'}")
+    return ok
+
+def set_stock_variante(variant_id, stock):
+    r = _put(f"{API_BASE}/variants/{variant_id}", {"stock": stock, "stock_management": True})
+    ok = r and r.status_code in (200, 201)
+    return ok
+
+def set_visibilidad(product_id, published):
+    r = _put(f"{API_BASE}/products/{product_id}", {"published": published})
+    return r and r.status_code in (200, 201)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# OAUTH
+# ══════════════════════════════════════════════════════════════════════════════
+def canjear_code(auth_code):
+    payload = {
+        "client_id":     CLIENT_ID,
+        "client_secret": CLIENT_SECRET,
+        "grant_type":    "authorization_code",
+        "code":          auth_code
+    }
+    try:
+        r = requests.post(f"{API_BASE}/oauth/app/token", json=payload,
+                          headers={"Content-Type": "application/json", "User-Agent": USER_AGENT},
+                          timeout=30)
+        print(f"OAuth HTTP {r.status_code}: {r.text[:200]}")
+        if r.status_code in (200, 201):
+            d       = r.json().get("data", r.json())
+            token   = d.get("access_token")
+            user_id = str(d.get("store_id") or d.get("user_id") or "")
+            if token and user_id:
+                guardar_token(token, user_id)
+                return token
+    except Exception as e:
+        print(f"❌ OAuth: {e}")
+    return None
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MATCHING DE NOMBRES
+# ══════════════════════════════════════════════════════════════════════════════
+STOP = {'de','para','con','el','la','los','las','un','una','y','en','del','al','a','o','e'}
+
+def normalizar(nombre):
+    return " ".join(re.sub(r'[^a-z0-9 ]', ' ', str(nombre).lower()).split())
+
+def palabras(nombre_norm):
+    return set(nombre_norm.split()) - STOP
+
+def match(n1, n2):
+    """
+    Devuelve True si n1 y n2 refieren al mismo producto.
+    n1 y n2 deben estar ya normalizados.
+    """
+    if n1 == n2: return True
+    w1 = palabras(n1); w2 = palabras(n2)
+    if not w1 or not w2: return False
+
+    # Palabras críticas: presencia distinta = productos distintos
+    criticas = {'bateria','battery','bat','face','maneral','mango','zocalo',
+                'board','mini','plus','max','kit','ultra','xl'}
+    for c in criticas:
+        if (c in w1) != (c in w2): return False
+
+    # Números: los del nombre más corto deben estar en el más largo
+    nums1 = {w for w in w1 if any(c.isdigit() for c in w)}
+    nums2 = {w for w in w2 if any(c.isdigit() for c in w)}
+    if nums1 and nums2:
+        corto = nums1 if len(w1) <= len(w2) else nums2
+        largo = nums2 if len(w1) <= len(w2) else nums1
+        if not corto.issubset(largo): return False
+
+    # Overlap ≥ 75% del nombre más corto
+    comunes = w1 & w2
+    return len(comunes) / min(len(w1), len(w2)) >= 0.75
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PRECIO OBJETIVO
+# ══════════════════════════════════════════════════════════════════════════════
+def precio_objetivo(costo):
+    """Calcula el precio de venta para obtener MARGEN% de ganancia neta."""
+    raw = costo / MARGEN
+    if raw >= 100000: return round(raw / 1000) * 1000
+    if raw >= 10000:  return round(raw / 500)  * 500
+    if raw >= 1000:   return round(raw / 100)  * 100
+    return round(raw / 50) * 50
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SINCRONIZACIÓN
+# ══════════════════════════════════════════════════════════════════════════════
+def sincronizar_producto(producto_api, prod_prov_base, prod_prov_variantes):
+    """
+    Actualiza precios de un producto de mi tienda contra el proveedor.
+
+    prod_prov_base:      precio del producto base en el proveedor (o None)
+    prod_prov_variantes: dict {nombre_variante_norm: precio} del proveedor
+
+    Devuelve (ok, precio_min, precio_max) o (False, 0, 0)
+    """
+    pid       = producto_api["id"]
+    variantes = producto_api["variantes"]
+
+    if not variantes:
+        # Producto sin variantes → precio directo
+        if prod_prov_base is None:
+            return False, 0, 0
+        p = precio_objetivo(prod_prov_base)
+        ok = set_precio_producto(pid, p)
+        time.sleep(0.4)
+        return ok, p, p
+
+    # Producto con variantes
+    precios_asignados = {}
+    for var in variantes:
+        costo = None
+        # 1. Intentar match por nombre de variante
+        var_norm = normalizar(var["nombre"])
+        for pv_norm, pv_precio in prod_prov_variantes.items():
+            if match(var_norm, pv_norm):
+                costo = pv_precio
+                break
+        # 2. Fallback: precio base del proveedor
+        if costo is None and prod_prov_base is not None:
+            costo = prod_prov_base
+        if costo is None:
+            continue
+        precios_asignados[var["id"]] = precio_objetivo(costo)
+
+    if not precios_asignados:
+        return False, 0, 0
+
+    exitos = 0
+    for vid, p in precios_asignados.items():
+        if set_precio_variante(vid, p):
+            exitos += 1
+        time.sleep(0.4)
+
+    if exitos == 0:
+        return False, 0, 0
+
+    precio_min = min(precios_asignados.values())
+    precio_max = max(precios_asignados.values())
+    return True, precio_min, precio_max
+
+def marcar_sin_stock(producto_api):
+    """
+    Marca el producto como sin stock SIN ocultarlo.
+    - Con variantes: stock=0 en cada variante (stock_management=True)
+    - Sin variantes: intenta stock=0 directo en el producto
+    NUNCA oculta el producto (published=False).
+    """
+    pid       = producto_api["id"]
+    variantes = producto_api["variantes"]
+    if variantes:
+        ok = True
+        for var in variantes:
+            if not set_stock_variante(var["id"], 0): ok = False
+            time.sleep(0.4)
+        return ok
+    else:
+        # Sin variantes: intentar poner stock=0 en el producto
+        r = _put(f"{API_BASE}/products/{pid}", {"stock": 0, "stock_management": True})
+        ok = r and r.status_code in (200, 201)
+        if not ok:
+            # Si no acepta stock directo, al menos dejarlo visible (no hacer nada)
+            print(f"⚠️ No pude marcar sin stock producto {pid} — se deja visible")
+            return True  # True para evitar spam, no es un error crítico
+        return ok
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SYNC TOTAL (comando manual)
+# ══════════════════════════════════════════════════════════════════════════════
+def run_sync_total():
+    """Sincroniza TODOS los productos de mi tienda contra el proveedor."""
+    db        = leer_db()
+    prov      = db.get("productos_proveedor", {})
+    sinc      = db.get("sincronizados", {})
+
+    if not prov:
+        tg("⚠️ Sin datos del proveedor. Esperá que complete un ciclo de monitoreo primero.")
+        return
+
+    catalogo = obtener_catalogo(forzar=True)
+    if not catalogo:
+        tg("❌ No pude obtener el catálogo de la API.")
+        return
+
+    # Construir índice del proveedor: base_norm → {variantes: {norm: precio}, precio_base}
+    idx_prov = _construir_indice(prov)
+
+    total          = len(catalogo)
+    act_precios    = []
+    act_sin_stock  = []
+    sin_match      = []
+    errores        = []
+
+    tg(f"🔄 *[{NOMBRE_TIENDA}] Sync total iniciada*\n{total} productos a procesar...")
+
+    for i, prod in enumerate(catalogo):
+        nombre_norm = prod["nombre_norm"]
+        nombre_real = prod["nombre"]
+        precio_web  = prod["precio_base"]
+
+        # Buscar en proveedor
+        base_norm, datos_prov = _buscar_en_indice(nombre_norm, idx_prov)
+
+        if datos_prov is None:
+            # No está en el proveedor → sin stock
+            ok = marcar_sin_stock(prod)
+            if ok:
+                sinc[nombre_real] = {"sin_stock": True}
+                act_sin_stock.append(f"• *{nombre_real}*")
+            else:
+                errores.append(nombre_real)
+            continue
+
+        # Está en el proveedor → calcular precio
+        p_obj       = precio_objetivo(datos_prov["precio_base"])
+        ultimo_sinc = sinc.get(nombre_real, {}).get("precio", 0)
+
+        ok, p_min, p_max = sincronizar_producto(
+            prod,
+            datos_prov["precio_base"],
+            datos_prov["variantes"]
+        )
+
+        if ok:
+            sinc[nombre_real] = {"precio": p_min, "ts": time.time()}
+            if p_min != ultimo_sinc:  # Solo reportar si realmente cambió
+                rango = f"${p_min:,}" if p_min == p_max else f"${p_min:,}–${p_max:,}"
+                act_precios.append(
+                    f"• *{nombre_real}*\n"
+                    f"  Antes: ${int(precio_web):,} → *Nuevo: {rango}*"
+                )
+        else:
+            errores.append(nombre_real)
+
+        if (i + 1) % 50 == 0:
+            print(f"   Sync [{i+1}/{total}]")
+
+    # Guardar y notificar
+    db["sincronizados"] = sinc
+    escribir_db(db)
+
+    resumen = (
+        f"✅ *[{NOMBRE_TIENDA}] Sync total terminada*\n\n"
+        f"📊 Total: *{total}*\n"
+        f"💲 Precios actualizados: *{len(act_precios)}*\n"
+        f"📦 Sin stock: *{len(act_sin_stock)}*\n"
+        f"❓ Sin match: *{len(sin_match)}*\n"
+    )
+    if errores: resumen += f"⚠️ Errores: *{len(errores)}*"
+    tg(resumen)
+
+    for i in range(0, len(act_precios), 20):
+        tg(f"💲 *Precios actualizados:*\n\n" + "\n\n".join(act_precios[i:i+20]))
+    for i in range(0, len(act_sin_stock), 30):
+        tg(f"📦 *Marcados sin stock:*\n\n" + "\n".join(act_sin_stock[i:i+30]))
+
+# ── Helpers del índice ────────────────────────────────────────────────────────
+def _construir_indice(prov):
+    """
+    Construye índice: {base_norm: {"precio_base": X, "variantes": {var_norm: precio}}}
+    El proveedor guarda entradas como:
+      - Simple:      "microscopio rf4 rf-6558x" → precio
+      - Con variante: "jc face id flex... (13 13mini...)" → precio
+    """
+    idx = {}
+    for clave, datos in prov.items():
+        base_raw = datos.get("nombre_base_proveedor", clave)
+        base_norm = normalizar(base_raw)
+        precio    = datos["precio"]
+
+        if base_norm not in idx:
+            idx[base_norm] = {"precio_base": precio, "variantes": {}}
+
+        # Si la clave tiene paréntesis, extraer la variante
+        if '(' in clave:
+            var_part = clave.split('(', 1)[-1].rstrip(')')
+            var_norm = normalizar(var_part)
+            idx[base_norm]["variantes"][var_norm] = precio
+        else:
+            # Actualizar precio_base con el más bajo disponible
+            if precio < idx[base_norm]["precio_base"]:
+                idx[base_norm]["precio_base"] = precio
+
+    return idx
+
+def _buscar_en_indice(nombre_norm, idx):
+    """Busca nombre_norm en el índice del proveedor. Devuelve (base_norm, datos) o (None, None)."""
+    for base_norm, datos in idx.items():
+        if match(nombre_norm, base_norm):
+            return base_norm, datos
+    return None, None
+
+# ══════════════════════════════════════════════════════════════════════════════
+# EXCEL
+# ══════════════════════════════════════════════════════════════════════════════
+def generar_excel():
+    try:
+        import openpyxl
+        from openpyxl.styles import Font, PatternFill, Alignment
+    except ImportError:
+        return None, "❌ Falta openpyxl en requirements.txt"
+
+    db  = leer_db()
+    prov = db.get("productos_proveedor", {})
+    if not prov: return None, "❌ Sin datos del proveedor."
+
+    catalogo = obtener_catalogo()
+    if not catalogo: return None, "❌ Sin datos de la API."
+
+    idx_prov = _construir_indice(prov)
+    cols = [
+        "Hash","Nombre del producto","Precio","Oferta","Stock",
+        "Visibilidad (Visible o Oculto)","Descripción","SKU",
+        "Peso en KG","Alto en CM","Ancho en CM","Profundidad en CM",
+        "Nombre de variante #1","Opción de variante #1",
+        "Nombre de variante #2","Opción de variante #2",
+        "Nombre de variante #3","Opción de variante #3",
+        "Categorías > Subcategorías > … > Subcategorías"
+    ]
+    filas = []; act = ign = sin = 0
+
+    for prod in catalogo:
+        _, datos_prov = _buscar_en_indice(prod["nombre_norm"], idx_prov)
+        if datos_prov is None:
+            sin += 1; continue
+        p = precio_objetivo(datos_prov["precio_base"])
+        if p == int(prod["precio_base"]):
+            ign += 1; continue
+        fila = {c: "" for c in cols}
+        fila["Hash"]               = prod["nombre_norm"]
+        fila["Nombre del producto"] = prod["nombre"]
+        fila["Precio"]             = p
+        filas.append(fila); act += 1
+
+    if not filas:
+        return None, f"ℹ️ Sin cambios.\n• {ign} ya correctos\n• {sin} sin match"
+
+    wb = openpyxl.Workbook(); ws = wb.active; ws.title = "Productos"
+    ws.append(cols)
+    hf   = PatternFill("solid", fgColor="1F6B3B")
+    hfnt = Font(bold=True, color="FFFFFF", name="Arial", size=10)
+    for c in ws[1]:
+        c.fill = hf; c.font = hfnt
+        c.alignment = Alignment(horizontal="center", vertical="center")
+    ws.row_dimensions[1].height = 25
+    fills  = [PatternFill("solid",fgColor="F0F7F2"), PatternFill("solid",fgColor="FFFFFF")]
+    fn     = Font(name="Arial", size=9)
+    fv     = Font(name="Arial", size=9, bold=True, color="1F6B3B")
+    for i, fila in enumerate(filas, 2):
+        ws.append([fila[c] for c in cols])
+        for cell in ws[i]: cell.fill = fills[i%2]; cell.font = fn
+        ws.cell(row=i,column=3).font = fv
+        ws.cell(row=i,column=3).number_format = '#,##0'
+    for col,w in zip("ABCDEFGHIJKLMNOPQRS",[38,48,12,8,8,12,8,8,8,8,8,8,20,22,20,22,20,22,30]):
+        ws.column_dimensions[col].width = w
+
+    buf = io.BytesIO(); wb.save(buf); buf.seek(0)
+    return buf.getvalue(), (
+        f"✅ Excel listo:\n• *{act}* a actualizar\n"
+        f"• *{ign}* ya correctos\n• *{sin}* sin match\n\n"
+        f"Importalo: *Productos → Importar y exportar → Importar*"
+    )
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SCRAPING DEL PROVEEDOR
+# ══════════════════════════════════════════════════════════════════════════════
+def _precio_html(el):
+    if not el: return 0, 0, False
+    try:
+        d = el.find('del'); i = el.find('ins')
+        if d and i:
+            pv = int(''.join(filter(str.isdigit, d.text.split(',')[0])) or 0)
+            pn = int(''.join(filter(str.isdigit, i.text.split(',')[0])) or 0)
+            if pn > 0: return pn, pv, True
+        raw = int(''.join(filter(str.isdigit, el.text.split(',')[0])) or 0)
+        return raw, 0, False
+    except Exception: return 0, 0, False
+
+def _variantes_woo(url):
+    variaciones = {}
+    target = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={url}"
+    try:
+        r = requests.get(target, timeout=30, verify=False)
+        if r.status_code != 200: return variaciones
+        form = BeautifulSoup(r.text, 'lxml').find('form', class_='variations_form')
+        if form and form.get('data-product_variations'):
+            for var in json.loads(form['data-product_variations']):
+                atrs = [str(v).replace('-',' ').replace('_',' ').strip()
+                        for k,v in var.get('attributes',{}).items() if v]
+                if not atrs: continue
+                nombre = " - ".join(atrs).title()
+                precio = var.get('display_price', 0)
+                stock  = var.get('is_in_stock', True)
+                if "agotado" in var.get('variation_html','').lower(): stock = False
+                if precio > 0 and stock:
+                    variaciones[nombre] = {"precio": int(precio)}
+    except Exception as e: print(f"⚠️ Variantes woo: {e}")
+    return variaciones
+
+def scrapear_proveedor():
+    if not SCRAPERAPI_KEY: return {}
+    target = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={URL_PROVEEDOR}"
+    productos = {}
+    try:
+        print("📥 Scrapeando proveedor...")
+        r = requests.get(target, timeout=60, verify=False)
+        if r.status_code != 200: return {}
+        soup  = BeautifulSoup(r.text, 'lxml')
+        items = soup.select('.product') or soup.find_all(['li','div'],
+                    class_=lambda x: x and 'product' in x)
+        for item in items:
+            title = (item.find(['h2','h3','h4','a','p'],
+                        class_=lambda x: x and ('title' in x or 'woocommerce-loop' in x or 'name' in x))
+                     or item.find(['h2','h3','h4']))
+            price = item.find(class_=lambda x: x and ('price' in x or 'precio' in x))
+            link  = item.find('a', href=True)
+            if not title or not title.text.strip(): continue
+            nombre_orig = title.text.strip()
+            if len(nombre_orig) < 4 or nombre_orig.lower() == "productos": continue
+            nombre_base = normalizar(nombre_orig)
+            interesa    = any(p in nombre_base for p in PALABRAS_INTERES)
+            es_variable = (item.find('a', class_='product_type_variable')
+                           or (price and "–" in price.text))
+            if interesa and es_variable and link:
+                vars_woo = _variantes_woo(link['href'])
+                for nombre_var, datos_var in vars_woo.items():
+                    clave = f"{nombre_orig} ({nombre_var})"
+                    productos[clave.lower()] = {
+                        "nombre_real":            clave,
+                        "nombre_base_proveedor":  nombre_base,
+                        "precio":                 datos_var["precio"],
+                        "precio_anterior":        0,
+                        "en_oferta":              False,
+                        "stock":                  True
+                    }
+                time.sleep(1)
+            elif price:
+                p, pa, oferta = _precio_html(price)
+                if p > 0:
+                    productos[nombre_base] = {
+                        "nombre_real":           nombre_orig,
+                        "nombre_base_proveedor": nombre_base,
+                        "precio":                p,
+                        "precio_anterior":       pa,
+                        "en_oferta":             oferta,
+                        "stock":                 True
+                    }
+    except Exception as e: print(f"❌ Scraping: {e}")
+    print(f"   🏪 {len(productos)} productos del proveedor")
     return productos
 
-def chequear_nuevos_pedidos_gmail():
+# ══════════════════════════════════════════════════════════════════════════════
+# GMAIL
+# ══════════════════════════════════════════════════════════════════════════════
+def chequear_gmail():
+    if not GMAIL_USER or not GMAIL_PASS: return []
     pedidos = []
-    if not GMAIL_USER or not GMAIL_PASS: return pedidos
     try:
-        mail = imaplib.IMAP4_SSL("imap.gmail.com")
-        mail.login(GMAIL_USER, GMAIL_PASS)
-        mail.select("inbox")
-        hace_24h = (datetime.now() - timedelta(days=1)).strftime("%d-%b-%Y")
-        status, msgs = mail.search(None, f'(FROM "tiendanegocio.com" SINCE {hace_24h})')
-        if status != "OK" or not msgs[0]:
-            mail.close(); mail.logout(); return pedidos
-        for msg_id in msgs[0].split():
-            str_id = msg_id.decode()
-            res, data = mail.fetch(msg_id, "(RFC822)")
+        m = imaplib.IMAP4_SSL("imap.gmail.com")
+        m.login(GMAIL_USER, GMAIL_PASS); m.select("inbox")
+        hace_24h = (datetime.now()-timedelta(days=1)).strftime("%d-%b-%Y")
+        st, msgs = m.search(None, f'(FROM "tiendanegocio.com" SINCE {hace_24h})')
+        if st != "OK" or not msgs[0]:
+            m.close(); m.logout(); return []
+        for mid in msgs[0].split():
+            res, data = m.fetch(mid, "(RFC822)")
             if res != "OK": continue
             msg = email.message_from_bytes(data[0][1])
-            subject, enc = decode_header(msg["Subject"])[0]
-            if isinstance(subject, bytes): subject = subject.decode(enc or "utf-8")
-            if not any(p in subject.lower() for p in ["compra", "realizó", "pedido", "venta"]): continue
-            match = re.search(r'#(\d+)', subject)
-            num_orden = match.group(1) if match else str_id
+            subj, enc = decode_header(msg["Subject"])[0]
+            if isinstance(subj, bytes): subj = subj.decode(enc or "utf-8")
+            if not any(p in subj.lower() for p in ["compra","realizó","pedido","venta"]): continue
+            num = (re.search(r'#(\d+)', subj) or [None, mid.decode()])[1]
             cuerpo = ""
             if msg.is_multipart():
                 for part in msg.walk():
                     if part.get_content_type() == "text/plain":
-                        cuerpo = part.get_payload(decode=True).decode("utf-8", errors="ignore"); break
+                        cuerpo = part.get_payload(decode=True).decode("utf-8","ignore"); break
             else:
-                cuerpo = msg.get_payload(decode=True).decode("utf-8", errors="ignore")
-            items = extraer_productos_del_mail(cuerpo)
-            if items: pedidos.append({"id_mail": str_id, "num_orden": num_orden, "productos": items})
-        mail.close(); mail.logout()
-    except Exception as e:
-        print(f"❌ Gmail: {e}")
+                cuerpo = msg.get_payload(decode=True).decode("utf-8","ignore")
+            items = _parsear_items_pedido(cuerpo)
+            if items: pedidos.append({"id": mid.decode(), "num": num, "items": items})
+        m.close(); m.logout()
+    except Exception as e: print(f"❌ Gmail: {e}")
     return pedidos
 
-def verificar_pedido_contra_proveedor(pedido, prod_proveedor):
-    reporte = f"🛒 *¡Nuevo Pedido! (Orden #{pedido['num_orden']})*\n\n"
-    todo_ok = True
-    for item in pedido["productos"]:
-        nombre = item["nombre"].lower()
-        datos_prov = next((d for c, d in prod_proveedor.items() if son_coincidentes_inteligentes(nombre, c)), None)
-        if datos_prov:
-            reporte += f"✅ *{item['nombre']}* (x{item['cantidad']})\n  Proveedor: CON STOCK a ${datos_prov['precio']:,}\n\n"
-        else:
-            todo_ok = False
-            reporte += f"❌ *{item['nombre']}* (x{item['cantidad']})\n  Proveedor: 🔥 SIN STOCK / NO DETECTADO\n\n"
-    reporte += "🚀 ¡Podés armar el pedido!" if todo_ok else "⚠️ Hay faltantes en el proveedor."
-    return reporte
+def _parsear_items_pedido(cuerpo):
+    items = []; en = False
+    for linea in cuerpo.split('\n'):
+        l = linea.strip()
+        if "productos:" in l.lower(): en = True; continue
+        if en:
+            if not l or "subtotal:" in l.lower(): en = False; continue
+            if l.startswith('-'):
+                m = re.match(r'-\s*(.+?)\s+x(\d+)\s*-', l)
+                if m: items.append({"nombre": m.group(1), "cant": int(m.group(2))})
+    return items
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# SCRAPING
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# CICLO DE MONITOREO (cada 15 min)
+# ══════════════════════════════════════════════════════════════════════════════
+def ciclo_monitoreo():
+    print(f"\n─── 🔄 Ciclo {datetime.now().strftime('%H:%M')} ───")
+    db            = leer_db()
+    prov_anterior = db.get("productos_proveedor", {})
+    sinc          = db.get("sincronizados", {})
+    pedidos_proc  = db.get("pedidos_procesados", [])
 
-def extraer_variaciones_woocommerce(url_producto):
-    variaciones = {}
-    target = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={url_producto}"
-    try:
-        resp = requests.get(target, timeout=30, verify=False)
-        if resp.status_code != 200: return variaciones
-        soup = BeautifulSoup(resp.text, 'lxml')
-        form = soup.find('form', class_='variations_form')
-        if form and form.get('data-product_variations'):
-            for var in json.loads(form['data-product_variations']):
-                atrs = [str(v).replace('-', ' ').replace('_', ' ').strip()
-                        for k, v in var.get('attributes', {}).items() if v]
-                if not atrs: continue
-                texto = " - ".join(atrs).title()
-                precio = var.get('display_price', 0)
-                in_stock = var.get('is_in_stock', True)
-                if "agotado" in var.get('variation_html', '').lower(): in_stock = False
-                if precio > 0 and in_stock:
-                    variaciones[texto] = {"precio": int(precio), "stock": True}
-    except Exception as e:
-        print(f"⚠️ Variantes {url_producto}: {e}")
-    return variaciones
+    # Chequear pedidos Gmail
+    for ped in chequear_gmail():
+        if ped["id"] not in pedidos_proc:
+            msg = f"🛒 *[{NOMBRE_TIENDA}] ¡Nuevo Pedido #{ped['num']}!*\n\n"
+            for item in ped["items"]:
+                en_prov = any(match(normalizar(item["nombre"]), normalizar(da["nombre_real"]))
+                              for da in prov_anterior.values())
+                msg += f"{'✅' if en_prov else '❌'} *{item['nombre']}* x{item['cant']}\n"
+            tg(msg)
+            pedidos_proc.append(ped["id"])
 
-def scrapear_web_a():
-    productos = {}
-    if not SCRAPERAPI_KEY: return productos
-    target = f"http://api.scraperapi.com?api_key={SCRAPERAPI_KEY}&url={URL_A}"
-    try:
-        print("📥 Scrapeando proveedor...")
-        resp = requests.get(target, timeout=60, verify=False)
-        if resp.status_code != 200: return productos
-        soup = BeautifulSoup(resp.text, 'lxml')
-        items = soup.select('.product') or soup.find_all(['li', 'div'],
-                    class_=lambda x: x and 'product' in x)
-        for item in items:
-            title_el = (item.find(['h2','h3','h4','a','p'],
-                         class_=lambda x: x and ('title' in x or 'woocommerce-loop' in x or 'name' in x))
-                        or item.find(['h2','h3','h4']))
-            price_el = item.find(class_=lambda x: x and ('price' in x or 'precio' in x))
-            link_el  = item.find('a', href=True)
-            if not title_el or not title_el.text.strip(): continue
-            nombre_original = title_el.text.strip()
-            if len(nombre_original) < 4 or nombre_original.lower() == "productos": continue
-            nombre_clave = " ".join(nombre_original.lower().split())
-            interesa   = any(p in nombre_clave for p in PALABRAS_INTERES)
-            es_variable = (item.find('a', class_='product_type_variable')
-                        or (price_el and "–" in price_el.text))
-            if interesa and es_variable and link_el:
-                for nombre_var, datos_var in extraer_variaciones_woocommerce(link_el['href']).items():
-                    nc = f"{nombre_original} ({nombre_var})"
-                    productos[nc.lower()] = {
-                        "nombre_real": nc, "nombre_base_proveedor": nombre_clave,
-                        "precio": datos_var["precio"], "precio_anterior": 0,
-                        "en_oferta": False, "stock": datos_var["stock"]
-                    }
-                time.sleep(1.0)
-            elif price_el:
-                precio, precio_anterior, en_oferta = procesar_html_precio(price_el)
-                if precio > 0:
-                    productos[nombre_clave] = {
-                        "nombre_real": nombre_original, "nombre_base_proveedor": nombre_clave,
-                        "precio": precio, "precio_anterior": precio_anterior,
-                        "en_oferta": en_oferta, "stock": True
-                    }
-    except Exception as e:
-        print(f"❌ Scraping proveedor: {e}")
-    return productos
-
-def scrapear_web_b():
-    productos = {}
-    pagina    = 1
-    headers   = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
-    while True:
-        url = URL_B if pagina == 1 else f"{URL_B}?page={pagina}"
-        html = None
-        en_pagina = 0
-        for _ in range(3):
-            try:
-                resp = requests.get(url, headers=headers, timeout=20)
-                if resp.status_code == 200: html = resp.text; break
-                if resp.status_code == 404: break
-            except Exception: pass
-            time.sleep(2)
-        if not html: break
-        soup  = BeautifulSoup(html, 'lxml')
-        items = soup.find_all(['div', 'li', 'article', 'form'])
-        for item in items:
-            title_el = item.find(['h2','h3','h1','a'],
-                         class_=lambda x: x and ('title' in x or 'name' in x or 'producto' in x))
-            price_el = item.find(class_=lambda x: x and ('price' in x or 'precio' in x or 'money' in x))
-            if not title_el or not price_el or not title_el.text.strip(): continue
-            nombre_original = title_el.text.strip()
-            if len(nombre_original) < 4 or nombre_original.lower() == "productos": continue
-            nombre_clave = " ".join(nombre_original.lower().split())
-            if nombre_clave not in productos:
-                precio, _, _ = procesar_html_precio(price_el)
-                texto = item.text.lower()
-                tiene_stock = "sin stock" not in texto and "agotado" not in texto
-                if precio > 0:
-                    productos[nombre_clave] = {"nombre_real": nombre_original,
-                        "precio": precio, "stock": tiene_stock}
-                    en_pagina += 1
-        if en_pagina == 0: break
-        pagina += 1
-        time.sleep(0.5)
-    return productos
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# LÓGICA PRINCIPAL DE MONITOREO
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def procesar_logica():
-    print("\n─── 🔄 Nuevo ciclo de monitoreo ───")
-    estado_anterior   = cargar_estado_anterior()
-    pedidos_proc      = estado_anterior.get("pedidos_procesados", [])
-    historial_a_viejo = estado_anterior.get("productos_a", {})
-
-    for ped in chequear_nuevos_pedidos_gmail():
-        if ped["id_mail"] not in pedidos_proc:
-            enviar_telegram(verificar_pedido_contra_proveedor(ped, historial_a_viejo))
-            pedidos_proc.append(ped["id_mail"])
-
-    prod_a = scrapear_web_a()
-    prod_b = scrapear_web_b()
-
-    if not prod_a:
-        print("⚠️ Proveedor devolvió 0 productos. Ciclo abortado.")
+    # Scrapear proveedor
+    prov_nuevo = scrapear_proveedor()
+    if not prov_nuevo:
+        print("⚠️ Proveedor 0 productos. Abortando ciclo.")
         return
 
-    historial_consolidado = {**historial_a_viejo, **prod_a}
+    prov_consolidado = {**prov_anterior, **prov_nuevo}
 
+    # Obtener catálogo de mi tienda (usa caché de 5 min)
+    catalogo = obtener_catalogo() if _token else []
+
+    idx_prov = _construir_indice(prov_nuevo)
+
+    # ── Detectar novedades del proveedor ──────────────────────────────────────
     bloque_ofertas = bloque_nuevos = bloque_recuperados = ""
-    bloque_precios_bajos = bloque_faltantes = ""
+    lineas_precios    = []
+    lineas_sin_stock  = []
 
-    for clave, datos in prod_a.items():
+    for clave, datos in prov_nuevo.items():
         if not any(p in clave for p in PALABRAS_INTERES): continue
-        estaba = clave in historial_a_viejo
-        viejo  = historial_a_viejo.get(clave, {})
+        viejo = prov_anterior.get(clave, {})
 
+        # Oferta nueva
         if datos["en_oferta"] and not viejo.get("en_oferta", False):
-            bloque_ofertas += f"• *{datos['nombre_real']}*\n  Reg: ${datos['precio_anterior']:,} → *🔥 ${datos['precio']:,}*\n\n"
+            bloque_ofertas += (f"• *{datos['nombre_real']}*\n"
+                               f"  Reg: ${datos['precio_anterior']:,} → 🔥 ${datos['precio']:,}\n\n")
 
-        base_prov    = datos.get("nombre_base_proveedor", clave)
-        lo_tengo_web = any(
-            son_coincidentes_inteligentes(clave, cb) or son_coincidentes_inteligentes(base_prov, cb)
-            for cb in prod_b
-        )
+        # Producto nuevo que no tengo en mi tienda
+        base_norm = datos.get("nombre_base_proveedor", clave)
+        tengo = any(match(p["nombre_norm"], base_norm) for p in catalogo) if catalogo else False
+        if not tengo and not viejo:
+            p_sugerido = precio_objetivo(datos["precio"])
+            bloque_nuevos += (f"• *{datos['nombre_real']}*\n"
+                              f"  Costo: ${datos['precio']:,} → Sugerido: ${p_sugerido:,}\n\n")
 
-        if not lo_tengo_web and (not estaba or viejo.get("precio", 0) == 0):
-            precio_ideal = redondear_precio(datos['precio'] * 1.22)
-            bloque_nuevos += f"• *{datos['nombre_real']}*\n  Costo proveedor: ${datos['precio']:,} → *Sugerido Web (+22%): ${precio_ideal:,}*\n\n"
+        # Stock recuperado
+        if viejo and not viejo.get("stock", True) and datos.get("stock", True):
+            nombre_real = datos["nombre_real"]
+            if sinc.get(nombre_real, {}).get("sin_stock"):
+                sinc.pop(nombre_real, None)
+                bloque_recuperados += f"• *{nombre_real}*\n  Proveedor recuperó stock\n\n"
 
-        elif lo_tengo_web and estaba and not viejo.get("stock", False) and datos["stock"]:
-            bloque_recuperados += f"• *{datos['nombre_real']}*\n  Vuelve a tener stock a ${datos['precio']:,}\n\n"
-            sincronizar_producto(datos['nombre_real'], datos, "publicar")
+    # ── Actualizar precios y stock en mi tienda ───────────────────────────────
+    for prod in catalogo:
+        nombre_real = prod["nombre"]
+        nombre_norm = prod["nombre_norm"]
+        precio_web  = prod["precio_base"]
+        sync_actual = sinc.get(nombre_real, {})
 
-    for clave_b, datos_b in prod_b.items():
-        datos_a = None
-        for clave_a, da in prod_a.items():
-            if son_coincidentes_inteligentes(clave_b, clave_a):
-                datos_a = da; break
-        if datos_a is None:
-            variantes = [d for c, d in prod_a.items()
-                         if son_coincidentes_inteligentes(clave_b, d.get("nombre_base_proveedor", ""))]
-            if variantes:
-                datos_a = min(variantes, key=lambda x: x["precio"])
+        _, datos_prov = _buscar_en_indice(nombre_norm, idx_prov)
 
-        if not datos_b["stock"]:
-            continue
-
-        if datos_a is None:
-            bloque_faltantes += f"• *{datos_b['nombre_real']}*\n  ❌ Proveedor SIN STOCK\n\n"
-            sincronizar_producto(datos_b['nombre_real'], {}, "ocultar")
+        if datos_prov is None:
+            # Proveedor no tiene → marcar sin stock UNA SOLA VEZ
+            # Se resetea solo cuando el proveedor vuelva a tener stock
+            if not sync_actual.get("sin_stock", False):
+                if _token and marcar_sin_stock(prod):
+                    sinc[nombre_real] = {"sin_stock": True}
+                    etiqueta = f"({len(prod['variantes'])} var.)" if prod["tiene_variantes"] else "(sin var.)"
+                    lineas_sin_stock.append(f"• *{nombre_real}* {etiqueta}")
         else:
-            precio_objetivo = redondear_precio(datos_a["precio"] * 1.22)
-            if datos_b["precio"] != precio_objetivo:
-                diff = precio_objetivo - datos_b["precio"]
-                if datos_b["precio"] < precio_objetivo:
-                    bloque_precios_bajos += (
-                        f"• *{datos_b['nombre_real']}*\n"
-                        f"  Tu web: ${datos_b['precio']:,}  →  Proveedor: ${datos_a['precio']:,}\n"
-                        f"  ⚠️ Precio sugerido (+22%): *${precio_objetivo:,}* _(brecha: ${diff:,})_\n\n"
+            # Limpiar flag sin_stock si volvió
+            if sync_actual.get("sin_stock"):
+                sinc.pop(nombre_real, None)
+                sync_actual = {}
+
+            # Actualizar precio solo si cambió desde último sync
+            # Calcular precio objetivo SIN llamar a la API todavía
+            p_obj = precio_objetivo(datos_prov["precio_base"])
+            ultimo_sinc = sync_actual.get("precio", 0)
+
+            # Solo sincronizar si el precio objetivo cambió desde el último sync
+            if p_obj != ultimo_sinc:
+                ok, p_min, p_max = sincronizar_producto(prod, datos_prov["precio_base"], datos_prov["variantes"])
+                if ok:
+                    sinc[nombre_real] = {"precio": p_min, "ts": time.time()}
+                    rango   = f"${p_min:,}" if p_min == p_max else f"${p_min:,}–${p_max:,}"
+                    etiqueta = f"({len(prod['variantes'])} var.)" if prod["tiene_variantes"] else "(sin var.)"
+                    lineas_precios.append(
+                        f"• *{nombre_real}* {etiqueta}\n"
+                        f"  Antes: ${int(precio_web):,} → *Nuevo: {rango}*"
                     )
-                sincronizar_producto(datos_b['nombre_real'], datos_a, "precio", precio_objetivo)
 
+    # ── Enviar notificaciones ─────────────────────────────────────────────────
     if bloque_ofertas:
-        enviar_telegram(f"🏷️ *¡Nuevos Descuentos en el Proveedor!*\n\n{bloque_ofertas}")
+        tg(f"🏷️ *[{NOMBRE_TIENDA}] ¡Descuentos en el Proveedor!*\n\n{bloque_ofertas}")
     if bloque_nuevos:
-        enviar_telegram(f"🔥 *¡Nuevos Productos en el Proveedor!*\n\n{bloque_nuevos}")
+        tg(f"🔥 *[{NOMBRE_TIENDA}] ¡Nuevo producto en el Proveedor!*\n\n{bloque_nuevos}")
     if bloque_recuperados:
-        enviar_telegram(f"🔄 *¡Stock Recuperado!*\n\n{bloque_recuperados}")
-    if bloque_precios_bajos:
-        enviar_telegram(f"📉 *¡Actualización de Precios (+22% sobre Proveedor)!*\n\n{bloque_precios_bajos}")
-    if bloque_faltantes:
-        enviar_telegram(f"⚠️ *¡Alerta de Stock Crítica!*\n\n{bloque_faltantes}")
+        tg(f"🔄 *[{NOMBRE_TIENDA}] ¡Stock recuperado!*\n\n{bloque_recuperados}")
+    for i in range(0, len(lineas_precios), 20):
+        tg(f"💲 *[{NOMBRE_TIENDA}] Precios actualizados:*\n\n" + "\n\n".join(lineas_precios[i:i+20]))
+    for i in range(0, len(lineas_sin_stock), 30):
+        tg(f"📦 *[{NOMBRE_TIENDA}] Marcados sin stock:*\n\n" + "\n".join(lineas_sin_stock[i:i+30]))
 
-    if not any([bloque_ofertas, bloque_nuevos, bloque_recuperados, bloque_precios_bajos, bloque_faltantes]):
-        print("✅ Todo en orden, sin cambios detectados.")
+    if not any([bloque_ofertas, bloque_nuevos, bloque_recuperados, lineas_precios, lineas_sin_stock]):
+        print("✅ Sin cambios detectados.")
 
-    guardar_estado_actual({
-        "productos_a":        historial_consolidado,
-        "productos_b":        prod_b,
-        "pedidos_procesados": pedidos_proc,
-        "api_token":          _api_token,
-        "api_user_id":        _api_user_id
-    })
+    db["productos_proveedor"] = prov_consolidado
+    db["sincronizados"]       = sinc
+    db["pedidos_procesados"]  = pedidos_proc
+    db["api_token"]           = _token
+    db["api_user_id"]         = _store_id
+    escribir_db(db)
     print("─── ✅ Ciclo completado ───")
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# ARRANQUE
-# ═══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# COMANDOS TELEGRAM
+# ══════════════════════════════════════════════════════════════════════════════
+AYUDA = f"""
+🤖 *Comandos disponibles:*
 
-if __name__ == "__main__":
-    print("🚀 Bot de Dropshipping iniciado...")
-    _cargar_token_desde_db()
+🔑 *Token / API*
+`?code=XXXX` — Canjear código OAuth
+`/estado_api` — Ver token activo
+`/borrar_token` — Eliminar token
 
-    if _api_token:
-        enviar_telegram(f"🟢 *Bot iniciado* — Token API activo (user_id: `{_api_user_id}`)\nMandá `/ayuda` para ver los comandos.")
+📦 *Productos (requiere token)*
+`/listar` — Ver productos de tu tienda
+`/ocultar NOMBRE` — Ocultar producto
+`/publicar NOMBRE` — Publicar producto
+`/stock NOMBRE CANTIDAD` — Cambiar stock
+`/precio NOMBRE VALOR` — Cambiar precio
+
+🔄 *Sincronización*
+`/sync_total` — Actualizar TODOS los precios y stock
+`/ciclo` — Forzar ciclo de monitoreo
+`/exportar_precios` — Excel precios lista para importar
+
+🔍 *Debug*
+`/debug_match NOMBRE` — Ver qué encuentra el bot para un producto
+`/debug_env` — Ver estado de variables de entorno
+
+❓ `/ayuda` — Este mensaje
+""".strip()
+
+def procesar_cmd(texto):
+    global _token, _store_id
+    texto = texto.strip()
+
+    # ── OAuth ──────────────────────────────────────────────────────────────
+    if "?code=" in texto:
+        code = texto.split("?code=")[1].split("&")[0].strip()
+        tg("🔄 Canjeando código OAuth...")
+        token = canjear_code(code)
+        if token:
+            tg(f"✅ *¡Token obtenido!*\n\n"
+               f"Guardá en Railway → Variables:\n"
+               f"• `API_TOKEN` = `{token}`\n"
+               f"• `API_USER_ID` = `{_store_id}`")
+        else:
+            tg("❌ Token fallido. El código dura 1 minuto.")
+        return
+
+    cmd = texto.lower().split()
+    if not cmd: return
+
+    # ── /ayuda ──────────────────────────────────────────────────────────────
+    if cmd[0] == "/ayuda":
+        tg(AYUDA)
+
+    # ── /estado_api ─────────────────────────────────────────────────────────
+    elif cmd[0] == "/estado_api":
+        if _token:
+            tg(f"✅ *Token activo*\nStore ID: `{_store_id}`\nToken: `{_token[:12]}...`")
+        else:
+            tg("❌ Sin token. Mandá el `?code=` para obtenerlo.")
+
+    # ── /borrar_token ────────────────────────────────────────────────────────
+    elif cmd[0] == "/borrar_token":
+        _token = _store_id = None
+        db = leer_db()
+        db.pop("api_token", None); db.pop("api_user_id", None)
+        escribir_db(db)
+        tg("🗑️ Token eliminado.")
+
+    # ── /listar ──────────────────────────────────────────────────────────────
+    elif cmd[0] == "/listar":
+        if not _token: tg("❌ Necesito el token primero."); return
+        tg("⏳ Cargando catálogo...")
+        catalogo = obtener_catalogo(forzar=True)
+        if not catalogo: tg("No encontré productos."); return
+        lineas = []
+        for p in catalogo[:50]:
+            cv = len(p["variantes"])
+            extra = f"({cv} var.)" if cv > 0 else "(sin var.)"
+            icon = "✅" if p["published"] else "🚫"
+            lineas.append(f"{icon} *{p['nombre']}* {extra} — ${int(p['precio_base']):,}")
+        msg = f"📦 *{len(catalogo)} productos:*\n\n" + "\n".join(lineas)
+        if len(catalogo) > 50: msg += f"\n\n_...y {len(catalogo)-50} más_"
+        tg(msg)
+
+    # ── /sync_total ──────────────────────────────────────────────────────────
+    elif cmd[0] == "/sync_total":
+        if not _token: tg("❌ Necesito el token primero."); return
+        threading.Thread(target=run_sync_total, daemon=True).start()
+
+    # ── /ocultar ─────────────────────────────────────────────────────────────
+    elif cmd[0] == "/ocultar":
+        if not _token: tg("❌ Necesito el token primero."); return
+        nombre = " ".join(texto.split()[1:])
+        if not nombre: tg("Uso: `/ocultar Nombre`"); return
+        catalogo = obtener_catalogo()
+        prod = next((p for p in catalogo if match(normalizar(nombre), p["nombre_norm"])), None)
+        if prod:
+            if set_visibilidad(prod["id"], False): tg(f"🚫 *{prod['nombre']}* ocultado.")
+            else: tg("❌ No pude ocultar el producto.")
+        else: tg(f"❌ No encontré *{nombre}*.")
+
+    # ── /publicar ────────────────────────────────────────────────────────────
+    elif cmd[0] == "/publicar":
+        if not _token: tg("❌ Necesito el token primero."); return
+        nombre = " ".join(texto.split()[1:])
+        if not nombre: tg("Uso: `/publicar Nombre`"); return
+        catalogo = obtener_catalogo()
+        prod = next((p for p in catalogo if match(normalizar(nombre), p["nombre_norm"])), None)
+        if prod:
+            if set_visibilidad(prod["id"], True): tg(f"✅ *{prod['nombre']}* publicado.")
+            else: tg("❌ No pude publicar el producto.")
+        else: tg(f"❌ No encontré *{nombre}*.")
+
+    # ── /stock ───────────────────────────────────────────────────────────────
+    elif cmd[0] == "/stock":
+        if not _token: tg("❌ Necesito el token primero."); return
+        partes = texto.split()
+        if len(partes) < 3: tg("Uso: `/stock Nombre 10`"); return
+        try: nuevo = int(partes[-1]); nombre = " ".join(partes[1:-1])
+        except ValueError: tg("El último parámetro debe ser un número."); return
+        catalogo = obtener_catalogo()
+        prod = next((p for p in catalogo if match(normalizar(nombre), p["nombre_norm"])), None)
+        if prod:
+            if prod["variantes"]:
+                ok = all(set_stock_variante(v["id"], nuevo) for v in prod["variantes"])
+            else:
+                ok = set_visibilidad(prod["id"], nuevo > 0)
+            if ok: tg(f"📦 Stock de *{prod['nombre']}* → *{nuevo}*.")
+            else:  tg("❌ No pude actualizar el stock.")
+        else: tg(f"❌ No encontré *{nombre}*.")
+
+    # ── /precio ──────────────────────────────────────────────────────────────
+    elif cmd[0] == "/precio":
+        if not _token: tg("❌ Necesito el token primero."); return
+        partes = texto.split()
+        if len(partes) < 3: tg("Uso: `/precio Nombre 9999`"); return
+        try: nuevo = int(partes[-1]); nombre = " ".join(partes[1:-1])
+        except ValueError: tg("El último parámetro debe ser un número."); return
+        catalogo = obtener_catalogo()
+        prod = next((p for p in catalogo if match(normalizar(nombre), p["nombre_norm"])), None)
+        if prod:
+            if prod["variantes"]:
+                ok = all(set_precio_variante(v["id"], nuevo) for v in prod["variantes"])
+            else:
+                ok = set_precio_producto(prod["id"], nuevo)
+            if ok: tg(f"💲 *{prod['nombre']}* → *${nuevo:,}*.")
+            else:  tg("❌ No pude actualizar el precio.")
+        else: tg(f"❌ No encontré *{nombre}*.")
+
+    # ── /exportar_precios ────────────────────────────────────────────────────
+    elif cmd[0] == "/exportar_precios":
+        tg("⏳ Generando Excel...")
+        data, msg = generar_excel()
+        if data:
+            fecha = datetime.now().strftime("%d-%m-%Y")
+            if not tg_archivo(data, f"precios_{fecha}.xlsx", caption=msg):
+                tg("❌ Excel generado pero falló el envío.")
+        else:
+            tg(msg)
+
+    # ── /ciclo ───────────────────────────────────────────────────────────────
+    elif cmd[0] == "/ciclo":
+        tg(f"🔄 *[{NOMBRE_TIENDA}]* Iniciando ciclo manual...")
+        threading.Thread(target=ciclo_monitoreo, daemon=True).start()
+
+    # ── /debug_match ─────────────────────────────────────────────────────────
+    elif cmd[0] == "/debug_match":
+        nombre = " ".join(texto.split()[1:]).strip()
+        if not nombre: tg("Uso: /debug_match Nombre del producto"); return
+        nombre_norm = normalizar(nombre)
+        db   = leer_db()
+        prov = db.get("productos_proveedor", {})
+        if not prov: tg("Sin datos del proveedor."); return
+        idx  = _construir_indice(prov)
+
+        # Buscar en proveedor
+        base_norm, datos_prov = _buscar_en_indice(nombre_norm, idx)
+        lineas = [f"*Debug: {nombre}*", ""]
+        if datos_prov:
+            p_obj = precio_objetivo(datos_prov["precio_base"])
+            lineas.append(f"PROVEEDOR: encontrado")
+            lineas.append(f"  Base: {base_norm}")
+            lineas.append(f"  Precio prov: ${datos_prov['precio_base']:,} → Web: ${p_obj:,}")
+            if datos_prov["variantes"]:
+                lineas.append(f"  Variantes prov: {len(datos_prov['variantes'])}")
+                for vn, vp in list(datos_prov["variantes"].items())[:5]:
+                    lineas.append(f"    - {vn}: ${vp:,}")
+        else:
+            lineas.append("PROVEEDOR: NO encontrado")
+        lineas.append("")
+
+        # Buscar en catálogo API
+        catalogo = obtener_catalogo() if _token else []
+        prod = next((p for p in catalogo if match(nombre_norm, p["nombre_norm"])), None)
+        if prod:
+            lineas.append(f"CATALOGO API: encontrado")
+            lineas.append(f"  Nombre: {prod['nombre']}")
+            lineas.append(f"  Variantes: {len(prod['variantes'])}")
+            lineas.append(f"  Precio actual: ${int(prod['precio_base']):,}")
+            if prod['variantes']:
+                for v in prod['variantes'][:5]:
+                    lineas.append(f"    - {v['nombre'] or '(sin nombre)'}: ${int(v['precio']):,}")
+        else:
+            lineas.append("CATALOGO API: NO encontrado" if _token else "CATALOGO API: sin token")
+
+        tg("\n".join(lineas))
+
+    # ── /debug_env ───────────────────────────────────────────────────────────
+    elif cmd[0] == "/debug_env":
+        t = os.environ.get("API_TOKEN","")
+        u = os.environ.get("API_USER_ID","")
+        lineas = [
+            "TELEGRAM_TOKEN: " + ("OK" if TELEGRAM_TOKEN else "NO"),
+            "CHAT_ID: "        + ("OK" if CHAT_ID else "NO"),
+            "CLIENT_ID: "      + ("OK" if CLIENT_ID else "NO"),
+            "SCRAPERAPI_KEY: " + ("OK" if SCRAPERAPI_KEY else "NO"),
+            "API_TOKEN env: "  + (t[:10]+"..." if t else "NO ENCONTRADA"),
+            "API_USER_ID env: "+ (u if u else "NO ENCONTRADA"),
+            "Token memoria: "  + (str(_token)[:10]+"..." if _token else "NONE"),
+            "UserID memoria: " + (_store_id or "NONE"),
+            "NOMBRE_TIENDA: "  + (NOMBRE_TIENDA or "NO"),
+        ]
+        tg("Diagnóstico:\n" + "\n".join(lineas))
+
     else:
-        enviar_telegram("🟡 *Bot iniciado* — Sin token API todavía.\nInstalá la app en tu tienda demo y mandá el `?code=` aquí.\nMandá `/ayuda` para ver los comandos.")
+        tg("❓ Comando no reconocido. Mandá `/ayuda`.")
 
-    hilo = threading.Thread(target=bucle_escucha_telegram, daemon=True)
-    hilo.start()
-
+# ── Loop de escucha ───────────────────────────────────────────────────────────
+def escuchar_telegram():
+    if not TELEGRAM_TOKEN: return
+    offset = 0
+    url    = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    print("📡 Telegram activo...")
     while True:
-        procesar_logica()
-        print("💤 Esperando 15 minutos...")
+        try:
+            r = requests.get(f"{url}?offset={offset}&timeout=10", timeout=15)
+            if r.status_code == 200:
+                for u in r.json().get("result", []):
+                    offset = u["update_id"] + 1
+                    msg    = u.get("message", {})
+                    texto  = msg.get("text", "")
+                    cid    = str(msg.get("chat", {}).get("id", ""))
+                    if cid != CHAT_ID or not texto: continue
+                    print(f"📨 {texto[:60]}")
+                    try: procesar_cmd(texto)
+                    except Exception as e: print(f"❌ Cmd: {e}")
+        except Exception as e:
+            print(f"⚠️ Telegram loop: {e}")
+        time.sleep(1)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ARRANQUE
+# ══════════════════════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    print("🚀 Bot iniciado...")
+    print(f"   API_TOKEN env:   {'SÍ (' + os.environ.get('API_TOKEN','')[:8] + '...)' if os.environ.get('API_TOKEN') else 'NO'}")
+    print(f"   API_USER_ID env: {os.environ.get('API_USER_ID','NO')}")
+    print(f"   NOMBRE_TIENDA:   {NOMBRE_TIENDA}")
+
+    cargar_token()
+
+    if _token:
+        tg(f"🟢 *[{NOMBRE_TIENDA}] Bot iniciado* — Token activo (store_id: `{_store_id}`)\n\n"
+           f"Mandá `/sync_total` para sincronizar precios y stock.\n"
+           f"Mandá `/ayuda` para ver los comandos.")
+    else:
+        tg(f"🟡 *[{NOMBRE_TIENDA}] Bot iniciado* — Sin token API.\n"
+           f"Mandá `/debug_env` para diagnosticar.")
+
+    threading.Thread(target=escuchar_telegram, daemon=True).start()
+
+    ciclo_monitoreo()
+    while True:
         time.sleep(900)
+        ciclo_monitoreo()
