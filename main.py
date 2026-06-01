@@ -300,7 +300,9 @@ def scrapear_proveedor():
             nombre_base = normalizar(nombre_orig)
             tipo        = p.get("type","simple")
             woo_id      = p.get("id")
-            en_oferta   = p.get("on_sale", False)
+            precio_reg  = _precio_real(p)
+            precio_sale = int(p.get("prices",{}).get("sale_price",0)) // 100
+            en_oferta   = p.get("on_sale", False) and 0 < precio_sale < precio_reg
             precio_reg  = _precio_real(p)
             precio_sale = int(p.get("prices",{}).get("sale_price",0)) // 100
             in_stock    = p.get("is_in_stock", False)
@@ -321,7 +323,8 @@ def scrapear_proveedor():
                     v_nombre  = v_var_str.split(":",1)[1].strip() if ":" in v_var_str else v_var_str
                     v_precio  = _precio_real(vd)
                     v_stock   = _stock_real(vd)
-                    v_oferta  = vd.get("on_sale", False)
+                    v_sale    = int(vd.get("prices",{}).get("sale_price",0)) // 100
+                    v_oferta  = vd.get("on_sale", False) and 0 < v_sale < _precio_real(vd)
                     v_instock = vd.get("is_in_stock", False)
                     if not v_instock or v_precio == 0: continue
 
@@ -721,8 +724,8 @@ def ciclo_monitoreo():
     for clave, datos in prov_nuevo.items():
         viejo = prov_ant.get(clave, {})
 
-        # Oferta nueva del proveedor
-        if datos["en_oferta"] and not viejo.get("en_oferta", False):
+        # Oferta nueva real del proveedor (precio_sale estrictamente menor)
+        if datos["en_oferta"] and datos.get("precio_anterior",0) > datos["precio"] and not viejo.get("en_oferta", False):
             base = datos["nombre_base_proveedor"]
             if base not in ofertas_nuevas:
                 ofertas_nuevas[base] = datos
@@ -756,7 +759,7 @@ def ciclo_monitoreo():
     # Guardar ofertas pendientes de confirmación
     if ofertas_nuevas:
         db["ofertas_pendientes"] = ofertas_nuevas
-        nums = [f"{i+1}. *{d['nombre_real']}*\n   Antes: ${d.get('precio_anterior',0):,} → 🔥 ${d['precio']:,}"
+        nums = [f"{i+1}. *{d['nombre_real']}*\n   Reg: ${d.get('precio_anterior',0):,} → 🔥 ${d['precio']:,}"
                 for i,(k,d) in enumerate(ofertas_nuevas.items())]
         tg(f"🏷️ *{_nt('Ofertas nuevas del Proveedor')}*\n\n" + "\n".join(nums) +
            f"\n\nUsá `/aplicar_ofertas todos` o `/aplicar_ofertas 1 3` para aplicarlas.")
