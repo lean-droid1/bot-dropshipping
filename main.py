@@ -1024,22 +1024,36 @@ def procesar_cmd(texto):
             p_o = precio_obj(datos_prov["precio_base"])
             lineas += [f"PROVEEDOR: encontrado",
                        f"  Base: {base_norm}",
-                       f"  Precio prov: ${datos_prov['precio_base']:,} → Web: ${p_o:,}",
-                       f"  Stock base: {datos_prov.get('stock_base','?')}"]
-            if datos_prov["variantes"]:
-                lineas.append(f"  Variantes prov: {len(datos_prov['variantes'])}")
-                for vn, vd in list(datos_prov["variantes"].items())[:5]:
-                    lineas.append(f"    - {vn}: ${vd['precio']:,} (stock: {vd.get('stock','?')})")
+                       f"  Precio base: ${datos_prov['precio_base']:,} → Web: ${p_o:,}",
+                       f"  Stock base: {datos_prov.get('stock_base','?')}",
+                       f"  Variantes prov: {len(datos_prov['variantes'])}"]
+            for vn, vd in list(datos_prov["variantes"].items())[:8]:
+                p_v = precio_obj(vd["precio"])
+                lineas.append(f"    [{vn[:35]}]: ${vd['precio']:,} → ${p_v:,} (stock:{vd.get('stock','?')})")
         else:
             lineas.append("PROVEEDOR: NO encontrado")
         lineas.append("")
         catalogo = obtener_catalogo() if _token else []
         prod = next((p for p in catalogo if match(nombre_norm,p["nombre_norm"])),None)
-        if prod:
+        if prod and datos_prov:
+            vars_prov_idx = datos_prov.get("variantes", {})
             lineas += [f"CATALOGO API: encontrado",
                        f"  Nombre: {prod['nombre']}",
-                       f"  Variantes: {len(prod['variantes'])}",
-                       f"  Precio actual: ${int(prod['precio_base']):,}"]
+                       f"  Variantes API: {len(prod['variantes'])}",
+                       f"  Precio actual: ${int(prod['precio_base']):,}",
+                       f"  Matching variantes:"]
+            for v in prod["variantes"][:8]:
+                vnom = normalizar(v["nombre"])
+                match_prov = next(((pv,pd) for pv,pd in vars_prov_idx.items() if match(vnom,pv)), None)
+                if match_prov:
+                    p_calc = precio_obj(match_prov[1]["precio"])
+                    lineas.append(f"    ✅ {v['nombre'][:30]} → ${p_calc:,}")
+                else:
+                    p_fb = precio_obj(datos_prov["precio_base"])
+                    lineas.append(f"    ⚠️ {v['nombre'][:30]} → fallback ${p_fb:,}")
+        elif prod:
+            lineas += [f"CATALOGO API: encontrado (sin datos prov para matching)",
+                       f"  Variantes: {len(prod['variantes'])}"]
             for v in prod["variantes"][:5]:
                 lineas.append(f"    - {v['nombre'] or '(sin nombre)'}: ${int(v['precio']):,}")
         else:
