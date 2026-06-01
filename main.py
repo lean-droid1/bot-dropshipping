@@ -25,7 +25,6 @@ USER_AGENT       = "dropshipping (lean.6roid@gmail.com)"
 # Márgenes y alertas (configurables via Railway Variables)
 MARGEN           = float(os.environ.get("MARGEN", "0.78"))   # /0.78 = 22% ganancia
 ALERTA_STOCK     = 3    # Telegram cuando stock del proveedor llega a este número
-URGENCIA_WEB     = 5    # Cartel "🔥 Últimas unidades" en la web
 CICLO_MINUTOS    = 15   # Cada cuántos minutos monitorea
 
 PALABRAS_INTERES = [
@@ -138,21 +137,33 @@ def canjear_code(code):
 def _h(): return {"Authorization":f"Bearer {_token}","User-Agent":USER_AGENT,"Content-Type":"application/json"}
 
 def _get(url, params=None):
-    for _ in range(3):
+    for intento in range(4):
         try:
-            r = requests.get(url, headers=_h(), params=params, timeout=20)
-            if r.status_code == 429: time.sleep(3); continue
+            r = requests.get(url, headers=_h(), params=params, timeout=40)
+            if r.status_code == 429:
+                espera = 5 * (intento + 1)
+                print(f"   ⚠️ Rate limit GET. Esperando {espera}s..."); time.sleep(espera); continue
             return r
-        except Exception as e: print(f"❌ GET: {e}"); time.sleep(1)
+        except requests.exceptions.Timeout:
+            print(f"   ⏱️ Timeout GET (intento {intento+1}/4): {url[:60]}")
+            time.sleep(3 * (intento + 1))
+        except Exception as e:
+            print(f"❌ GET: {e}"); time.sleep(2)
     return None
 
 def _put(url, data):
-    for _ in range(3):
+    for intento in range(4):
         try:
-            r = requests.put(url, headers=_h(), json=data, timeout=15)
-            if r.status_code == 429: time.sleep(3); continue
+            r = requests.put(url, headers=_h(), json=data, timeout=40)
+            if r.status_code == 429:
+                espera = 5 * (intento + 1)
+                print(f"   ⚠️ Rate limit PUT. Esperando {espera}s..."); time.sleep(espera); continue
             return r
-        except Exception as e: print(f"❌ PUT: {e}"); time.sleep(1)
+        except requests.exceptions.Timeout:
+            print(f"   ⏱️ Timeout PUT (intento {intento+1}/4): {url[:60]}")
+            time.sleep(3 * (intento + 1))
+        except Exception as e:
+            print(f"❌ PUT: {e}"); time.sleep(2)
     return None
 
 # ── Caché del catálogo ────────────────────────────────────────────────────────
@@ -484,33 +495,8 @@ def sincronizar_stock(prod, datos_prov, sinc):
             set_stock_producto(pid, stock_base)
             sinc.setdefault(nombre_real,{})["stock_sinc"] = stock_base
 
-    # Cartel de urgencia en el nombre del producto
-    # Determinar stock mínimo entre todas las variantes (o stock_base si simple)
-    if variantes:
-        stocks = []
-        for v in variantes:
-            vnom = normalizar(v["nombre"])
-            s = stock_base
-            for pv_norm, pv_datos in vars_prov.items():
-                if match(vnom, pv_norm): s = pv_datos.get("stock", stock_base); break
-            stocks.append(s)
-        stock_min = min(stocks) if stocks else stock_base
-    else:
-        stock_min = stock_base
-
-    nombre_actual = prod["nombre"]
-    prefijo = "🔥 "
-    tiene_cartel = nombre_actual.startswith(prefijo)
-
-    if stock_min <= URGENCIA_WEB and not tiene_cartel:
-        if set_nombre_producto(pid, f"{prefijo}{nombre_actual}"):
-            prod["nombre"] = f"{prefijo}{nombre_actual}"
-            print(f"   🔥 Cartel urgencia ON: {nombre_actual}")
-    elif stock_min > URGENCIA_WEB and tiene_cartel:
-        nombre_limpio = nombre_actual.replace(prefijo,"",1)
-        if set_nombre_producto(pid, nombre_limpio):
-            prod["nombre"] = nombre_limpio
-            print(f"   ✅ Cartel urgencia OFF: {nombre_limpio}")
+    # Cartel de urgencia: se maneja directamente desde Tienda Negocio
+    # No modificamos el nombre del producto para evitar errores de matching
 
 # ══════════════════════════════════════════════════════════════════════════════
 # MARCAR SIN STOCK (nunca oculta)
