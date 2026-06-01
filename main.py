@@ -400,6 +400,8 @@ def precio_obj(costo):
 def construir_indice(prov):
     """
     Agrupa entradas del proveedor por nombre base.
+    ✅ Usa nombre_real (con paréntesis) para detectar variantes,
+       no la clave normalizada que ya no tiene paréntesis.
     Resultado: {base_norm: {precio_base, stock_base, en_oferta,
                             variantes:{var_norm: {precio, stock}}}}
     """
@@ -409,14 +411,23 @@ def construir_indice(prov):
         if base not in idx:
             idx[base] = {"precio_base":d["precio"], "stock_base":d.get("stock",0),
                          "en_oferta":d.get("en_oferta",False), "variantes":{}}
-        if '(' in clave:
-            var_part = clave.split('(',1)[-1].rstrip(')')
-            idx[base]["variantes"][var_part.strip()] = {
-                "precio": d["precio"], "stock": d.get("stock",0)
-            }
+
+        # Usar nombre_real para detectar variantes (tiene los paréntesis originales)
+        nombre_real = d.get("nombre_real", clave)
+        if '(' in nombre_real:
+            var_part = nombre_real.split('(',1)[-1].rstrip(')')
+            var_norm = normalizar(var_part)
+            if var_norm:
+                idx[base]["variantes"][var_norm] = {
+                    "precio": d["precio"], "stock": d.get("stock",0)
+                }
         else:
+            # Producto simple: actualizar precio_base si es menor
             if d["precio"] < idx[base]["precio_base"]:
                 idx[base]["precio_base"] = d["precio"]
+            # Actualizar stock_base con el máximo disponible
+            if d.get("stock",0) > idx[base]["stock_base"]:
+                idx[base]["stock_base"] = d.get("stock",0)
     return idx
 
 def buscar_en_indice(nombre_norm, idx):
