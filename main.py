@@ -156,12 +156,13 @@ def _put(url, data):
         try:
             r = requests.put(url, headers=_h(), json=data, timeout=40)
             if r.status_code == 429:
-                espera = 5 * (intento + 1)
+                espera = 15 * (intento + 1)
                 print(f"   ⚠️ Rate limit PUT. Esperando {espera}s..."); time.sleep(espera); continue
+            time.sleep(0.8)
             return r
         except requests.exceptions.Timeout:
             print(f"   ⏱️ Timeout PUT (intento {intento+1}/4): {url[:60]}")
-            time.sleep(3 * (intento + 1))
+            time.sleep(5 * (intento + 1))
         except Exception as e:
             print(f"❌ PUT: {e}"); time.sleep(2)
     return None
