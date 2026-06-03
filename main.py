@@ -797,17 +797,28 @@ def ciclo_monitoreo():
                 sinc[nombre_real] = {"precio": precio_guardado} if precio_guardado else {}
                 sync_actual = sinc[nombre_real]
 
-            # Precio — solo si cambió desde último sync
+            # Precio: solo actualizar si cambio
             p_obj_calc = precio_obj(datos_prov["precio_base"])
             if p_obj_calc != sync_actual.get("precio", 0):
-                ok, p_min, p_max = sincronizar_precios(prod, datos_prov)
-                if ok:
-                    sinc.setdefault(nombre_real,{})["precio"] = p_min
-                    if int(precio_web) != p_min:
-                        rango = f"${p_min:,}" if p_min==p_max else f"${p_min:,}–${p_max:,}"
-                        etiq  = f"({len(prod['variantes'])} var.)" if prod["tiene_variantes"] else "(sin var.)"
-                        lineas_precios.append(f"• *{nombre_real}* {etiq}\n  Antes: ${int(precio_web):,} → *Nuevo: {rango}*")
-
+                ratio = (p_obj_calc / precio_web) if precio_web > 0 else 1
+                if ratio < 0.40:
+                    alerta = "[" + NOMBRE_TIENDA + "] PRECIO BLOQUEADO baja >60%: "
+                    alerta += nombre_real + " actual $" + str(int(precio_web))
+                    alerta += " calculado $" + str(p_obj_calc)
+                    alerta += " | verificar /debug_match"
+                    tg(alerta)
+                else:
+                    ok, p_min, p_max = sincronizar_precios(prod, datos_prov)
+                    if ok:
+                        sinc.setdefault(nombre_real, {})["precio"] = p_min
+                        if int(precio_web) != p_min:
+                            rango = str(p_min) if p_min == p_max else str(p_min) + "-" + str(p_max)
+                            nvar = len(prod["variantes"])
+                            etiq = "(" + str(nvar) + " var.)" if prod["tiene_variantes"] else "(sin var.)"
+                            linea = nombre_real + " " + etiq
+                            linea += " | Antes $" + str(int(precio_web))
+                            linea += " Nuevo $" + rango
+                            lineas_precios.append(linea)
             # Stock real
             sincronizar_stock(prod, datos_prov, sinc)
 
