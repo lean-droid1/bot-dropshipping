@@ -309,7 +309,7 @@ def scrapear_proveedor():
             in_stock    = p.get("is_in_stock", False)
             stock_base  = _stock_real(p)
 
-            if not in_stock or precio_reg == 0: continue
+            if precio_reg == 0: continue  # Saltear solo si no tiene precio
 
             if tipo == "variable":
                 variaciones = p.get("variations", [])
@@ -327,7 +327,7 @@ def scrapear_proveedor():
                     v_sale    = int(vd.get("prices",{}).get("sale_price",0)) // 100
                     v_oferta  = vd.get("on_sale", False) and 0 < v_sale < _precio_real(vd)
                     v_instock = vd.get("is_in_stock", False)
-                    if not v_instock or v_precio == 0: continue
+                    if v_precio == 0: continue  # Saltear solo si no tiene precio
 
                     clave = normalizar(f"{nombre_orig} ({v_nombre})")
                     productos[clave] = {
@@ -336,7 +336,7 @@ def scrapear_proveedor():
                         "precio":                v_precio,
                         "precio_anterior":       _precio_real(vd) if v_oferta else 0,
                         "en_oferta":             v_oferta,
-                        "stock":                 v_stock,
+                        "stock":                 v_stock if v_instock else 0,
                         "woo_id":                vid,
                     }
                     time.sleep(0.25)
@@ -347,7 +347,7 @@ def scrapear_proveedor():
                     "precio":                precio_reg,
                     "precio_anterior":       precio_reg if en_oferta else 0,
                     "en_oferta":             en_oferta,
-                    "stock":                 stock_base,
+                    "stock":                 stock_base if in_stock else 0,
                     "woo_id":                woo_id,
                 }
 
