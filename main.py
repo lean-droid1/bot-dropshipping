@@ -644,24 +644,24 @@ def run_sync_total():
 # GMAIL
 # ══════════════════════════════════════════════════════════════════════════════
 def chequear_gmail():
+    """Solo trae emails NO LEIDOS. Los marca leidos para evitar spam al redeployar."""
     if not GMAIL_USER or not GMAIL_PASS: return []
-    pedidos = []
+    pedidos = []; conn = None
     try:
-        m = imaplib.IMAP4_SSL("imap.gmail.com")
-        m.login(GMAIL_USER, GMAIL_PASS); m.select("inbox")
-        hace_24h = (datetime.now()-timedelta(days=1)).strftime("%d-%b-%Y")
-        st, msgs = m.search(None, f'(FROM "tiendanegocio.com" SINCE {hace_24h})')
-        if st != "OK" or not msgs[0]: m.close(); m.logout(); return []
+        conn = imaplib.IMAP4_SSL("imap.gmail.com")
+        conn.login(GMAIL_USER, GMAIL_PASS); conn.select("inbox")
+        st, msgs = conn.search(None, '(UNSEEN FROM "tiendanegocio.com")')
+        if st != "OK" or not msgs[0]: conn.close(); conn.logout(); return []
         for mid in msgs[0].split():
             sid = mid.decode()
-            res, data = m.fetch(mid, "(RFC822)")
+            res, data = conn.fetch(mid, "(RFC822)")
             if res != "OK": continue
             msg = email.message_from_bytes(data[0][1])
             subj, enc = decode_header(msg["Subject"])[0]
             if isinstance(subj, bytes): subj = subj.decode(enc or "utf-8")
-            if not any(p in subj.lower() for p in ["compra","realizó","pedido","venta"]): continue
-            num = (re.search(r'#(\d+)', subj) or type('x',[],{'group':lambda self,i:sid})())\
-                    .group(1) if re.search(r'#(\d+)', subj) else sid
+            if not any(p in subj.lower() for p in ["compra","realiz","pedido","venta"]): continue
+            num_m = re.search(r"#(\d+)", subj)
+            num = num_m.group(1) if num_m else sid
             cuerpo = ""
             if msg.is_multipart():
                 for part in msg.walk():
@@ -670,9 +670,15 @@ def chequear_gmail():
             else:
                 cuerpo = msg.get_payload(decode=True).decode("utf-8","ignore")
             items = _parsear_items(cuerpo)
-            if items: pedidos.append({"id":sid,"num":num,"items":items})
-        m.close(); m.logout()
-    except Exception as e: print(f"❌ Gmail: {e}")
+            if items:
+                pedidos.append({"id":sid,"num":num,"items":items})
+                conn.store(mid, "+FLAGS", "\\Seen")  # Marcar leido
+        conn.close(); conn.logout()
+    except Exception as e:
+        print("Gmail: " + str(e))
+        try:
+            if conn: conn.close(); conn.logout()
+        except Exception: pass
     return pedidos
 
 def _parsear_items(cuerpo):
