@@ -489,6 +489,8 @@ def sincronizar_precios(prod, datos_prov):
         if ok: _actualizar_envio_gratis_prod(prod, p)
         return ok, p, p
 
+    vars_prov = datos_prov.get("variantes", {})
+    precios   = {}
     for v in variantes:
         costo = None
         # Buscar precio específico de esta variante
