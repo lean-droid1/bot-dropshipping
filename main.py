@@ -294,8 +294,13 @@ def _prov_get(url, params=None):
     return None
 
 def _precio_real(p):
-    """Siempre usa regular_price (precio sin oferta del proveedor)."""
-    return int(p.get("prices",{}).get("regular_price", p.get("prices",{}).get("price",0))) // 100
+    """
+    Usa el precio activo que ve el cliente final en la web del proveedor.
+    - Sin oferta publica: price == regular_price
+    - Con oferta publica (SALE): price == sale_price (mas bajo)
+    El descuento de revendedor (20-25%) no se incluye en la formula.
+    """
+    return int(p.get("prices",{}).get("price", 0)) // 100
 
 def _stock_real(p):
     """Stock real = maximum del add_to_cart."""
@@ -310,8 +315,10 @@ def scrapear_proveedor():
     print("📥 API proveedor...")
     while True:
         r = _prov_get(PROV_API, params={"per_page":100,"page":pagina})
-        if not r or r.status_code != 200:
+        if not r or r.status_code not in (200, 201, 202):
             print(f"❌ Proveedor HTTP {r.status_code if r else 'None'}"); break
+        if r.status_code == 202:
+            print(f"⚠️ Proveedor HTTP 202 - intentando parsear igual")
         lote = r.json()
         if not lote: break
 
