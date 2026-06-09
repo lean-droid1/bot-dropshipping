@@ -131,7 +131,7 @@ def _nt(txt): return f"[{NOMBRE_TIENDA}] {txt}"
 # ══════════════════════════════════════════════════════════════════════════════
 # TEXTO DE AYUDA
 # ══════════════════════════════════════════════════════════════════════════════
-AYUDA = """📋 *Comandos disponibles:*
+AYUDA = r"""📋 *Comandos disponibles:*
 
 *Sincronización*
 /sync\_total — Sincroniza precios y stock de todos los productos
