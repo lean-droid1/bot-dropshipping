@@ -28,7 +28,9 @@ ALERTA_STOCK       = 3       # Alerta Telegram cuando stock llega a este numero
 ENVIO_GRATIS_MIN   = 100000  # Activar envio gratis en productos >= este precio
 # IDs de mesas (productos pesados) - se completan con /debug_match
 # Formato: agregar los IDs reales despues de obtenerlos
-PRODUCTOS_PESADOS_IDS = set()
+# Mesas pesadas (no envio gratis): RT-01D:3643182, RF-RT02D:3643163, LW-A1:3643153, LW-A1 Mini:3643173
+PRODUCTOS_PESADOS_IDS = {3643182, 3643163, 3643153, 3643173}
+
 CICLO_MINUTOS    = 15   # Cada cuántos minutos monitorea
 
 PALABRAS_INTERES = [
