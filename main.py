@@ -24,7 +24,11 @@ USER_AGENT       = "dropshipping (lean.6roid@gmail.com)"
 
 # Márgenes y alertas (configurables via Railway Variables)
 MARGEN           = float(os.environ.get("MARGEN", "0.78"))   # /0.78 = 22% ganancia
-ALERTA_STOCK     = 3    # Telegram cuando stock del proveedor llega a este número
+ALERTA_STOCK       = 3       # Alerta Telegram cuando stock llega a este numero
+ENVIO_GRATIS_MIN   = 100000  # Activar envio gratis en productos >= este precio
+# IDs de mesas (productos pesados) - se completan con /debug_match
+# Formato: agregar los IDs reales despues de obtenerlos
+PRODUCTOS_PESADOS_IDS = set()
 CICLO_MINUTOS    = 15   # Cada cuántos minutos monitorea
 
 PALABRAS_INTERES = [
