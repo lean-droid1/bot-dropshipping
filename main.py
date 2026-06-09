@@ -278,9 +278,9 @@ def set_visibilidad(pid, published):
 
 
 def set_envio_gratis(pid, activo):
-    r = _put(f"{API_BASE}/products/{pid}", {"free_shipping": activo})
+    r = _put(f"{API_BASE}/products/{pid}", {"freeshipping": activo})
     ok = r and r.status_code in (200,201)
-    if not ok: print(f"  Envio gratis HTTP {r.status_code if r else 'None'}")
+    if not ok: print("  Envio gratis HTTP " + str(r.status_code if r else "None"))
     return ok
 
 # ══════════════════════════════════════════════════════════════════════════════
