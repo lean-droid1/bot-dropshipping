@@ -1332,6 +1332,16 @@ def procesar_cmd(texto):
         else:
             lineas.append("CATALOGO API: " + ("NO encontrado" if _token else "sin token"))
         tg("\n".join(lineas))
+    elif cmd[0] == "/debug_producto":
+        if not _token: tg("Sin token."); return
+        pid = texto.split()[1] if len(texto.split()) > 1 else ""
+        if not pid: tg("Uso: /debug_producto ID"); return
+        r = _get(f"{API_BASE}/products/{pid}")
+        if not r or r.status_code != 200: tg("HTTP " + str(r.status_code if r else 0)); return
+        d = r.json()
+        sep = chr(10)
+        info = [k + ": " + str(v) for k,v in d.items() if not isinstance(v,(dict,list))]
+        tg("Producto " + str(pid) + ":" + sep + sep.join(info[:25]))
 
     elif cmd[0] == "/debug_env":
         t = os.environ.get("API_TOKEN",""); u = os.environ.get("API_USER_ID","")
