@@ -270,6 +270,13 @@ def set_visibilidad(pid, published):
     r = _put(f"{API_BASE}/products/{pid}", {"published":published})
     return r and r.status_code in (200,201)
 
+
+def set_envio_gratis(pid, activo):
+    r = _put(f"{API_BASE}/products/{pid}", {"free_shipping": activo})
+    ok = r and r.status_code in (200,201)
+    if not ok: print(f"  Envio gratis HTTP {r.status_code if r else 'None'}")
+    return ok
+
 # ══════════════════════════════════════════════════════════════════════════════
 # SCRAPING PROVEEDOR — API WOOCOMMERCE PÚBLICA
 # ══════════════════════════════════════════════════════════════════════════════
@@ -448,6 +455,16 @@ def buscar_en_indice(nombre_norm, idx):
 # ══════════════════════════════════════════════════════════════════════════════
 # SINCRONIZACIÓN DE PRECIOS
 # ══════════════════════════════════════════════════════════════════════════════
+def _actualizar_envio_gratis_prod(prod, precio):
+    """Activa/desactiva envio gratis segun precio. Excluye productos pesados."""
+    pid = prod["id"]
+    es_pesado = pid in PRODUCTOS_PESADOS_IDS
+    if es_pesado:
+        return  # Las mesas tienen manejo especial, no tocar
+    activo = precio >= ENVIO_GRATIS_MIN
+    set_envio_gratis(pid, activo)
+
+
 def sincronizar_precios(prod, datos_prov):
     """
     Actualiza precios de todas las variantes (o el producto si no tiene).
@@ -459,12 +476,14 @@ def sincronizar_precios(prod, datos_prov):
 
     if not variantes:
         p = precio_obj(datos_prov["precio_base"])
+        precio_actual = prod.get("precio_base", 0)
+        if precio_actual > 0 and p > 0 and (p / precio_actual) < 0.40:
+            print("BLOQUEADO baja >60%: " + prod.get("nombre","?")[:40])
+            return False, 0, 0
         ok = set_precio_producto(pid, p)
         time.sleep(0.4)
+        if ok: _actualizar_envio_gratis_prod(prod, p)
         return ok, p, p
-
-    vars_prov = datos_prov.get("variantes", {})
-    precios   = {}
 
     for v in variantes:
         costo = None
