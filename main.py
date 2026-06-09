@@ -48,6 +48,14 @@ CLIENT_ID      = _e("CLIENT_ID")
 CLIENT_SECRET  = _e("CLIENT_SECRET")
 NOMBRE_TIENDA  = _e("NOMBRE_TIENDA") or "🧪 PRUEBA"
 
+# ── Compras automáticas al proveedor ─────────────────────────────────────────
+PROV_USER      = _e("PROV_USER")       # Usuario rxzweb.com
+PROV_PASS      = _e("PROV_PASS")       # Contraseña rxzweb.com
+CUIT_PROVEEDOR = _e("CUIT_PROVEEDOR")  # CUIT para el checkout
+PROV_LOGIN_URL = "https://rxzweb.com/wp-login.php"
+PROV_CART_URL  = "https://rxzweb.com/wp-json/wc/store/v1/cart"
+PROV_CHKOUT_URL= "https://rxzweb.com/wp-json/wc/store/v1/checkout"
+
 # ── Token API Tienda Negocio ──────────────────────────────────────────────────
 _token    = None
 _store_id = None
@@ -81,9 +89,10 @@ def leer_db():
                 d.setdefault("sincronizados", {})
                 d.setdefault("pedidos_procesados", [])
                 d.setdefault("ofertas_pendientes", {})
+                d.setdefault("ordenes", {})
                 return d
         except Exception: pass
-    return {"productos_proveedor":{}, "sincronizados":{}, "pedidos_procesados":[], "ofertas_pendientes":{}}
+    return {"productos_proveedor":{}, "sincronizados":{}, "pedidos_procesados":[], "ofertas_pendientes":{}, "ordenes":{}}
 
 def escribir_db(d):
     try:
@@ -491,6 +500,10 @@ def sincronizar_stock(prod, datos_prov, sinc):
     vars_prov   = datos_prov.get("variantes", {})
     stock_base  = datos_prov.get("stock_base", 0)
 
+    # Stock ilimitado (9999+): no sincronizar ni alertar
+    if stock_base >= 9999: return
+
+
     if variantes:
         # Asignar stock individual por variante si está disponible
         for v in variantes:
@@ -761,7 +774,7 @@ def ciclo_monitoreo():
 
         # Alerta stock bajo (≤ ALERTA_STOCK)
         stock = datos.get("stock", 0)
-        if isinstance(stock, (int,float)) and 0 < stock <= ALERTA_STOCK:
+        if isinstance(stock, (int,float)) and 0 < stock <= ALERTA_STOCK and stock < 9999:
             nombre_r = datos["nombre_real"]
             ultimo_alerta_stock = sinc.get(nombre_r,{}).get("alerta_stock_cant")
             if ultimo_alerta_stock != int(stock):
@@ -848,36 +861,232 @@ def ciclo_monitoreo():
 # ══════════════════════════════════════════════════════════════════════════════
 # COMANDOS TELEGRAM
 # ══════════════════════════════════════════════════════════════════════════════
-AYUDA = """
-🤖 *Comandos disponibles:*
+# ══════════════════════════════════════════════════════════════════════════════
+# COMPRAS AUTOMÁTICAS AL PROVEEDOR
+# ══════════════════════════════════════════════════════════════════════════════
 
-🔑 *Token / API*
-`?code=XXXX` — Canjear código OAuth
-`/estado_api` — Ver token activo
-`/borrar_token` — Eliminar token
+def _prov_session():
+    """
+    Inicia sesión en rxzweb.com y devuelve (session, nonce) o (None, None).
+    La sesión mantiene las cookies para requests posteriores.
+    """
+    if not PROV_USER or not PROV_PASS:
+        print("❌ Falta PROV_USER o PROV_PASS en Railway Variables")
+        return None, None
+    session = requests.Session()
+    session.headers.update({"User-Agent": USER_AGENT})
+    try:
+        # 1. Obtener página de login para el nonce inicial
+        r = session.get(PROV_LOGIN_URL, timeout=20)
+        if r.status_code != 200:
+            print(f"❌ Login page HTTP {r.status_code}"); return None, None
+        # 2. Login con usuario y contraseña
+        login_data = {
+            "log":         PROV_USER,
+            "pwd":         PROV_PASS,
+            "wp-submit":   "Acceder",
+            "redirect_to": "https://rxzweb.com/mi-cuenta/",
+            "testcookie":  "1"
+        }
+        r2 = session.post(PROV_LOGIN_URL, data=login_data, timeout=20)
+        if "mi-cuenta" not in r2.url and "dashboard" not in r2.url:
+            print(f"❌ Login falló. URL final: {r2.url[:80]}")
+            return None, None
+        print("✅ Login rxzweb exitoso")
+        # 3. Obtener nonce del carrito
+        r3 = session.get(PROV_CART_URL, timeout=20)
+        nonce = r3.headers.get("X-WC-Store-API-Nonce") or r3.headers.get("Nonce", "")
+        if not nonce:
+            # Intentar obtener nonce desde la web
+            r4 = session.get("https://rxzweb.com/", timeout=20)
+            import re as _re
+            m = _re.search(r'"nonce":"([^"]+)"', r4.text)
+            if m: nonce = m.group(1)
+        print(f"   Nonce: {nonce[:20] if nonce else 'NO ENCONTRADO'}...")
+        return session, nonce
+    except Exception as e:
+        print(f"❌ Session: {e}"); return None, None
 
-📦 *Productos*
-`/listar` — Ver productos de tu tienda
-`/ocultar NOMBRE` — Ocultar producto
-`/publicar NOMBRE` — Publicar producto
-`/stock NOMBRE CANTIDAD` — Cambiar stock
-`/precio NOMBRE VALOR` — Cambiar precio
 
-🔄 *Sincronización*
-`/sync_total` — Sincronizar TODOS precios y stock
-`/ciclo` — Forzar ciclo de monitoreo
-`/exportar_precios` — Excel precios lista para importar
+def _prov_add_to_cart(session, nonce, product_id, variation_id, quantity):
+    """Agrega un producto al carrito del proveedor."""
+    headers = {"Nonce": nonce, "Content-Type": "application/json"}
+    payload = {
+        "id":       variation_id or product_id,
+        "quantity": quantity
+    }
+    try:
+        r = session.post(
+            f"{PROV_CART_URL}/add-item",
+            json=payload, headers=headers, timeout=20
+        )
+        ok = r.status_code in (200, 201)
+        print(f"  {'✅' if ok else '❌'} Carrito add {product_id}: HTTP {r.status_code}")
+        if not ok: print(f"     {r.text[:100]}")
+        return ok
+    except Exception as e:
+        print(f"❌ Add to cart: {e}"); return False
 
-🏷️ *Ofertas del proveedor*
-`/aplicar_ofertas todos` — Aplicar todas las ofertas
-`/aplicar_ofertas 1 3` — Aplicar ofertas 1 y 3
 
-🔍 *Debug*
-`/debug_match NOMBRE` — Diagnosticar un producto
-`/debug_env` — Estado de variables
+def _prov_checkout(session, nonce, datos_cliente):
+    """
+    Completa el checkout en el proveedor.
+    datos_cliente: {first_name, last_name, address_1, city, state,
+                    postcode, phone, email, company (CUIT)}
+    Devuelve número de orden o None.
+    """
+    headers = {"Nonce": nonce, "Content-Type": "application/json"}
+    payload = {
+        "billing_address": {
+            "first_name": datos_cliente.get("first_name", ""),
+            "last_name":  datos_cliente.get("last_name", ""),
+            "company":    CUIT_PROVEEDOR or "",
+            "address_1":  datos_cliente.get("address_1", ""),
+            "city":       datos_cliente.get("city", ""),
+            "state":      datos_cliente.get("state", "B"),
+            "postcode":   datos_cliente.get("postcode", ""),
+            "country":    "AR",
+            "email":      datos_cliente.get("email", PROV_USER or ""),
+            "phone":      datos_cliente.get("phone", ""),
+        },
+        "shipping_address": {
+            "first_name": datos_cliente.get("first_name", ""),
+            "last_name":  datos_cliente.get("last_name", ""),
+            "company":    "",
+            "address_1":  datos_cliente.get("address_1", ""),
+            "city":       datos_cliente.get("city", ""),
+            "state":      datos_cliente.get("state", "B"),
+            "postcode":   datos_cliente.get("postcode", ""),
+            "country":    "AR",
+            "phone":      datos_cliente.get("phone", ""),
+        },
+        "payment_method": "cod",  # Contra entrega / sin pago online
+        "customer_note":  datos_cliente.get("nota", ""),
+    }
+    try:
+        r = session.post(
+            PROV_CHKOUT_URL,
+            json=payload, headers=headers, timeout=30
+        )
+        if r.status_code in (200, 201):
+            data = r.json()
+            orden = data.get("order_id") or data.get("id") or data.get("number")
+            print(f"✅ Pedido creado en proveedor: #{orden}")
+            return str(orden)
+        else:
+            print(f"❌ Checkout HTTP {r.status_code}: {r.text[:200]}")
+            return None
+    except Exception as e:
+        print(f"❌ Checkout: {e}"); return None
 
-❓ `/ayuda` — Este mensaje
-""".strip()
+
+def hacer_pedido_proveedor(items, datos_cliente, nota=""):
+    """
+    Flujo completo de compra automática al proveedor.
+    items: [{"product_id": X, "variation_id": Y, "quantity": Z, "nombre": "..."}]
+    datos_cliente: datos de billing/shipping
+    Devuelve número de orden del proveedor o None.
+    """
+    print("🛒 Iniciando compra automática al proveedor...")
+    session, nonce = _prov_session()
+    if not session:
+        tg("❌ No pude iniciar sesión en el proveedor. Verificá PROV_USER y PROV_PASS.")
+        return None
+    # Agregar cada item al carrito
+    for item in items:
+        ok = _prov_add_to_cart(
+            session, nonce,
+            item["product_id"], item.get("variation_id"),
+            item["quantity"]
+        )
+        if not ok:
+            tg(f"❌ No pude agregar al carrito: {item.get('nombre', item['product_id'])}")
+            return None
+        time.sleep(0.5)
+    # Completar checkout
+    if nota:
+        datos_cliente["nota"] = nota
+    orden = _prov_checkout(session, nonce, datos_cliente)
+    return orden
+
+
+def procesar_orden_pagada(datos_orden):
+    num_orden  = str(datos_orden.get("id") or datos_orden.get("number","?"))
+    cliente    = datos_orden.get("billing", {})
+    productos  = datos_orden.get("products", datos_orden.get("line_items", []))
+    envio_tipo = datos_orden.get("shipping", {}).get("pickup_type", "shipping")
+    es_retiro  = "pickup" in str(envio_tipo).lower() or "retiro" in str(envio_tipo).lower()
+
+    db      = leer_db()
+    prov    = db.get("productos_proveedor", {})
+    idx     = construir_indice(prov)
+
+    items_pedido = []
+    hay_problema = False
+    lineas_msg   = ["Orden pagada #" + num_orden, ""]
+
+    for item in productos:
+        nombre   = item.get("name", item.get("product_name","?"))
+        cantidad = item.get("quantity", 1)
+        nn       = normalizar(nombre)
+        _, dp    = buscar_en_indice(nn, idx)
+
+        if dp is None:
+            lineas_msg.append("NO ENCONTRADO: " + nombre + " x" + str(cantidad))
+            hay_problema = True
+            continue
+
+        stock_disp = dp.get("stock_base", 0)
+        if stock_disp < cantidad:
+            lineas_msg.append("STOCK BAJO: " + nombre + " x" + str(cantidad) + " (disponible: " + str(stock_disp) + ")")
+            hay_problema = True
+        else:
+            lineas_msg.append("OK: " + nombre + " x" + str(cantidad))
+
+        woo_id = None; var_id = None
+        for clave, d in prov.items():
+            base = normalizar(d.get("nombre_base_proveedor", clave))
+            if match(nn, base):
+                woo_id = d.get("woo_id")
+                if "(" in d.get("nombre_real",""):
+                    var_id = woo_id
+                    for c2,d2 in prov.items():
+                        if normalizar(d2.get("nombre_base_proveedor",""))==base and "(" not in d2.get("nombre_real",""):
+                            woo_id=d2.get("woo_id"); break
+                break
+
+        items_pedido.append({"nombre":nombre,"product_id":woo_id,"variation_id":var_id,"quantity":cantidad})
+
+    ship = datos_orden.get("shipping", {})
+    datos_cli = {
+        "first_name": cliente.get("first_name",""),
+        "last_name":  cliente.get("last_name",""),
+        "address_1":  ship.get("address", cliente.get("address","")),
+        "city":       ship.get("city", cliente.get("city","")),
+        "state":      ship.get("province","B"),
+        "postcode":   ship.get("zipcode",""),
+        "phone":      cliente.get("phone",""),
+        "email":      cliente.get("email",""),
+    }
+    nota = "Orden cliente #" + num_orden + (" - RETIRO EN LOCAL" if es_retiro else "")
+
+    sep = chr(10)
+    if hay_problema:
+        lineas_msg.append("")
+        lineas_msg.append("Hay problemas de stock.")
+        lineas_msg.append("Usa /confirmar_pedido " + num_orden + " para proceder igual.")
+        tg("[" + NOMBRE_TIENDA + "] " + sep.join(lineas_msg))
+        db["pedido_pendiente"] = {"num_orden":num_orden,"items":items_pedido,"cliente":datos_cli,"nota":nota}
+        escribir_db(db)
+    else:
+        tg("[" + NOMBRE_TIENDA + "] " + sep.join(lineas_msg))
+        orden_prov = hacer_pedido_proveedor(items_pedido, datos_cli, nota)
+        if orden_prov:
+            tg("[" + NOMBRE_TIENDA + "] Pedido enviado al proveedor. Cliente #" + num_orden + " -> Proveedor #" + orden_prov)
+            db.setdefault("ordenes",{})[num_orden] = {"orden_prov": orden_prov}
+            escribir_db(db)
+        else:
+            tg("[" + NOMBRE_TIENDA + "] ERROR: No pude hacer el pedido #" + num_orden + ". Hacelo manualmente.")
 
 def procesar_cmd(texto):
     global _token, _store_id
@@ -922,7 +1131,7 @@ def procesar_cmd(texto):
             cv   = len(p["variantes"])
             icon = "✅" if p["published"] else "🚫"
             extra = f"({cv} var.)" if cv > 0 else "(sin var.)"
-            lineas.append(f"{icon} *{p['nombre']}* {extra} — ${int(p['precio_base']):,}")
+            lineas.append(icon + " *" + p["nombre"] + "* " + extra + " — $" + str(int(p["precio_base"])) + " (ID:" + str(p["id"]) + ")")
         msg = f"📦 *{len(catalogo)} productos:*\n\n" + "\n".join(lineas)
         if len(catalogo) > 50: msg += f"\n\n_...y {len(catalogo)-50} más_"
         tg(msg)
@@ -1042,17 +1251,16 @@ def procesar_cmd(texto):
         if not prov: tg("Sin datos del proveedor."); return
         idx = construir_indice(prov)
         base_norm, datos_prov = buscar_en_indice(nombre_norm, idx)
-        lineas = [f"*Debug: {nombre}*",""]
+        lineas = ["Debug: " + nombre, ""]
         if datos_prov:
             p_o = precio_obj(datos_prov["precio_base"])
-            lineas += [f"PROVEEDOR: encontrado",
-                       f"  Base: {base_norm}",
-                       f"  Precio base: ${datos_prov['precio_base']:,} → Web: ${p_o:,}",
-                       f"  Stock base: {datos_prov.get('stock_base','?')}",
-                       f"  Variantes prov: {len(datos_prov['variantes'])}"]
-            for vn, vd in list(datos_prov["variantes"].items())[:8]:
-                p_v = precio_obj(vd["precio"])
-                lineas.append(f"    [{vn[:35]}]: ${vd['precio']:,} → ${p_v:,} (stock:{vd.get('stock','?')})")
+            lineas += ["PROVEEDOR: encontrado",
+                       "  Base: " + base_norm,
+                       "  Precio base: $" + str(datos_prov["precio_base"]) + " -> Web: $" + str(p_o),
+                       "  Stock base: " + str(datos_prov.get("stock_base","?")),
+                       "  Variantes prov: " + str(len(datos_prov["variantes"]))]
+            for vn, vd in list(datos_prov["variantes"].items())[:5]:
+                lineas.append("    [" + vn[:35] + "]: $" + str(vd["precio"]) + " st:" + str(vd.get("stock","?")))
         else:
             lineas.append("PROVEEDOR: NO encontrado")
         lineas.append("")
@@ -1060,25 +1268,27 @@ def procesar_cmd(texto):
         prod = next((p for p in catalogo if match(nombre_norm,p["nombre_norm"])),None)
         if prod and datos_prov:
             vars_prov_idx = datos_prov.get("variantes", {})
-            lineas += [f"CATALOGO API: encontrado",
-                       f"  Nombre: {prod['nombre']}",
-                       f"  Variantes API: {len(prod['variantes'])}",
-                       f"  Precio actual: ${int(prod['precio_base']):,}",
-                       f"  Matching variantes:"]
+            lineas += ["CATALOGO API: encontrado",
+                       "  ID: " + str(prod["id"]),
+                       "  Nombre: " + prod["nombre"],
+                       "  Variantes API: " + str(len(prod["variantes"])),
+                       "  Precio actual: $" + str(int(prod["precio_base"])),
+                       "  Matching variantes:"]
             for v in prod["variantes"][:8]:
                 vnom = normalizar(v["nombre"])
                 match_prov = next(((pv,pd) for pv,pd in vars_prov_idx.items() if match(vnom,pv)), None)
                 if match_prov:
                     p_calc = precio_obj(match_prov[1]["precio"])
-                    lineas.append(f"    ✅ {v['nombre'][:30]} → ${p_calc:,}")
+                    lineas.append("    OK " + v["nombre"][:30] + " -> $" + str(p_calc))
                 else:
                     p_fb = precio_obj(datos_prov["precio_base"])
-                    lineas.append(f"    ⚠️ {v['nombre'][:30]} → fallback ${p_fb:,}")
+                    lineas.append("    FB " + v["nombre"][:30] + " -> $" + str(p_fb))
         elif prod:
-            lineas += [f"CATALOGO API: encontrado (sin datos prov para matching)",
-                       f"  Variantes: {len(prod['variantes'])}"]
-            for v in prod["variantes"][:5]:
-                lineas.append(f"    - {v['nombre'] or '(sin nombre)'}: ${int(v['precio']):,}")
+            lineas += ["CATALOGO API: encontrado (sin datos prov)",
+                       "  ID: " + str(prod["id"]),
+                       "  Nombre: " + prod["nombre"],
+                       "  Variantes: " + str(len(prod["variantes"])),
+                       "  Precio actual: $" + str(int(prod["precio_base"]))]
         else:
             lineas.append("CATALOGO API: " + ("NO encontrado" if _token else "sin token"))
         tg("\n".join(lineas))
@@ -1097,6 +1307,27 @@ def procesar_cmd(texto):
             "MARGEN: "         + str(MARGEN),
         ]
         tg("Diagnóstico:\n" + "\n".join(lineas))
+
+    elif cmd[0] == "/confirmar_pedido":
+        partes = texto.split()
+        if len(partes) < 2:
+            tg("Uso: /confirmar_pedido NUMERO_ORDEN"); return
+        num = partes[1]
+        db  = leer_db()
+        pp  = db.get("pedido_pendiente", {})
+        if not pp or str(pp.get("num_orden")) != str(num):
+            tg(f"No hay pedido pendiente #{num}."); return
+        tg(f"🔄 Confirmando pedido #{num} al proveedor...")
+        orden_prov = hacer_pedido_proveedor(
+            pp["items"], pp["cliente"], pp.get("nota","")
+        )
+        if orden_prov:
+            tg(f"✅ Pedido #{num} enviado al proveedor como #{orden_prov}")
+            db.pop("pedido_pendiente", None)
+            db.setdefault("ordenes", {})[str(num)] = {"orden_prov": orden_prov}
+            escribir_db(db)
+        else:
+            tg(f"❌ No pude hacer el pedido #{num}. Intentá manualmente.")
 
     else:
         tg("❓ Comando no reconocido. Mandá `/ayuda`.")
