@@ -396,24 +396,35 @@ def run_fix_envio_gratis():
     if not catalogo:
         tg("❌ No pude obtener el catálogo."); return
 
-    activados  = []
+    db   = leer_db()
+    prov = db.get("productos_proveedor", {})
+    sinc = db.get("sincronizados", {})
+    if not prov:
+        tg("\u26a0\ufe0f Sin datos del proveedor. Esperá un ciclo primero."); return
+    idx = construir_indice(prov)
+
+    activados    = []
     desactivados = []
     pesados_skip = []
 
     for prod in catalogo:
         pid    = prod["id"]
-        precio = prod["precio_base"]
         nombre = prod["nombre"]
 
         if pid in PRODUCTOS_PESADOS_IDS:
             pesados_skip.append(f"• *{nombre}* (pesado, sin tocar)")
             continue
 
-        # Usar precio máximo entre variantes (o precio base si no tiene)
-        if prod["variantes"]:
-            precio_max = max(v["precio"] for v in prod["variantes"])
+        # Usar precio calculado desde el proveedor (no el del catálogo que puede ser 0)
+        _, datos_prov = buscar_en_indice(prod["nombre_norm"], idx)
+        if datos_prov:
+            if datos_prov.get("variantes"):
+                precio_max = max(precio_obj(vd["precio"]) for vd in datos_prov["variantes"].values())
+            else:
+                precio_max = precio_obj(datos_prov["precio_base"])
         else:
-            precio_max = precio
+            # Sin datos del proveedor: usar precio guardado en sincronizados
+            precio_max = sinc.get(nombre, {}).get("precio", 0)
 
         if precio_max >= ENVIO_GRATIS_MIN:
             if set_envio_gratis(pid, True):
