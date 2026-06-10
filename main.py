@@ -470,14 +470,19 @@ def _stock_real(p):
     return p.get("add_to_cart",{}).get("maximum") or 0
 
 def scrapear_proveedor():
-    productos = {}; pagina = 1
+    productos = {}; pagina = 1; reintentos_202 = 0
     print("📥 API proveedor...")
     while True:
         r = _prov_get(PROV_API, params={"per_page":100,"page":pagina})
         if not r or r.status_code not in (200, 201, 202):
             print(f"❌ Proveedor HTTP {r.status_code if r else 'None'}"); break
         if r.status_code == 202:
-            print(f"⚠️ Proveedor HTTP 202 - body vacío, reintentando en 10s...")
+            reintentos_202 += 1
+            if reintentos_202 >= 5:
+                print(f"❌ Proveedor HTTP 202 x{reintentos_202} - abortando scrape")
+                tg(f"⚠️ *{NOMBRE_TIENDA}* — Proveedor no responde (HTTP 202 x5). Reintentará en el próximo ciclo.")
+                break
+            print(f"⚠️ Proveedor HTTP 202 ({reintentos_202}/5) - reintentando en 10s...")
             time.sleep(10)
             continue
         if not r.text or not r.text.strip():
