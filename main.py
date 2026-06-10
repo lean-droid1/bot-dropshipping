@@ -405,8 +405,18 @@ def scrapear_proveedor():
         if not r or r.status_code not in (200, 201, 202):
             print(f"❌ Proveedor HTTP {r.status_code if r else 'None'}"); break
         if r.status_code == 202:
-            print(f"⚠️ Proveedor HTTP 202 - intentando parsear igual")
-        lote = r.json()
+            print(f"⚠️ Proveedor HTTP 202 - body vacío, reintentando en 10s...")
+            time.sleep(10)
+            continue
+        if not r.text or not r.text.strip():
+            print(f"⚠️ Proveedor respuesta vacía en pág {pagina}, reintentando...")
+            time.sleep(5)
+            continue
+        try:
+            lote = r.json()
+        except Exception as e:
+            print(f"⚠️ Proveedor JSON inválido pág {pagina}: {e}")
+            break
         if not lote: break
 
         for p in lote:
@@ -1429,7 +1439,15 @@ if __name__ == "__main__":
            f"Mandá `/debug_env` para diagnosticar.")
 
     threading.Thread(target=escuchar_telegram, daemon=True).start()
-    ciclo_monitoreo()
+    try:
+        ciclo_monitoreo()
+    except Exception as e:
+        print(f"⚠️ Error en ciclo inicial: {e}")
+        tg(f"⚠️ *{_nt('Error en ciclo inicial')}*\n`{e}`\nEl bot sigue activo, reintentará en {CICLO_MINUTOS} min.")
     while True:
         time.sleep(CICLO_MINUTOS * 60)
-        ciclo_monitoreo()
+        try:
+            ciclo_monitoreo()
+        except Exception as e:
+            print(f"⚠️ Error en ciclo: {e}")
+            tg(f"⚠️ *{_nt('Error en ciclo')}*\n`{e}`\nReintentando en {CICLO_MINUTOS} min.")
