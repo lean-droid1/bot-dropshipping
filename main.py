@@ -33,6 +33,9 @@ PRODUCTOS_PESADOS_IDS = {3643182, 3643163, 3643153, 3643173}
 
 CICLO_MINUTOS    = 15   # Cada cuántos minutos monitorea
 
+# Categorías del proveedor a excluir siempre (no nos interesan)
+CATEGORIAS_EXCLUIDAS = {'pantallas', 'modulos', 'baterias', 'bateria'}
+
 PALABRAS_INTERES = [
     'ma ant','amaoe','2uul','goot wick','mijing','louwei','rf4','jakemy',
     'kailiwei','kslid','aifen','sugon','jcid','jc','v1','v1s','v1se',
@@ -148,6 +151,8 @@ AYUDA = r"""📋 *Comandos disponibles:*
 
 *Envío gratis*
 /fix\_envio\_gratis — Aplica envío gratis a todos los productos ≥ $100.000 (excepto mesas)
+/productos\_sin\_cargar — Productos del proveedor que no tenés en tu tienda (filtrado)
+/productos\_sin\_cargar todo — Ídem pero sin filtro (excluye solo Pantallas/Baterías)
 
 *Ofertas*
 /aplicar\_ofertas todos — Aplica todas las ofertas pendientes del proveedor
@@ -1266,6 +1271,76 @@ def procesar_orden_pagada(datos_orden):
 # ══════════════════════════════════════════════════════════════════════════════
 # COMANDOS TELEGRAM
 # ══════════════════════════════════════════════════════════════════════════════
+def run_productos_sin_cargar(modo_todo=False):
+    """
+    Muestra productos del proveedor que no están cargados en la tienda.
+    Excluye siempre: Pantallas/Modulos y Baterias.
+    modo_todo=False → filtra por PALABRAS_INTERES
+    modo_todo=True  → muestra todo (menos categorías excluidas)
+    """
+    if not _token:
+        tg("❌ Necesito el token primero."); return
+
+    tg(f"🔍 *{_nt('Buscando productos del proveedor sin cargar...')}*")
+
+    # Scrapear proveedor fresco con categorías
+    productos_prov = {}; pagina = 1
+    while True:
+        r = _prov_get(PROV_API, params={"per_page":100,"page":pagina})
+        if not r or r.status_code not in (200,201,202): break
+        lote = r.json()
+        if not lote: break
+        for p in lote:
+            nombre = p.get("name","").strip()
+            if not nombre or len(nombre) < 4: continue
+            # Chequear categorías excluidas
+            cats = [c.get("slug","").lower() + " " + c.get("name","").lower()
+                    for c in p.get("categories",[])]
+            cats_str = " ".join(cats)
+            if any(exc in cats_str for exc in CATEGORIAS_EXCLUIDAS):
+                continue
+            precio = int(p.get("prices",{}).get("price",0)) // 100
+            if precio == 0: continue
+            stock = p.get("add_to_cart",{}).get("maximum") or 0
+            productos_prov[normalizar(nombre)] = {
+                "nombre_real": nombre,
+                "precio": precio,
+                "precio_sug": precio_obj(precio),
+                "stock": stock,
+            }
+        if len(lote) < 100: break
+        pagina += 1; time.sleep(0.5)
+
+    catalogo = obtener_catalogo()
+    cat_norms = {p["nombre_norm"] for p in catalogo}
+
+    # Filtrar los que no están en mi tienda
+    sin_cargar = []
+    for norm, datos in productos_prov.items():
+        en_tienda = any(match(norm, cn) for cn in cat_norms)
+        if en_tienda: continue
+        if not modo_todo:
+            if not any(w in norm for w in PALABRAS_INTERES): continue
+        sin_cargar.append(datos)
+
+    if not sin_cargar:
+        modo_txt = "en toda la lista" if modo_todo else "con palabras de interés"
+        tg(f"ℹ️ No hay productos sin cargar {modo_txt}."); return
+
+    modo_txt = "🗂 *Todos* (sin Pantallas/Baterías)" if modo_todo else "🎯 *Filtrado por palabras de interés*"
+    header = f"📦 *{_nt('Productos sin cargar en tu tienda')}*\n{modo_txt}\nTotal: *{len(sin_cargar)}*"
+    tg(header)
+
+    lineas = []
+    for d in sin_cargar:
+        stock_txt = f"Stock: {d['stock']}" if d['stock'] < 9999 else "Stock: ∞"
+        linea = f"• *{d['nombre_real']}*\n  Costo: ${d['precio']:,} → Sugerido: ${d['precio_sug']:,} | {stock_txt}"
+        lineas.append(linea)
+
+    for i in range(0, len(lineas), 20):
+        tg("\n\n".join(lineas[i:i+20]))
+
+
 def procesar_cmd(texto):
     global _token, _store_id
     texto = texto.strip()
@@ -1383,6 +1458,11 @@ def procesar_cmd(texto):
     elif cmd[0] == "/ciclo":
         tg(f"🔄 *{_nt('Ciclo manual iniciado')}*")
         threading.Thread(target=ciclo_monitoreo, daemon=True).start()
+
+    elif cmd[0] == "/productos_sin_cargar":
+        if not _token: tg("❌ Necesito el token primero."); return
+        modo_todo = len(cmd) > 1 and cmd[1] == "todo"
+        threading.Thread(target=run_productos_sin_cargar, args=(modo_todo,), daemon=True).start()
 
     elif cmd[0] == "/aplicar_ofertas":
         db = leer_db()
