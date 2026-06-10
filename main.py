@@ -492,15 +492,13 @@ def scrapear_proveedor():
             nombre_base = normalizar(nombre_orig)
             tipo        = p.get("type","simple")
             woo_id      = p.get("id")
-            precio_reg  = _precio_real(p)
-            precio_sale = int(p.get("prices",{}).get("sale_price",0)) // 100
-            en_oferta   = p.get("on_sale", False) and 0 < precio_sale < precio_reg
-            precio_reg  = _precio_real(p)
-            precio_sale = int(p.get("prices",{}).get("sale_price",0)) // 100
-            in_stock    = p.get("is_in_stock", False)
-            stock_base  = _stock_real(p)
+            precio_pub      = _precio_real(p)   # precio activo (rebajado si hay oferta)
+            precio_original = int(p.get("prices",{}).get("regular_price",0)) // 100
+            en_oferta       = p.get("on_sale", False) and 0 < precio_pub < precio_original
+            in_stock        = p.get("is_in_stock", False)
+            stock_base      = _stock_real(p)
 
-            if precio_reg == 0: continue
+            if precio_pub == 0: continue
 
             if tipo == "variable":
                 variaciones = p.get("variations", [])
@@ -510,13 +508,13 @@ def scrapear_proveedor():
                     rv = _prov_get(f"{PROV_API}/{vid}")
                     if not rv or rv.status_code != 200: continue
                     vd = rv.json()
-                    v_var_str = vd.get("variation","")
-                    v_nombre  = v_var_str.split(":",1)[1].strip() if ":" in v_var_str else v_var_str
-                    v_precio  = _precio_real(vd)
-                    v_stock   = _stock_real(vd)
-                    v_sale    = int(vd.get("prices",{}).get("sale_price",0)) // 100
-                    v_oferta  = vd.get("on_sale", False) and 0 < v_sale < _precio_real(vd)
-                    v_instock = vd.get("is_in_stock", False)
+                    v_var_str   = vd.get("variation","")
+                    v_nombre    = v_var_str.split(":",1)[1].strip() if ":" in v_var_str else v_var_str
+                    v_precio    = _precio_real(vd)
+                    v_stock     = _stock_real(vd)
+                    v_original  = int(vd.get("prices",{}).get("regular_price",0)) // 100
+                    v_oferta    = vd.get("on_sale", False) and 0 < v_precio < v_original
+                    v_instock   = vd.get("is_in_stock", False)
                     if v_precio == 0: continue
 
                     clave = normalizar(f"{nombre_orig} ({v_nombre})")
@@ -524,7 +522,7 @@ def scrapear_proveedor():
                         "nombre_real":           f"{nombre_orig} ({v_nombre})",
                         "nombre_base_proveedor": nombre_base,
                         "precio":                v_precio,
-                        "precio_anterior":       _precio_real(vd) if v_oferta else 0,
+                        "precio_anterior":       v_original if v_oferta else 0,
                         "en_oferta":             v_oferta,
                         "stock":                 v_stock if v_instock else 0,
                         "woo_id":                vid,
@@ -534,8 +532,8 @@ def scrapear_proveedor():
                 productos[nombre_base] = {
                     "nombre_real":           nombre_orig,
                     "nombre_base_proveedor": nombre_base,
-                    "precio":                precio_reg,
-                    "precio_anterior":       precio_reg if en_oferta else 0,
+                    "precio":                precio_pub,
+                    "precio_anterior":       precio_original if en_oferta else 0,
                     "en_oferta":             en_oferta,
                     "stock":                 stock_base if in_stock else 0,
                     "woo_id":                woo_id,
@@ -595,7 +593,8 @@ def construir_indice(prov):
     for clave, d in prov.items():
         base = normalizar(d.get("nombre_base_proveedor", clave))
         if base not in idx:
-            idx[base] = {"precio_base":d["precio"], "stock_base":d.get("stock",0),
+            idx[base] = {"precio_base":d["precio"], "precio_anterior":d.get("precio_anterior",0),
+                         "stock_base":d.get("stock",0),
                          "en_oferta":d.get("en_oferta",False), "variantes":{}}
 
         nombre_real = d.get("nombre_real", clave)
@@ -604,11 +603,16 @@ def construir_indice(prov):
             var_norm = normalizar(var_part)
             if var_norm:
                 idx[base]["variantes"][var_norm] = {
-                    "precio": d["precio"], "stock": d.get("stock",0)
+                    "precio":          d["precio"],
+                    "stock":           d.get("stock",0),
+                    "en_oferta":       d.get("en_oferta",False),
+                    "precio_anterior": d.get("precio_anterior",0),
                 }
         else:
             if d["precio"] < idx[base]["precio_base"]:
-                idx[base]["precio_base"] = d["precio"]
+                idx[base]["precio_base"]    = d["precio"]
+                idx[base]["en_oferta"]      = d.get("en_oferta",False)
+                idx[base]["precio_anterior"]= d.get("precio_anterior",0)
             if d.get("stock",0) > idx[base]["stock_base"]:
                 idx[base]["stock_base"] = d.get("stock",0)
     return idx
@@ -622,8 +626,15 @@ def buscar_en_indice(nombre_norm, idx):
 # SINCRONIZACIÓN DE PRECIOS
 # ══════════════════════════════════════════════════════════════════════════════
 def sincronizar_precios(prod, datos_prov):
-    pid       = prod["id"]
-    variantes = prod["variantes"]
+    """
+    Actualiza precios de todas las variantes (o el producto si no tiene).
+    Si el proveedor tiene oferta activa, usa promotional_price para mostrar
+    el precio original tachado junto al precio de oferta.
+    """
+    pid            = prod["id"]
+    variantes      = prod["variantes"]
+    en_oferta      = datos_prov.get("en_oferta", False)
+    precio_anterior = datos_prov.get("precio_anterior", 0)
 
     if not variantes:
         p = precio_obj(datos_prov["precio_base"])
@@ -631,7 +642,22 @@ def sincronizar_precios(prod, datos_prov):
         if precio_actual > 0 and p > 0 and (p / precio_actual) < 0.40:
             print("BLOQUEADO baja >60%: " + prod.get("nombre","?")[:40])
             return False, 0, 0
-        ok = set_precio_producto(pid, p)
+
+        if en_oferta and precio_anterior > 0:
+            # Precio original tachado → precio oferta activo
+            p_orig = precio_obj(precio_anterior)
+            r = _put(f"{API_BASE}/products/{pid}", {
+                "price": str(int(p_orig)),
+                "promotional_price": str(int(p))
+            })
+        else:
+            # Sin oferta: precio normal, borrar precio promocional si había
+            r = _put(f"{API_BASE}/products/{pid}", {
+                "price": str(int(p)),
+                "promotional_price": None
+            })
+        ok = r and r.status_code in (200, 201)
+        if not ok: print(f"  ⚠️ precio producto {pid}: HTTP {r.status_code if r else 'None'}")
         time.sleep(0.4)
         if ok: _actualizar_envio_gratis_prod(prod, p)
         return ok, p, p
@@ -639,27 +665,42 @@ def sincronizar_precios(prod, datos_prov):
     vars_prov = datos_prov.get("variantes", {})
     precios   = {}
     for v in variantes:
-        costo = None
+        costo = None; costo_ant = 0; v_oferta = False
         vnom = normalizar(v["nombre"])
         for pv_norm, pv_datos in vars_prov.items():
             if match(vnom, pv_norm):
-                costo = pv_datos["precio"]; break
+                costo     = pv_datos["precio"]
+                costo_ant = pv_datos.get("precio_anterior", 0)
+                v_oferta  = pv_datos.get("en_oferta", False)
+                break
         if costo is None:
-            costo = datos_prov["precio_base"]
-        precios[v["id"]] = precio_obj(costo)
+            costo     = datos_prov["precio_base"]
+            costo_ant = precio_anterior
+            v_oferta  = en_oferta
+        precios[v["id"]] = {
+            "precio":          precio_obj(costo),
+            "precio_anterior": precio_obj(costo_ant) if costo_ant else 0,
+            "en_oferta":       v_oferta
+        }
 
     exitos = 0
-    for vid, p in precios.items():
-        if set_precio_variante(vid, p): exitos += 1
+    for vid, pd in precios.items():
+        p = pd["precio"]
+        if pd["en_oferta"] and pd["precio_anterior"] > 0:
+            data = {"price": str(int(pd["precio_anterior"])), "promotional_price": str(int(p))}
+        else:
+            data = {"price": str(int(p)), "promotional_price": None}
+        r = _put(f"{API_BASE}/variants/{vid}", data)
+        if r and r.status_code in (200, 201): exitos += 1
+        else: print(f"  ⚠️ precio variante {vid}: HTTP {r.status_code if r else 'None'}")
         time.sleep(0.4)
 
     if not precios or exitos == 0: return False, 0, 0
 
-    # Actualizar envío gratis usando el precio mínimo de las variantes
-    precio_min_variante = min(precios.values())
-    _actualizar_envio_gratis_prod(prod, precio_min_variante)
-
-    return True, min(precios.values()), max(precios.values())
+    precio_min = min(pd["precio"] for pd in precios.values())
+    precio_max = max(pd["precio"] for pd in precios.values())
+    _actualizar_envio_gratis_prod(prod, precio_min)
+    return True, precio_min, precio_max
 
 # ══════════════════════════════════════════════════════════════════════════════
 # SINCRONIZACIÓN DE STOCK REAL
