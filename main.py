@@ -96,6 +96,8 @@ def leer_db():
                 d.setdefault("pedidos_procesados", [])
                 d.setdefault("ofertas_pendientes", {})
                 d.setdefault("ordenes", {})
+                d.setdefault("variantes_cache", {})
+                d.setdefault("pids_refrescar", [])
                 return d
         except Exception: pass
     return {"productos_proveedor":{}, "sincronizados":{}, "pedidos_procesados":[], "ofertas_pendientes":{}, "ordenes":{}}
@@ -222,11 +224,40 @@ def _put(url, data):
 _cat_cache = None
 _cat_ts    = 0
 
-def obtener_catalogo(forzar=False):
+def _fetch_variantes(pid):
+    """Descarga variantes de un producto desde la API. Devuelve lista o []."""
+    r_var = _get(f"{API_BASE}/products/{pid}/variants", params={"per_page":200})
+    variantes = []
+    if r_var and r_var.status_code == 200:
+        dv = r_var.json()
+        lista = dv.get("results", dv) if isinstance(dv,dict) else dv
+        if isinstance(lista, list):
+            for v in lista:
+                vid = v.get("id")
+                if not vid: continue
+                vals = v.get("values", [])
+                vnom = " ".join(str(x.get("es") or x.get("en","")).strip() for x in vals).strip()
+                variantes.append({"id":vid,"nombre":vnom,"precio":float(v.get("price",0) or 0)})
+    return variantes
+
+def obtener_catalogo(forzar=False, pids_refrescar=None):
+    """
+    Descarga el catalogo con cache inteligente de variantes en DB.
+    - Primera vez / producto nuevo: descarga variantes y las guarda en DB.
+    - Ciclos siguientes: usa las variantes cacheadas.
+    - pids_refrescar: set de IDs cuyas variantes hay que re-pedir.
+    - forzar=True: refresca lista de productos pero usa cache de variantes.
+    """
     global _cat_cache, _cat_ts
     if not forzar and _cat_cache and (time.time()-_cat_ts) < 300:
         return _cat_cache
     if not _token: return []
+
+    if pids_refrescar is None:
+        pids_refrescar = set()
+
+    db = leer_db()
+    var_cache = db.get("variantes_cache", {})  # {str(pid): [lista de variantes]}
 
     print("📥 Descargando catálogo Tienda Negocio...")
     raw = []; pagina = 1
@@ -241,10 +272,13 @@ def obtener_catalogo(forzar=False):
         print(f"   Pág {pagina}: {len(lote)} items (total: {len(raw)})")
         if not (data.get("pagination",{}).get("next_page") if isinstance(data,dict) else None): break
         pagina += 1; time.sleep(0.3)
-    print(f"   {len(raw)} productos encontrados. Obteniendo variantes...")
+    print(f"   {len(raw)} productos encontrados.")
 
     catalogo = []
-    for i, p in enumerate(raw):
+    nuevas_en_cache = 0
+    refrescadas = 0
+
+    for p in raw:
         pid = p.get("id")
         nombre_raw = p.get("name", {})
         nombre = (nombre_raw.get("es") or nombre_raw.get("en") or
@@ -252,18 +286,18 @@ def obtener_catalogo(forzar=False):
         nombre = nombre.strip()
         if not nombre or not pid: continue
 
-        r_var = _get(f"{API_BASE}/products/{pid}/variants", params={"per_page":200})
-        variantes = []
-        if r_var and r_var.status_code == 200:
-            dv = r_var.json()
-            lista = dv.get("results", dv) if isinstance(dv,dict) else dv
-            if isinstance(lista, list):
-                for v in lista:
-                    vid = v.get("id")
-                    if not vid: continue
-                    vals = v.get("values", [])
-                    vnom = " ".join(str(x.get("es") or x.get("en","")).strip() for x in vals).strip()
-                    variantes.append({"id":vid,"nombre":vnom,"precio":float(v.get("price",0) or 0)})
+        pid_str = str(pid)
+        es_nuevo       = pid_str not in var_cache
+        debe_refrescar = pid in pids_refrescar
+
+        if es_nuevo or debe_refrescar:
+            variantes = _fetch_variantes(pid)
+            var_cache[pid_str] = variantes
+            time.sleep(0.4)
+            if es_nuevo: nuevas_en_cache += 1
+            else:        refrescadas += 1
+        else:
+            variantes = var_cache[pid_str]
 
         precio_base = variantes[0]["precio"] if variantes else float(p.get("price",0) or 0)
         catalogo.append({
@@ -271,10 +305,21 @@ def obtener_catalogo(forzar=False):
             "precio_base":precio_base, "tiene_variantes":len(variantes)>0,
             "variantes":variantes, "published":p.get("published",True)
         })
-        if (i+1) % 50 == 0: print(f"   Variantes: [{i+1}/{len(raw)}]")
-        time.sleep(0.4)
 
-    print(f"   ✅ Catálogo: {len(catalogo)} productos")
+    # Limpiar del cache productos que ya no existen
+    pids_actuales = {str(p.get("id")) for p in raw if p.get("id")}
+    eliminados = [k for k in var_cache if k not in pids_actuales]
+    for k in eliminados: del var_cache[k]
+
+    db["variantes_cache"] = var_cache
+    escribir_db(db)
+
+    info = f"   ✅ Catálogo: {len(catalogo)} productos"
+    if nuevas_en_cache: info += f" | {nuevas_en_cache} nuevos cacheados"
+    if refrescadas:     info += f" | {refrescadas} variantes refrescadas"
+    if eliminados:      info += f" | {len(eliminados)} eliminados del cache"
+    print(info)
+
     _cat_cache = catalogo; _cat_ts = time.time()
     return catalogo
 
@@ -326,9 +371,14 @@ def _debe_tener_envio_gratis(pid, precio):
     return precio >= ENVIO_GRATIS_MIN
 
 def _actualizar_envio_gratis_prod(prod, precio):
-    """Activa/desactiva envío gratis según precio. Excluye productos pesados."""
+    """Activa/desactiva envío gratis según precio. Excluye productos pesados.
+    Usa el precio máximo entre variantes para no desactivar por una variante barata."""
     pid = prod["id"]
-    activo = _debe_tener_envio_gratis(pid, precio)
+    if prod.get("variantes"):
+        precio_max = max(v["precio"] for v in prod["variantes"])
+    else:
+        precio_max = precio
+    activo = _debe_tener_envio_gratis(pid, precio_max)
     set_envio_gratis(pid, activo)
 
 
@@ -359,12 +409,18 @@ def run_fix_envio_gratis():
             pesados_skip.append(f"• *{nombre}* (pesado, sin tocar)")
             continue
 
-        if precio >= ENVIO_GRATIS_MIN:
+        # Usar precio máximo entre variantes (o precio base si no tiene)
+        if prod["variantes"]:
+            precio_max = max(v["precio"] for v in prod["variantes"])
+        else:
+            precio_max = precio
+
+        if precio_max >= ENVIO_GRATIS_MIN:
             if set_envio_gratis(pid, True):
-                activados.append(f"• *{nombre}* — ${int(precio):,}")
+                activados.append(f"• *{nombre}* — ${int(precio_max):,}")
         else:
             if set_envio_gratis(pid, False):
-                desactivados.append(f"• *{nombre}* — ${int(precio):,}")
+                desactivados.append(f"• *{nombre}* — ${int(precio_max):,}")
         time.sleep(0.5)
 
     resumen = (f"✅ *{_nt('Fix envío gratis terminado')}*\n\n"
@@ -832,8 +888,13 @@ def ciclo_monitoreo():
         print("⚠️ Proveedor 0 productos. Abortando."); return
 
     prov_consolidado = {**prov_ant, **prov_nuevo}
-    catalogo = obtener_catalogo() if _token else []
     idx      = construir_indice(prov_nuevo)
+
+    # Leer pids marcados para refrescar variantes en este ciclo
+    pids_refrescar = set(db.get("pids_refrescar", []))
+    db["pids_refrescar"] = []  # Limpiar para el proximo ciclo
+
+    catalogo = obtener_catalogo(pids_refrescar=pids_refrescar) if _token else []
 
     bloque_nuevos = ""; bloque_recuperados = ""
     lineas_precios    = []
@@ -917,6 +978,10 @@ def ciclo_monitoreo():
                     ok, p_min, p_max = sincronizar_precios(prod, datos_prov)
                     if ok:
                         sinc.setdefault(nombre_real, {})["precio"] = p_min
+                        # Marcar para refrescar variantes en el proximo ciclo
+                        db.setdefault("pids_refrescar", [])
+                        if prod["tiene_variantes"] and prod["id"] not in db["pids_refrescar"]:
+                            db["pids_refrescar"].append(prod["id"])
                         if int(precio_web) != p_min:
                             rango = str(p_min) if p_min == p_max else str(p_min) + "-" + str(p_max)
                             nvar = len(prod["variantes"])
@@ -927,8 +992,6 @@ def ciclo_monitoreo():
                             lineas_precios.append(linea)
             else:
                 # Precio no cambió → igual verificar envío gratis por si no estaba aplicado
-                # Esto cubre el caso de productos que ya tenían precio correcto
-                # pero nunca tuvieron el cartel de envío gratis activado
                 _actualizar_envio_gratis_prod(prod, p_obj_calc)
 
             sincronizar_stock(prod, datos_prov, sinc)
