@@ -659,7 +659,7 @@ def sincronizar_precios(prod, datos_prov):
             # Sin oferta: precio normal, borrar precio promocional si había
             r = _put(f"{API_BASE}/products/{pid}", {
                 "price": str(int(p)),
-                "promotional_price": None
+                "promotional_price": ""
             })
         ok = r and r.status_code in (200, 201)
         if not ok: print(f"  ⚠️ precio producto {pid}: HTTP {r.status_code if r else 'None'}")
@@ -694,7 +694,7 @@ def sincronizar_precios(prod, datos_prov):
         if pd["en_oferta"] and pd["precio_anterior"] > 0:
             data = {"price": str(int(pd["precio_anterior"])), "promotional_price": str(int(p))}
         else:
-            data = {"price": str(int(p)), "promotional_price": None}
+            data = {"price": str(int(p)), "promotional_price": ""}
         r = _put(f"{API_BASE}/variants/{vid}", data)
         if r and r.status_code in (200, 201): exitos += 1
         else: print(f"  ⚠️ precio variante {vid}: HTTP {r.status_code if r else 'None'}")
