@@ -565,7 +565,8 @@ def match(n1, n2):
     if not w1 or not w2: return False
     criticas = {'bateria','battery','bat','face','maneral','mango','zocalo',
                 'board','mini','plus','max','kit','ultra','xl',
-                'lente','microscopio','trinocular','fuente','estacion','silla','cabina'}
+                'lente','microscopio','trinocular','fuente','estacion','silla','cabina',
+                'cam','4k','camara','wifi','pro','lite','set'}
     for c in criticas:
         if (c in w1) != (c in w2): return False
     n1s = {w for w in w1 if any(c.isdigit() for c in w)}
