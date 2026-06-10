@@ -721,6 +721,8 @@ def run_sync_total():
     catalogo = obtener_catalogo(forzar=True)
     if not catalogo:
         tg("❌ No pude obtener el catálogo de la API."); return
+    db = leer_db()  # Re-leer para no pisar variantes_cache
+    sinc = db.get("sincronizados", sinc)
 
     idx   = construir_indice(prov)
     total = len(catalogo)
@@ -906,6 +908,8 @@ def ciclo_monitoreo():
     db["pids_refrescar"] = []  # Limpiar para el proximo ciclo
 
     catalogo = obtener_catalogo(pids_refrescar=pids_refrescar) if _token else []
+    db = leer_db()  # Re-leer para no pisar variantes_cache guardado por obtener_catalogo
+    sinc = db.get("sincronizados", sinc)
 
     bloque_nuevos = ""; bloque_recuperados = ""
     lineas_precios    = []
