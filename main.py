@@ -1591,12 +1591,14 @@ def procesar_cmd(texto):
             try:
                 r = requests.post(f"{API_BASE}/webhooks", headers=_h(),
                     json={"event": evento, "url": f"{WEBHOOK_BASE_URL}/webhook"}, timeout=30)
-                if r and r.status_code in (200, 201):
+                if r is not None and r.status_code in (200, 201):
                     resultados.append(f"✅ `{evento}`")
                 else:
-                    resultados.append(f"❌ `{evento}` — HTTP {r.status_code if r else 'None'}: {r.text[:80] if r else ''}")
+                    codigo = r.status_code if r is not None else "Sin respuesta"
+                    detalle = r.text[:100] if r is not None else ""
+                    resultados.append(f"❌ `{evento}` — HTTP {codigo}: {detalle}")
             except Exception as e:
-                resultados.append(f"❌ `{evento}` — {e}")
+                resultados.append(f"❌ `{evento}` — Error: {e}")
         tg("*Webhooks:*\n" + "\n".join(resultados))
 
     elif cmd[0] == "/ver_webhooks":
