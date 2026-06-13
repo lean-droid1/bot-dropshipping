@@ -3,6 +3,12 @@ Bot de Dropshipping — Tienda Negocio / RXZ Web
 Versión limpia con API WooCommerce del proveedor.
 """
 import os, time, json, re, io, threading, imaplib, email
+try:
+    from flask import Flask, request, jsonify
+    FLASK_OK = True
+except ImportError:
+    FLASK_OK = False
+    print('⚠️ Flask no instalado — webhooks desactivados')
 from email.header import decode_header
 from datetime import datetime, timedelta
 import requests
@@ -58,7 +64,8 @@ CLIENT_SECRET  = _e("CLIENT_SECRET")
 NOMBRE_TIENDA  = _e("NOMBRE_TIENDA") or "🧪 PRUEBA"
 
 # ── Compras automáticas al proveedor ─────────────────────────────────────────
-PROV_USER      = _e("PROV_USER")
+PROV_USER          = _e("PROV_USER")
+WEBHOOK_BASE_URL   = _e("WEBHOOK_BASE_URL")
 PROV_PASS      = _e("PROV_PASS")
 CUIT_PROVEEDOR = _e("CUIT_PROVEEDOR")
 PROV_LOGIN_URL = "https://rxzweb.com/wp-login.php"
@@ -141,6 +148,9 @@ AYUDA = r"""📋 *Comandos disponibles:*
 *Sincronización*
 /sync\_total — Sincroniza precios y stock de todos los productos
 /ciclo — Dispara un ciclo de monitoreo manualmente
+/registrar\_webhooks — Registra webhooks en Tienda Nube para notificaciones instantáneas
+/ver\_webhooks — Muestra los webhooks activos
+/borrar\_webhook ID — Elimina un webhook por ID
 
 *Productos*
 /listar — Lista los primeros 50 productos del catálogo
@@ -1346,6 +1356,112 @@ def run_productos_sin_cargar(modo_todo=False):
         tg("\n\n".join(lineas[i:i+20]))
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# WEBHOOK SERVER — Recibe eventos de Tienda Nube en tiempo real
+# ══════════════════════════════════════════════════════════════════════════════
+if FLASK_OK:
+    flask_app = Flask(__name__)
+
+    @flask_app.route("/webhook", methods=["POST"])
+    def recibir_webhook():
+        try:
+            data = request.get_json(silent=True) or {}
+            evento   = data.get("event", "")
+            orden_id = data.get("id")
+            print(f"📨 Webhook: {evento} id={orden_id}")
+            if orden_id:
+                if evento == "order/created":
+                    threading.Thread(target=procesar_webhook_pedido_nuevo, args=(orden_id,), daemon=True).start()
+                elif evento == "order/paid":
+                    threading.Thread(target=procesar_webhook_pedido_pagado, args=(orden_id,), daemon=True).start()
+        except Exception as e:
+            print(f"❌ Webhook error: {e}")
+        return jsonify({"status": "ok"}), 200
+
+    @flask_app.route("/health", methods=["GET"])
+    def health():
+        return jsonify({"status": "ok", "tienda": NOMBRE_TIENDA}), 200
+
+    def run_flask():
+        port = int(os.environ.get("PORT", 8080))
+        print(f"🌐 Webhook server en puerto {port}")
+        flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
+
+
+def obtener_orden(orden_id):
+    """Obtiene datos completos de una orden desde la API de Tienda Nube."""
+    r = _get(f"{API_BASE}/orders/{orden_id}")
+    if r and r.status_code == 200:
+        return r.json()
+    print(f"❌ No pude obtener orden {orden_id}: HTTP {r.status_code if r else 'None'}")
+    return None
+
+
+def procesar_webhook_pedido_nuevo(orden_id):
+    """
+    Webhook order/created: notifica al instante con items y chequeo de stock.
+    Reemplaza la detección por Gmail para pedidos nuevos.
+    """
+    time.sleep(1)  # Espera breve para que TN termine de guardar
+    orden = obtener_orden(orden_id)
+    if not orden:
+        tg("⚠️ *" + _nt('Nuevo pedido') + f"* recibido pero no pude obtener detalles (ID: {orden_id})")
+        return
+
+    num      = str(orden.get("number", orden_id))
+    productos = orden.get("products", [])
+    total    = orden.get("total", "0")
+    pago_st  = orden.get("payment_status", "?")
+    envio    = orden.get("shipping", {})
+    metodo   = envio.get("pickup_type", "") or envio.get("method", "")
+
+    db   = leer_db()
+    prov = db.get("productos_proveedor", {})
+
+    msg = "🛒 *" + _nt('¡Nuevo Pedido #' + num + '!') + "*\n\n"
+    msg += f"💰 Total: *${float(total or 0):,.0f}*\n"
+    msg += f"💳 Pago: *{pago_st}*\n"
+    if metodo:
+        msg += f"📦 Envío: *{metodo}*\n"
+    msg += "\n"
+
+    if prov:
+        idx = construir_indice(prov)
+        for item in productos:
+            nombre   = item.get("name", "?")
+            cantidad = item.get("quantity", 1)
+            nn       = normalizar(nombre)
+            _, dp    = buscar_en_indice(nn, idx)
+            if dp:
+                stock = dp.get("stock_base", 0)
+                icono = "⚠️" if stock < cantidad else "✅"
+                stock_txt = f" (stock: {stock})" if stock < cantidad else ""
+                msg += f"{icono} *{nombre}* x{cantidad}{stock_txt}\n"
+            else:
+                msg += f"❓ *{nombre}* x{cantidad}\n"
+    else:
+        for item in productos:
+            msg += f"• *{item.get('name','?')}* x{item.get('quantity',1)}\n"
+
+    tg(msg)
+
+
+def procesar_webhook_pedido_pagado(orden_id):
+    """
+    Webhook order/paid: notifica pago confirmado y dispara compra automática.
+    """
+    time.sleep(1)
+    orden = obtener_orden(orden_id)
+    if not orden:
+        tg("⚠️ *" + _nt('Pedido pagado') + f"* pero no pude obtener detalles (ID: {orden_id})")
+        return
+
+    num = str(orden.get("number", orden_id))
+    tg("💚 *" + _nt('¡Pago confirmado! Pedido #' + num) + "*")
+    procesar_orden_pagada(orden)
+
+
 def procesar_cmd(texto):
     global _token, _store_id
     texto = texto.strip()
@@ -1463,6 +1579,45 @@ def procesar_cmd(texto):
     elif cmd[0] == "/ciclo":
         tg(f"🔄 *{_nt('Ciclo manual iniciado')}*")
         threading.Thread(target=ciclo_monitoreo, daemon=True).start()
+
+    elif cmd[0] == "/registrar_webhooks":
+        if not _token: tg("❌ Necesito el token primero."); return
+        if not WEBHOOK_BASE_URL:
+            tg("❌ Falta `WEBHOOK_BASE_URL` en Railway Variables.\n"
+               "Valor: `https://bot-dropshipping-production.up.railway.app`"); return
+        tg("🔄 Registrando webhooks en Tienda Nube...")
+        resultados = []
+        for evento in ["order/created", "order/paid"]:
+            try:
+                r = requests.post(f"{API_BASE}/webhooks", headers=_h(),
+                    json={"event": evento, "url": f"{WEBHOOK_BASE_URL}/webhook"}, timeout=30)
+                if r and r.status_code in (200, 201):
+                    resultados.append(f"✅ `{evento}`")
+                else:
+                    resultados.append(f"❌ `{evento}` — HTTP {r.status_code if r else 'None'}: {r.text[:80] if r else ''}")
+            except Exception as e:
+                resultados.append(f"❌ `{evento}` — {e}")
+        tg("*Webhooks:*\n" + "\n".join(resultados))
+
+    elif cmd[0] == "/ver_webhooks":
+        if not _token: tg("❌ Necesito el token primero."); return
+        r = _get(f"{API_BASE}/webhooks")
+        if r and r.status_code == 200:
+            hooks = r.json()
+            results = hooks.get("results", hooks) if isinstance(hooks, dict) else hooks
+            if not results:
+                tg("ℹ️ No hay webhooks registrados."); return
+            lineas = [f"• `{h.get('event')}` (ID:{h.get('id')})\n  → {h.get('url')}" for h in results]
+            tg("🔗 *Webhooks activos:*\n\n" + "\n\n".join(lineas))
+        else:
+            tg(f"❌ HTTP {r.status_code if r else 'None'}")
+
+    elif cmd[0] == "/borrar_webhook":
+        if not _token: tg("❌ Necesito el token primero."); return
+        wid = texto.split()[1] if len(texto.split()) > 1 else ""
+        if not wid: tg("Uso: /borrar_webhook ID"); return
+        r = requests.delete(f"{API_BASE}/webhooks/{wid}", headers=_h(), timeout=30)
+        tg(f"✅ Webhook {wid} borrado." if r and r.status_code in (200,204) else f"❌ HTTP {r.status_code if r else 'None'}")
 
     elif cmd[0] == "/productos_sin_cargar":
         if not _token: tg("❌ Necesito el token primero."); return
@@ -1645,6 +1800,10 @@ if __name__ == "__main__":
            f"Mandá `/debug_env` para diagnosticar.")
 
     threading.Thread(target=escuchar_telegram, daemon=True).start()
+    if FLASK_OK:
+        threading.Thread(target=run_flask, daemon=True).start()
+    else:
+        print('⚠️ Flask no disponible — webhooks desactivados')
     try:
         ciclo_monitoreo()
     except Exception as e:
