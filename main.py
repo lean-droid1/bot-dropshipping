@@ -1589,7 +1589,7 @@ def procesar_cmd(texto):
         resultados = []
         for evento in ["order/created", "order/paid"]:
             try:
-                r = requests.post(f"{API_BASE}/webhooks", headers=_h(),
+                r = requests.post(f"{API_BASE}/{_store_id}/webhooks", headers=_h(),
                     json={"event": evento, "url": f"{WEBHOOK_BASE_URL}/webhook"}, timeout=30)
                 if r is not None and r.status_code in (200, 201):
                     resultados.append(f"✅ `{evento}`")
@@ -1603,7 +1603,7 @@ def procesar_cmd(texto):
 
     elif cmd[0] == "/ver_webhooks":
         if not _token: tg("❌ Necesito el token primero."); return
-        r = _get(f"{API_BASE}/webhooks")
+        r = _get(f"{API_BASE}/{_store_id}/webhooks")
         if r and r.status_code == 200:
             hooks = r.json()
             results = hooks.get("results", hooks) if isinstance(hooks, dict) else hooks
@@ -1618,7 +1618,7 @@ def procesar_cmd(texto):
         if not _token: tg("❌ Necesito el token primero."); return
         wid = texto.split()[1] if len(texto.split()) > 1 else ""
         if not wid: tg("Uso: /borrar_webhook ID"); return
-        r = requests.delete(f"{API_BASE}/webhooks/{wid}", headers=_h(), timeout=30)
+        r = requests.delete(f"{API_BASE}/{_store_id}/webhooks/{wid}", headers=_h(), timeout=30)
         tg(f"✅ Webhook {wid} borrado." if r and r.status_code in (200,204) else f"❌ HTTP {r.status_code if r else 'None'}")
 
     elif cmd[0] == "/productos_sin_cargar":
