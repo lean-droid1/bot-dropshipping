@@ -108,6 +108,7 @@ def leer_db():
                 d.setdefault("ordenes", {})
                 d.setdefault("variantes_cache", {})
                 d.setdefault("pids_refrescar", [])
+                d.setdefault("ultimo_orden_id", 0)
                 return d
         except Exception: pass
     return {"productos_proveedor":{}, "sincronizados":{}, "pedidos_procesados":[], "ofertas_pendientes":{}, "ordenes":{}}
@@ -464,7 +465,31 @@ def run_fix_envio_gratis():
 # ══════════════════════════════════════════════════════════════════════════════
 # SCRAPING PROVEEDOR — API WOOCOMMERCE PÚBLICA
 # ══════════════════════════════════════════════════════════════════════════════
-def _prov_get(url, params=None):
+SCRAPERAPI_KEY = _e("SCRAPERAPI_KEY")
+SCRAPERAPI_URL = "http://api.scraperapi.com"
+
+def _via_scraperapi(url, params=None):
+    """Pasa la request por ScraperAPI para evitar bloqueos tipo Cloudflare al proveedor."""
+    if not SCRAPERAPI_KEY:
+        print("⚠️ Sin SCRAPERAPI_KEY configurada — no puedo usar fallback")
+        return None
+    target = url
+    if params:
+        target += "?" + "&".join(f"{k}={v}" for k, v in params.items())
+    try:
+        r = requests.get(SCRAPERAPI_URL, params={
+            "api_key": SCRAPERAPI_KEY,
+            "url": target,
+        }, timeout=60)
+        return r
+    except Exception as e:
+        print(f"⚠️ ScraperAPI: {e}")
+        return None
+
+def _prov_get(url, params=None, usar_scraperapi=False):
+    if usar_scraperapi:
+        r = _via_scraperapi(url, params)
+        return r
     for _ in range(3):
         try:
             r = requests.get(url, params=params, timeout=20, headers={"User-Agent":USER_AGENT})
@@ -480,17 +505,21 @@ def _stock_real(p):
     return p.get("add_to_cart",{}).get("maximum") or 0
 
 def scrapear_proveedor():
-    productos = {}; pagina = 1; reintentos_202 = 0
+    productos = {}; pagina = 1; reintentos_202 = 0; via_scraperapi = False
     print("📥 API proveedor...")
     while True:
-        r = _prov_get(PROV_API, params={"per_page":100,"page":pagina})
+        r = _prov_get(PROV_API, params={"per_page":100,"page":pagina}, usar_scraperapi=via_scraperapi)
         if not r or r.status_code not in (200, 201, 202):
             print(f"❌ Proveedor HTTP {r.status_code if r else 'None'}"); break
         if r.status_code == 202:
             reintentos_202 += 1
+            if reintentos_202 == 2 and not via_scraperapi and SCRAPERAPI_KEY:
+                print("🔄 Cambiando a ScraperAPI tras 2 bloqueos directos...")
+                via_scraperapi = True
+                continue
             if reintentos_202 >= 5:
                 print(f"❌ Proveedor HTTP 202 x{reintentos_202} - abortando scrape")
-                tg(f"⚠️ *{NOMBRE_TIENDA}* — Proveedor no responde (HTTP 202 x5). Reintentará en el próximo ciclo.")
+                tg(f"⚠️ *{NOMBRE_TIENDA}* — Proveedor no responde (HTTP 202 x5{' incluso via ScraperAPI' if via_scraperapi else ''}). Reintentará en el próximo ciclo.")
                 break
             print(f"⚠️ Proveedor HTTP 202 ({reintentos_202}/5) - reintentando en 10s...")
             time.sleep(10)
@@ -525,7 +554,7 @@ def scrapear_proveedor():
                 for var_info in variaciones:
                     vid = var_info.get("id")
                     if not vid: continue
-                    rv = _prov_get(f"{PROV_API}/{vid}")
+                    rv = _prov_get(f"{PROV_API}/{vid}", usar_scraperapi=via_scraperapi)
                     if not rv or rv.status_code != 200: continue
                     vd = rv.json()
                     v_var_str   = vd.get("variation","")
@@ -943,6 +972,95 @@ def generar_excel():
 # ══════════════════════════════════════════════════════════════════════════════
 # CICLO DE MONITOREO
 # ══════════════════════════════════════════════════════════════════════════════
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DETECCIÓN DE ÓRDENES VIA API (más confiable que Gmail)
+# ══════════════════════════════════════════════════════════════════════════════
+def chequear_ordenes_api():
+    """
+    Consulta GET /orders buscando pedidos nuevos desde el último conocido.
+    No depende de emails leídos. Se ejecuta en cada ciclo.
+    Primera ejecución: guarda el estado actual sin notificar (evita spam de órdenes viejas).
+    """
+    if not _token: return []
+    try:
+        db  = leer_db()
+        ultimo_id = db.get("ultimo_orden_id", 0)
+
+        params = {"per_page": 50}
+        if ultimo_id:
+            params["since_id"] = ultimo_id
+
+        r = _get(f"{API_BASE}/orders", params=params)
+        if not r or r.status_code != 200:
+            print(f"⚠️ Órdenes API: HTTP {r.status_code if r else 'None'}")
+            return []
+
+        data    = r.json()
+        ordenes = data.get("results", data) if isinstance(data, dict) else data
+        if not isinstance(ordenes, list) or not ordenes:
+            return []
+
+        max_id = max(o.get("id", 0) for o in ordenes)
+
+        # Primera ejecución: solo guardar estado, no notificar
+        if ultimo_id == 0:
+            db["ultimo_orden_id"] = max_id
+            escribir_db(db)
+            print(f"   Órdenes API: primer ciclo — {len(ordenes)} órdenes existentes guardadas, sin notificar")
+            return []
+
+        # Actualizar último ID
+        if max_id > ultimo_id:
+            db["ultimo_orden_id"] = max_id
+            escribir_db(db)
+
+        print(f"   Órdenes API: {len(ordenes)} nuevas desde ID {ultimo_id}")
+        return ordenes
+
+    except Exception as e:
+        print(f"❌ chequear_ordenes_api: {e}")
+        return []
+
+
+def notificar_orden_nueva(orden):
+    """Arma y envía notificación Telegram para una orden nueva."""
+    num      = str(orden.get("number", orden.get("id", "?")))
+    productos = orden.get("products", [])
+    total    = float(orden.get("total") or 0)
+    pago_st  = orden.get("payment_status", "?")
+    envio    = orden.get("shipping", {})
+    metodo   = envio.get("pickup_type", "") or envio.get("method", "") or ""
+
+    db   = leer_db()
+    prov = db.get("productos_proveedor", {})
+
+    msg  = "🛒 *" + _nt("¡Nuevo Pedido #" + num + "!") + "*\n\n"
+    msg += f"💰 Total: *${total:,.0f}*\n"
+    msg += f"💳 Pago: *{pago_st}*\n"
+    if metodo:
+        msg += f"📦 Envío: *{metodo}*\n"
+    msg += "\n"
+
+    if prov:
+        idx = construir_indice(prov)
+        for item in productos:
+            nombre   = item.get("name", "?")
+            cantidad = item.get("quantity", 1)
+            _, dp    = buscar_en_indice(normalizar(nombre), idx)
+            if dp:
+                stock = dp.get("stock_base", 0)
+                icono = "⚠️" if stock < cantidad else "✅"
+                extra = f" (stock proveedor: {stock})" if stock < cantidad else ""
+                msg += f"{icono} *{nombre}* x{cantidad}{extra}\n"
+            else:
+                msg += f"❓ *{nombre}* x{cantidad}\n"
+    else:
+        for item in productos:
+            msg += f"• *{item.get('name','?')}* x{item.get('quantity',1)}\n"
+
+    tg(msg)
+
 def ciclo_monitoreo():
     print(f"\n─── 🔄 Ciclo {datetime.now().strftime('%H:%M')} ───")
     db          = leer_db()
@@ -950,14 +1068,17 @@ def ciclo_monitoreo():
     sinc        = db.get("sincronizados",{})
     ped_proc    = db.get("pedidos_procesados",[])
 
+    # Detección de órdenes via API (principal) + Gmail (backup)
+    for orden in chequear_ordenes_api():
+        oid = str(orden.get("id", ""))
+        if oid not in ped_proc:
+            notificar_orden_nueva(orden)
+            ped_proc.append(oid)
+
+    # Gmail como backup (por si acaso)
     for ped in chequear_gmail():
         if ped["id"] not in ped_proc:
-            msg = f"🛒 *{_nt('¡Nuevo Pedido #' + ped['num'] + '!')}*\n\n"
-            for item in ped["items"]:
-                en_prov = any(match(normalizar(item["nombre"]),
-                              normalizar(d["nombre_real"])) for d in prov_ant.values())
-                msg += f"{'✅' if en_prov else '❌'} *{item['nombre']}* x{item['cant']}\n"
-            tg(msg); ped_proc.append(ped["id"])
+            ped_proc.append(ped["id"])  # Solo marcar como procesado, ya notificó la API
 
     prov_nuevo = scrapear_proveedor()
     if not prov_nuevo:
@@ -1580,6 +1701,21 @@ def procesar_cmd(texto):
         tg(f"🔄 *{_nt('Ciclo manual iniciado')}*")
         threading.Thread(target=ciclo_monitoreo, daemon=True).start()
 
+    elif cmd[0] == "/test_scraperapi":
+        if not SCRAPERAPI_KEY:
+            tg("❌ Falta `SCRAPERAPI_KEY` en Railway Variables."); return
+        tg("🔄 Probando ScraperAPI contra el proveedor...")
+        r = _via_scraperapi(PROV_API, params={"per_page":1,"page":1})
+        if r and r.status_code == 200:
+            try:
+                data = r.json()
+                nombre = data[0].get("name","?") if data else "?"
+                tg(f"✅ ScraperAPI funciona. Producto de prueba: *{nombre}*")
+            except Exception as e:
+                tg(f"⚠️ HTTP 200 pero no pude parsear JSON: {e}")
+        else:
+            tg(f"❌ ScraperAPI HTTP {r.status_code if r else 'Sin respuesta'}")
+
     elif cmd[0] == "/registrar_webhooks":
         if not _token: tg("❌ Necesito el token primero."); return
         if not WEBHOOK_BASE_URL:
@@ -1589,7 +1725,7 @@ def procesar_cmd(texto):
         resultados = []
         for evento in ["order/created", "order/paid"]:
             try:
-                r = requests.post(f"{API_BASE}/{_store_id}/webhooks", headers=_h(),
+                r = requests.post(f"{API_BASE}/webhooks", headers=_h(),
                     json={"event": evento, "url": f"{WEBHOOK_BASE_URL}/webhook"}, timeout=30)
                 if r is not None and r.status_code in (200, 201):
                     resultados.append(f"✅ `{evento}`")
@@ -1603,7 +1739,7 @@ def procesar_cmd(texto):
 
     elif cmd[0] == "/ver_webhooks":
         if not _token: tg("❌ Necesito el token primero."); return
-        r = _get(f"{API_BASE}/{_store_id}/webhooks")
+        r = _get(f"{API_BASE}/webhooks")
         if r and r.status_code == 200:
             hooks = r.json()
             results = hooks.get("results", hooks) if isinstance(hooks, dict) else hooks
@@ -1618,7 +1754,7 @@ def procesar_cmd(texto):
         if not _token: tg("❌ Necesito el token primero."); return
         wid = texto.split()[1] if len(texto.split()) > 1 else ""
         if not wid: tg("Uso: /borrar_webhook ID"); return
-        r = requests.delete(f"{API_BASE}/{_store_id}/webhooks/{wid}", headers=_h(), timeout=30)
+        r = requests.delete(f"{API_BASE}/webhooks/{wid}", headers=_h(), timeout=30)
         tg(f"✅ Webhook {wid} borrado." if r and r.status_code in (200,204) else f"❌ HTTP {r.status_code if r else 'None'}")
 
     elif cmd[0] == "/productos_sin_cargar":
