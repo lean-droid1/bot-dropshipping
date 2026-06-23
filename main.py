@@ -1701,6 +1701,15 @@ def procesar_cmd(texto):
         tg(f"🔄 *{_nt('Ciclo manual iniciado')}*")
         threading.Thread(target=ciclo_monitoreo, daemon=True).start()
 
+    elif cmd[0] == "/debug_ordenes":
+        if not _token: tg("❌ Necesito el token primero."); return
+        tg("🔄 Probando GET /orders directo...")
+        try:
+            r = requests.get(f"{API_BASE}/orders", headers=_h(), params={"per_page":5}, timeout=20)
+            tg(f"✅ Respuesta recibida\nHTTP {r.status_code}\n`{r.text[:300]}`")
+        except Exception as e:
+            tg(f"❌ Excepción real: `{type(e).__name__}: {e}`")
+
     elif cmd[0] == "/test_scraperapi":
         if not SCRAPERAPI_KEY:
             tg("❌ Falta `SCRAPERAPI_KEY` en Railway Variables."); return
