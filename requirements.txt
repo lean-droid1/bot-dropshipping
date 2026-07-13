@@ -4,3 +4,4 @@ lxml
 urllib3
 openpyxl
 flask
+curl-cffi
