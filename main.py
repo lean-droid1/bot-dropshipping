@@ -9,6 +9,15 @@ try:
 except ImportError:
     FLASK_OK = False
     print('⚠️ Flask no instalado — webhooks desactivados')
+
+try:
+    from curl_cffi import requests as cf_requests
+    CURL_CFFI_OK = True
+    print('✅ curl-cffi disponible — bypass Cloudflare activo')
+except ImportError:
+    cf_requests = None
+    CURL_CFFI_OK = False
+    print('⚠️ curl-cffi no instalado — usando requests normal')
 from email.header import decode_header
 from datetime import datetime, timedelta
 import requests
@@ -492,7 +501,14 @@ def _prov_get(url, params=None, usar_scraperapi=False):
         return r
     for _ in range(3):
         try:
-            r = requests.get(url, params=params, timeout=20, headers={"User-Agent":USER_AGENT})
+            if CURL_CFFI_OK:
+                # curl-cffi imita TLS fingerprint de Chrome — bypasea Cloudflare
+                r = cf_requests.get(url, params=params, timeout=20,
+                                    impersonate="chrome120",
+                                    headers={"User-Agent": USER_AGENT})
+            else:
+                r = requests.get(url, params=params, timeout=20,
+                                 headers={"User-Agent": USER_AGENT})
             if r.status_code == 429: print("⚠️ Rate limit proveedor"); time.sleep(3); continue
             return r
         except Exception as e: print(f"⚠️ Proveedor API: {e}"); time.sleep(1)
@@ -513,10 +529,10 @@ def scrapear_proveedor():
             print(f"❌ Proveedor HTTP {r.status_code if r is not None else 'None'}"); break
         if r.status_code == 202:
             reintentos_202 += 1
-            if reintentos_202 == 2 and not via_scraperapi and SCRAPERAPI_KEY:
-                print("🔄 Cambiando a ScraperAPI tras 2 bloqueos directos...")
-                via_scraperapi = True
-                continue
+            # ScraperAPI deshabilitado — créditos agotados, se renuevan automáticamente
+            # Cuando se renueven, descomentar el bloque de abajo
+            # if reintentos_202 == 2 and not via_scraperapi and SCRAPERAPI_KEY:
+            #     via_scraperapi = True; continue
             if reintentos_202 >= 5:
                 print(f"❌ Proveedor HTTP 202 x{reintentos_202} - abortando scrape")
                 tg(f"⚠️ *{NOMBRE_TIENDA}* — Proveedor no responde (HTTP 202 x5{' incluso via ScraperAPI' if via_scraperapi else ''}). Reintentará en el próximo ciclo.")
@@ -1084,10 +1100,14 @@ def ciclo_monitoreo():
             notificar_orden_nueva(orden)
             ped_proc.append(oid)
 
+    # Guardar ped_proc YA para no perderlo si el ciclo aborta por fallo del proveedor
+    db["pedidos_procesados"] = ped_proc
+    escribir_db(db)
+
     # Gmail como backup (por si acaso)
     for ped in chequear_gmail():
         if ped["id"] not in ped_proc:
-            ped_proc.append(ped["id"])  # Solo marcar como procesado, ya notificó la API
+            ped_proc.append(ped["id"])
 
     prov_nuevo = scrapear_proveedor()
     if not prov_nuevo:
