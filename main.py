@@ -280,7 +280,7 @@ def obtener_catalogo(forzar=False, pids_refrescar=None):
     while True:
         r = _get(f"{API_BASE}/products", params={"per_page":200,"page":pagina})
         if not r or r.status_code != 200:
-            print(f"❌ Catálogo HTTP {r.status_code if r else 'None'}"); break
+            print(f"❌ Catálogo HTTP {r.status_code if r is not None else 'None'}"); break
         data = r.json()
         lote = data.get("results", data) if isinstance(data, dict) else data
         if not lote: break
@@ -343,13 +343,13 @@ def obtener_catalogo(forzar=False, pids_refrescar=None):
 def set_precio_variante(vid, precio):
     r = _put(f"{API_BASE}/variants/{vid}", {"price": str(int(precio))})
     ok = r and r.status_code in (200,201)
-    if not ok: print(f"  ⚠️ precio variante {vid}: HTTP {r.status_code if r else 'None'}")
+    if not ok: print(f"  ⚠️ precio variante {vid}: HTTP {r.status_code if r is not None else 'None'}")
     return ok
 
 def set_precio_producto(pid, precio):
     r = _put(f"{API_BASE}/products/{pid}", {"price": str(int(precio))})
     ok = r and r.status_code in (200,201)
-    if not ok: print(f"  ⚠️ precio producto {pid}: HTTP {r.status_code if r else 'None'}")
+    if not ok: print(f"  ⚠️ precio producto {pid}: HTTP {r.status_code if r is not None else 'None'}")
     return ok
 
 def set_stock_variante(vid, stock):
@@ -371,7 +371,7 @@ def set_visibilidad(pid, published):
 def set_envio_gratis(pid, activo):
     r = _put(f"{API_BASE}/products/{pid}", {"freeshipping": activo})
     ok = r and r.status_code in (200,201)
-    if not ok: print("  Envio gratis HTTP " + str(r.status_code if r else "None"))
+    if not ok: print("  Envio gratis HTTP " + str(r.status_code if r is not None else "None"))
     return ok
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -510,7 +510,7 @@ def scrapear_proveedor():
     while True:
         r = _prov_get(PROV_API, params={"per_page":100,"page":pagina}, usar_scraperapi=via_scraperapi)
         if not r or r.status_code not in (200, 201, 202):
-            print(f"❌ Proveedor HTTP {r.status_code if r else 'None'}"); break
+            print(f"❌ Proveedor HTTP {r.status_code if r is not None else 'None'}"); break
         if r.status_code == 202:
             reintentos_202 += 1
             if reintentos_202 == 2 and not via_scraperapi and SCRAPERAPI_KEY:
@@ -706,7 +706,7 @@ def sincronizar_precios(prod, datos_prov):
                 "promotional_price": ""
             })
         ok = r and r.status_code in (200, 201)
-        if not ok: print(f"  ⚠️ precio producto {pid}: HTTP {r.status_code if r else 'None'}")
+        if not ok: print(f"  ⚠️ precio producto {pid}: HTTP {r.status_code if r is not None else 'None'}")
         time.sleep(0.4)
         if ok: _actualizar_envio_gratis_prod(prod, p)
         return ok, p, p
@@ -741,7 +741,7 @@ def sincronizar_precios(prod, datos_prov):
             data = {"price": str(int(p)), "promotional_price": ""}
         r = _put(f"{API_BASE}/variants/{vid}", data)
         if r and r.status_code in (200, 201): exitos += 1
-        else: print(f"  ⚠️ precio variante {vid}: HTTP {r.status_code if r else 'None'}")
+        else: print(f"  ⚠️ precio variante {vid}: HTTP {r.status_code if r is not None else 'None'}")
         time.sleep(0.4)
 
     if not precios or exitos == 0: return False, 0, 0
@@ -992,8 +992,9 @@ def chequear_ordenes_api():
             params["since_id"] = ultimo_id
 
         r = _get(f"{API_BASE}/orders", params=params)
-        if not r or r.status_code != 200:
-            print(f"⚠️ Órdenes API: HTTP {r.status_code if r else 'None'}")
+        if r is None or r.status_code != 200:
+            detalle = r.text[:150] if r is not None else "Sin respuesta"
+            print(f"⚠️ Órdenes API: HTTP {r.status_code if r is not None else 'None'} — {detalle}")
             return []
 
         data    = r.json()
@@ -1003,19 +1004,27 @@ def chequear_ordenes_api():
 
         max_id = max(o.get("id", 0) for o in ordenes)
 
-        # Primera ejecución: solo guardar estado, no notificar
+        # Primera ejecución o DB reseteada: guardar estado sin notificar.
+        # Marcamos TODAS las ordenes existentes como procesadas
+        # para evitar spam tras un redeploy de Railway.
         if ultimo_id == 0:
             db["ultimo_orden_id"] = max_id
+            ya_proc = db.get("pedidos_procesados", [])
+            for o in ordenes:
+                oid = str(o.get("id", ""))
+                if oid and oid not in ya_proc:
+                    ya_proc.append(oid)
+            db["pedidos_procesados"] = ya_proc
             escribir_db(db)
-            print(f"   Órdenes API: primer ciclo — {len(ordenes)} órdenes existentes guardadas, sin notificar")
+            print(f"   Ordenes API: primer ciclo — {len(ordenes)} ordenes marcadas como procesadas")
             return []
 
-        # Actualizar último ID
+        # Actualizar ultimo ID conocido
         if max_id > ultimo_id:
             db["ultimo_orden_id"] = max_id
             escribir_db(db)
 
-        print(f"   Órdenes API: {len(ordenes)} nuevas desde ID {ultimo_id}")
+        print(f"   Ordenes API: {len(ordenes)} desde ID {ultimo_id}")
         return ordenes
 
     except Exception as e:
@@ -1515,7 +1524,7 @@ def obtener_orden(orden_id):
     r = _get(f"{API_BASE}/orders/{orden_id}")
     if r and r.status_code == 200:
         return r.json()
-    print(f"❌ No pude obtener orden {orden_id}: HTTP {r.status_code if r else 'None'}")
+    print(f"❌ No pude obtener orden {orden_id}: HTTP {r.status_code if r is not None else 'None'}")
     return None
 
 
@@ -1723,7 +1732,7 @@ def procesar_cmd(texto):
             except Exception as e:
                 tg(f"⚠️ HTTP 200 pero no pude parsear JSON: {e}")
         else:
-            tg(f"❌ ScraperAPI HTTP {r.status_code if r else 'Sin respuesta'}")
+            tg(f"❌ ScraperAPI HTTP {r.status_code if r is not None else 'Sin respuesta'}")
 
     elif cmd[0] == "/registrar_webhooks":
         if not _token: tg("❌ Necesito el token primero."); return
@@ -1757,14 +1766,14 @@ def procesar_cmd(texto):
             lineas = [f"• `{h.get('event')}` (ID:{h.get('id')})\n  → {h.get('url')}" for h in results]
             tg("🔗 *Webhooks activos:*\n\n" + "\n\n".join(lineas))
         else:
-            tg(f"❌ HTTP {r.status_code if r else 'None'}")
+            tg(f"❌ HTTP {r.status_code if r is not None else 'None'}")
 
     elif cmd[0] == "/borrar_webhook":
         if not _token: tg("❌ Necesito el token primero."); return
         wid = texto.split()[1] if len(texto.split()) > 1 else ""
         if not wid: tg("Uso: /borrar_webhook ID"); return
         r = requests.delete(f"{API_BASE}/webhooks/{wid}", headers=_h(), timeout=30)
-        tg(f"✅ Webhook {wid} borrado." if r and r.status_code in (200,204) else f"❌ HTTP {r.status_code if r else 'None'}")
+        tg(f"✅ Webhook {wid} borrado." if r and r.status_code in (200,204) else f"❌ HTTP {r.status_code if r is not None else 'None'}")
 
     elif cmd[0] == "/productos_sin_cargar":
         if not _token: tg("❌ Necesito el token primero."); return
@@ -1864,7 +1873,7 @@ def procesar_cmd(texto):
         pid = texto.split()[1] if len(texto.split()) > 1 else ""
         if not pid: tg("Uso: /debug_producto ID"); return
         r = _get(f"{API_BASE}/products/{pid}")
-        if not r or r.status_code != 200: tg("HTTP " + str(r.status_code if r else 0)); return
+        if not r or r.status_code != 200: tg("HTTP " + str(r.status_code if r is not None else 0)); return
         d = r.json()
         sep = chr(10)
         info = [k + ": " + str(v) for k,v in d.items() if not isinstance(v,(dict,list))]
