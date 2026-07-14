@@ -75,6 +75,7 @@ NOMBRE_TIENDA  = _e("NOMBRE_TIENDA") or "🧪 PRUEBA"
 # ── Compras automáticas al proveedor ─────────────────────────────────────────
 PROV_USER          = _e("PROV_USER")
 WEBHOOK_BASE_URL   = _e("WEBHOOK_BASE_URL")
+GROQ_API_KEY       = _e("GROQ_API_KEY")
 PROV_PASS      = _e("PROV_PASS")
 CUIT_PROVEEDOR = _e("CUIT_PROVEEDOR")
 PROV_LOGIN_URL = "https://rxzweb.com/wp-login.php"
@@ -170,11 +171,16 @@ AYUDA = r"""📋 *Comandos disponibles:*
 /publicar Nombre — Publica un producto oculto
 
 *Envío gratis*
-/fix\_envio\_gratis — Aplica envío gratis a todos los productos ≥ $100.000 (excepto mesas)
+/fix\_envio\_gratis — Aplica envío gratis a todos los productos
+/generar\_descripcion Nombre — Genera descripción con IA (Groq/Llama) para un producto
+/generar\_todas\_descripciones — Genera descripciones para todos los productos sin descripción
+/set\_video Nombre URL — Agrega video de YouTube a un producto
+/generar\_todas\_descripciones — Genera descripciones para todos los productos sin descripción ≥ $100.000 (excepto mesas)
 /productos\_sin\_cargar — Productos del proveedor que no tenés en tu tienda (filtrado)
 /productos\_sin\_cargar todo — Ídem pero sin filtro (excluye solo Pantallas/Baterías)
 
 *Ofertas*
+/ver\_ofertas\_proveedor — Ver todas las ofertas activas del proveedor (numeradas)
 /aplicar\_ofertas todos — Aplica todas las ofertas pendientes del proveedor
 /aplicar\_ofertas 1 3 — Aplica las ofertas numeradas seleccionadas
 
@@ -328,7 +334,8 @@ def obtener_catalogo(forzar=False, pids_refrescar=None):
         catalogo.append({
             "id":pid, "nombre":nombre, "nombre_norm":normalizar(nombre),
             "precio_base":precio_base, "tiene_variantes":len(variantes)>0,
-            "variantes":variantes, "published":p.get("published",True)
+            "variantes":variantes, "published":p.get("published",True),
+            "descripcion": (p.get("description") or "").strip()
         })
 
     # Limpiar del cache productos que ya no existen
@@ -1612,6 +1619,163 @@ def procesar_webhook_pedido_pagado(orden_id):
     procesar_orden_pagada(orden)
 
 
+
+# ══════════════════════════════════════════════════════════════════════════════
+# GENERACIÓN DE DESCRIPCIONES CON IA
+# ══════════════════════════════════════════════════════════════════════════════
+def generar_descripcion_ia(nombre, precio):
+    """Llama a Groq API (Llama) para generar descripcion de producto. Gratis."""
+    if not GROQ_API_KEY:
+        return None, "Falta GROQ_API_KEY en Railway Variables"
+    prompt = (
+        "Sos un experto en herramientas para tecnicos de reparacion electronica de celulares y placas en Argentina.\n\n"
+        f"Genera una descripcion de producto para una tienda online orientada a tecnicos profesionales.\n"
+        f"Producto: {nombre}\n"
+        f"Precio: ${precio:,}\n\n"
+        "La descripcion debe:\n"
+        "- Estar en espanol argentino, sin tuteo\n"
+        "- Tener entre 100 y 200 palabras\n"
+        "- Explicar para que sirve y que problemas resuelve\n"
+        "- Mencionar compatibilidades o especificaciones si aplica\n"
+        "- Usar lenguaje tecnico apropiado para profesionales\n"
+        "- NO usar markdown ni asteriscos, solo texto plano con saltos de linea\n"
+        "- NO inventar especificaciones que no conoces\n\n"
+        "Solo devuelve la descripcion, sin titulo ni comentarios adicionales."
+    )
+    try:
+        r = requests.post(
+            "https://api.groq.com/openai/v1/chat/completions",
+            headers={"Authorization": f"Bearer {GROQ_API_KEY}",
+                     "Content-Type": "application/json"},
+            json={"model": "llama-3.3-70b-versatile",
+                  "max_tokens": 1000,
+                  "messages": [{"role": "user", "content": prompt}]},
+            timeout=30
+        )
+        if r.status_code == 200:
+            return r.json()["choices"][0]["message"]["content"].strip(), None
+        return None, f"Groq API HTTP {r.status_code}: {r.text[:150]}"
+    except Exception as e:
+        return None, f"Error Groq API: {e}"
+
+
+def set_descripcion_producto(pid, descripcion):
+    """Sube la descripcion a Tienda Nube."""
+    r = _put(f"{API_BASE}/products/{pid}", {"description": descripcion})
+    return r is not None and r.status_code in (200, 201)
+
+
+def run_generar_todas_descripciones():
+    """
+    Recorre el catalogo y genera descripciones para productos que no tienen.
+    Envia progreso cada 10 productos.
+    """
+    catalogo = obtener_catalogo(forzar=True)
+    if not catalogo:
+        tg("No pude obtener el catalogo."); return
+
+    sin_desc = [p for p in catalogo if not p.get("descripcion")]
+    total = len(sin_desc)
+
+    if not sin_desc:
+        tg("Todos los productos ya tienen descripcion."); return
+
+    tg(f"*{_nt('Generando descripciones')}*\n\n"
+       f"Productos sin descripcion: *{total}*\n"
+       f"Tiempo estimado: ~{total * 3 // 60} minutos\n\n"
+       f"Te aviso cada 10 productos.")
+
+    ok = 0; errores = []; i = 0
+    for prod in sin_desc:
+        i += 1
+        desc, err = generar_descripcion_ia(prod["nombre"], int(prod["precio_base"]))
+        if err:
+            errores.append(prod["nombre"])
+            print(f"Error IA {prod['nombre']}: {err}")
+        elif set_descripcion_producto(prod["id"], desc):
+            ok += 1
+            print(f"OK desc: {prod['nombre']}")
+        else:
+            errores.append(prod["nombre"])
+        if i % 10 == 0:
+            tg(f"Progreso: *{i}/{total}* ({ok} OK, {len(errores)} errores)")
+        time.sleep(2)  # Evitar rate limits
+
+    tg(f"*{_nt('Descripciones completadas')}*\n\n"
+       f"Exitosas: *{ok}*\n"
+       f"Errores: *{len(errores)}*" +
+       (f"\n\nFallaron:\n" + "\n".join(f"• {e}" for e in errores[:10]) if errores else ""))
+
+
+
+def run_ver_ofertas_proveedor():
+    """
+    Muestra TODAS las ofertas activas del proveedor en este momento.
+    Las enumera para poder aplicar todas o solo algunas con /aplicar_ofertas.
+    """
+    db   = leer_db()
+    prov = db.get("productos_proveedor", {})
+    if not prov:
+        tg("Sin datos del proveedor. Esperá un ciclo primero."); return
+
+    # Filtrar solo los que tienen oferta activa
+    ofertas = {}
+    for clave, d in prov.items():
+        if not d.get("en_oferta"): continue
+        precio     = d.get("precio", 0)
+        precio_ant = d.get("precio_anterior", 0)
+        if not precio or not precio_ant or precio >= precio_ant: continue
+        # Usar nombre base del proveedor para agrupar (evitar duplicados de variantes)
+        base = d.get("nombre_base_proveedor", clave)
+        if base not in ofertas:
+            ofertas[base] = {
+                "nombre_real":    d.get("nombre_real", base),
+                "precio":         precio,
+                "precio_anterior": precio_ant,
+                "precio_web":     precio_obj(precio),
+                "precio_web_ant": precio_obj(precio_ant),
+                "descuento":      round((1 - precio / precio_ant) * 100),
+            }
+
+    if not ofertas:
+        tg("No hay ofertas activas del proveedor en este momento."); return
+
+    lista = list(ofertas.items())
+    lineas = []
+    for i, (base, d) in enumerate(lista, 1):
+        ahorro = d["precio_web_ant"] - d["precio_web"]
+        lineas.append(
+            f"*{i}.* {d['nombre_real']}\n"
+            f"   Costo: ~~${d['precio_anterior']:,}~~ → ${d['precio']:,} (-{d['descuento']}%)\n"
+            f"   Tu precio: ~~${d['precio_web_ant']:,}~~ → *${d['precio_web']:,}* (ahorrás ${ahorro:,})"
+        )
+
+    # Guardar en DB para que /aplicar_ofertas pueda usarlas
+    db["ofertas_pendientes"] = {base: {
+        "nombre_real":    d["nombre_real"],
+        "precio":         d["precio"],
+        "precio_anterior": d["precio_anterior"],
+        "en_oferta":      True,
+        "stock":          prov.get(base, {}).get("stock", 0),
+        "nombre_base_proveedor": base,
+    } for base, d in lista}
+    escribir_db(db)
+
+    encabezado = (f"*{_nt('Ofertas activas del proveedor')}*\n"
+                  f"Total: *{len(lista)}*\n\n"
+                  f"Usá `/aplicar_ofertas todos` o `/aplicar_ofertas 1 3 5` para aplicar.")
+
+    tg(encabezado)
+    for i in range(0, len(lineas), 15):
+        tg("\n\n".join(lineas[i:i+15]))
+
+
+def set_video_producto(pid, url):
+    """Sube URL de video YouTube a Tienda Nube."""
+    r = _put(f"{API_BASE}/products/{pid}", {"video_url": url})
+    return r is not None and r.status_code in (200, 201)
+
+
 def procesar_cmd(texto):
     global _token, _store_id
     texto = texto.strip()
@@ -1739,6 +1903,48 @@ def procesar_cmd(texto):
         except Exception as e:
             tg(f"❌ Excepción real: `{type(e).__name__}: {e}`")
 
+    elif cmd[0] == "/set_video":
+        if not _token: tg("Necesito el token primero."); return
+        partes = texto.split()
+        if len(partes) < 3: tg("Uso: `/set_video Nombre del producto https://youtube.com/...`"); return
+        # Último token es la URL, el resto es el nombre
+        url = partes[-1]
+        nombre = " ".join(partes[1:-1])
+        if "youtube.com" not in url and "youtu.be" not in url:
+            tg("La URL debe ser de YouTube."); return
+        prod = next((p for p in obtener_catalogo() if match(normalizar(nombre), p["nombre_norm"])), None)
+        if not prod:
+            tg(f"No encontre *{nombre}* en tu catalogo."); return
+        if set_video_producto(prod["id"], url):
+            tg(f"Video agregado a *{prod['nombre']}*")
+        else:
+            tg("No pude agregar el video.")
+
+    elif cmd[0] == "/generar_descripcion":
+        if not _token: tg("Necesito el token primero."); return
+        if not GROQ_API_KEY:
+            tg("Falta `GROQ_API_KEY` en Railway Variables."); return
+        nombre = " ".join(texto.split()[1:]).strip()
+        if not nombre: tg("Uso: `/generar_descripcion Nombre del producto`"); return
+        prod = next((p for p in obtener_catalogo() if match(normalizar(nombre), p["nombre_norm"])), None)
+        if not prod:
+            tg(f"No encontre *{nombre}* en tu catalogo."); return
+        tg(f"Generando descripcion para *{prod['nombre']}*...")
+        desc, err = generar_descripcion_ia(prod["nombre"], int(prod["precio_base"]))
+        if err:
+            tg(f"Error: {err}"); return
+        if set_descripcion_producto(prod["id"], desc):
+            tg(f"*{prod['nombre']}*\n\n{desc}")
+        else:
+            tg("No pude subir la descripcion a Tienda Nube.")
+
+    elif cmd[0] == "/generar_todas_descripciones":
+        if not _token: tg("Necesito el token primero."); return
+        if not GROQ_API_KEY:
+            tg("Falta `GROQ_API_KEY` en Railway Variables."); return
+        threading.Thread(target=run_generar_todas_descripciones, daemon=True).start()
+        tg(f"Iniciando generacion masiva de descripciones...")
+
     elif cmd[0] == "/test_scraperapi":
         if not SCRAPERAPI_KEY:
             tg("❌ Falta `SCRAPERAPI_KEY` en Railway Variables."); return
@@ -1799,6 +2005,9 @@ def procesar_cmd(texto):
         if not _token: tg("❌ Necesito el token primero."); return
         modo_todo = len(cmd) > 1 and cmd[1] == "todo"
         threading.Thread(target=run_productos_sin_cargar, args=(modo_todo,), daemon=True).start()
+
+    elif cmd[0] == "/ver_ofertas_proveedor":
+        threading.Thread(target=run_ver_ofertas_proveedor, daemon=True).start()
 
     elif cmd[0] == "/aplicar_ofertas":
         db = leer_db()
