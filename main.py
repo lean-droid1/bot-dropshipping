@@ -35,7 +35,7 @@ except Exception:
 DB_FILE          = "estado_productos.json"
 API_BASE         = "https://developers.tiendanegocio.com/v1"
 PROV_API         = "https://rxzweb.com/wp-json/wc/store/v1/products"
-USER_AGENT       = "dropshipping (lean.6roid@gmail.com)"
+USER_AGENT       = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
 # Márgenes y alertas (configurables via Railway Variables)
 MARGEN           = float(os.environ.get("MARGEN", "0.78"))   # /0.78 = 22% ganancia
