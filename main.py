@@ -77,6 +77,8 @@ PROV_USER          = _e("PROV_USER")
 WEBHOOK_BASE_URL   = _e("WEBHOOK_BASE_URL")
 GROQ_API_KEY       = _e("GROQ_API_KEY")
 WEBSHARE_PROXY     = _e("WEBSHARE_PROXY")
+WEBSHARE_USER      = _e("WEBSHARE_USER")
+WEBSHARE_PASS      = _e("WEBSHARE_PASS")
 PROV_PASS      = _e("PROV_PASS")
 CUIT_PROVEEDOR = _e("CUIT_PROVEEDOR")
 PROV_LOGIN_URL = "https://rxzweb.com/wp-login.php"
@@ -509,7 +511,23 @@ def _prov_get(url, params=None, usar_scraperapi=False):
     if usar_scraperapi:
         r = _via_scraperapi(url, params)
         return r
-    proxies = {"http": WEBSHARE_PROXY, "https": WEBSHARE_PROXY} if WEBSHARE_PROXY else None
+    # Construir proxies con autenticación correcta para HTTPS
+    if WEBSHARE_USER and WEBSHARE_PASS:
+        # Lista de proxies a rotar
+        _proxy_list = [
+            f"http://{WEBSHARE_USER}:{WEBSHARE_PASS}@31.59.20.176:6754",
+            f"http://{WEBSHARE_USER}:{WEBSHARE_PASS}@31.56.127.193:7684",
+            f"http://{WEBSHARE_USER}:{WEBSHARE_PASS}@45.38.107.97:6014",
+            f"http://{WEBSHARE_USER}:{WEBSHARE_PASS}@198.105.121.200:6462",
+            f"http://{WEBSHARE_USER}:{WEBSHARE_PASS}@64.137.96.74:6641",
+        ]
+        import random
+        _proxy_url = random.choice(_proxy_list)
+        proxies = {"http": _proxy_url, "https": _proxy_url}
+    elif WEBSHARE_PROXY:
+        proxies = {"http": WEBSHARE_PROXY, "https": WEBSHARE_PROXY}
+    else:
+        proxies = None
     for _ in range(3):
         try:
             if CURL_CFFI_OK and not proxies:
