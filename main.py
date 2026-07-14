@@ -156,6 +156,8 @@ def _nt(txt): return f"[{NOMBRE_TIENDA}] {txt}"
 # ══════════════════════════════════════════════════════════════════════════════
 AYUDA = r"""📋 *Comandos disponibles:*
 
+/menu — Abre el panel de control con botones
+
 *Sincronización*
 /sync\_total — Sincroniza precios y stock de todos los productos
 /ciclo — Dispara un ciclo de monitoreo manualmente
@@ -1776,6 +1778,40 @@ def set_video_producto(pid, url):
     return r is not None and r.status_code in (200, 201)
 
 
+def tg_menu():
+    """Envía menú interactivo con botones inline agrupados por categoría."""
+    if not TELEGRAM_TOKEN or not CHAT_ID: return
+    keyboard = {
+        "inline_keyboard": [
+            [{"text": "🔄 Sync Total", "callback_data": "/sync_total"},
+             {"text": "🔁 Ciclo Manual", "callback_data": "/ciclo"}],
+            [{"text": "📋 Listar Productos", "callback_data": "/listar"},
+             {"text": "📦 Sin Cargar", "callback_data": "/productos_sin_cargar todo"}],
+            [{"text": "🏷️ Ver Ofertas Proveedor", "callback_data": "/ver_ofertas_proveedor"},
+             {"text": "✅ Aplicar Ofertas", "callback_data": "/aplicar_ofertas todos"}],
+            [{"text": "🚚 Fix Envío Gratis", "callback_data": "/fix_envio_gratis"},
+             {"text": "📊 Exportar Precios", "callback_data": "/exportar_precios"}],
+            [{"text": "✍️ Generar Descripciones", "callback_data": "/generar_todas_descripciones"}],
+            [{"text": "🔗 Ver Webhooks", "callback_data": "/ver_webhooks"},
+             {"text": "📡 Registrar Webhooks", "callback_data": "/registrar_webhooks"}],
+            [{"text": "🔑 Estado API", "callback_data": "/estado_api"},
+             {"text": "🛠️ Debug Env", "callback_data": "/debug_env"}],
+            [{"text": "📄 Ayuda completa", "callback_data": "/ayuda"}],
+        ]
+    }
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID,
+                  "text": f"*{_nt('Panel de control')}*\nElegí una opción:",
+                  "parse_mode": "Markdown",
+                  "reply_markup": keyboard},
+            timeout=15
+        )
+    except Exception as e:
+        print(f"❌ Menu: {e}")
+
+
 def procesar_cmd(texto):
     global _token, _store_id
     texto = texto.strip()
@@ -1794,7 +1830,10 @@ def procesar_cmd(texto):
     cmd = texto.lower().split()
     if not cmd: return
 
-    if cmd[0] == "/ayuda":
+    if cmd[0] == "/menu":
+        tg_menu()
+
+    elif cmd[0] == "/ayuda":
         tg(AYUDA)
 
     elif cmd[0] == "/estado_api":
@@ -2156,11 +2195,26 @@ def escuchar_telegram():
             if r.status_code == 200:
                 for u in r.json().get("result",[]):
                     offset = u["update_id"] + 1
+                    # Mensaje de texto normal
                     msg = u.get("message",{}); texto = msg.get("text","")
-                    if str(msg.get("chat",{}).get("id","")) != CHAT_ID or not texto: continue
-                    print(f"📨 {texto[:60]}")
-                    try: procesar_cmd(texto)
-                    except Exception as e: print(f"❌ Cmd: {e}")
+                    if str(msg.get("chat",{}).get("id","")) == CHAT_ID and texto:
+                        print(f"📨 {texto[:60]}")
+                        try: procesar_cmd(texto)
+                        except Exception as e: print(f"❌ Cmd: {e}")
+                    # Callback de botón inline
+                    cb = u.get("callback_query",{})
+                    if cb and str(cb.get("message",{}).get("chat",{}).get("id","")) == CHAT_ID:
+                        cb_data = cb.get("data","")
+                        cb_id   = cb.get("id","")
+                        # Responder al callback para quitar el "reloj" del botón
+                        try:
+                            requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery",
+                                json={"callback_query_id": cb_id}, timeout=5)
+                        except Exception: pass
+                        if cb_data:
+                            print(f"🔘 Botón: {cb_data[:60]}")
+                            try: procesar_cmd(cb_data)
+                            except Exception as e: print(f"❌ Botón cmd: {e}")
         except Exception as e: print(f"⚠️ Telegram: {e}")
         time.sleep(1)
 
@@ -2178,8 +2232,8 @@ if __name__ == "__main__":
 
     if _token:
         tg(f"🟢 *{_nt('Bot iniciado')}* — Token activo (store_id: `{_store_id}`)\n\n"
-           f"Mandá `/sync_total` para sincronizar precios y stock.\n"
-           f"Mandá `/ayuda` para ver los comandos.")
+           f"Mandá `/menu` para abrir el panel de control con botones.\n"
+           f"Mandá `/ayuda` para ver todos los comandos.")
     else:
         tg(f"🟡 *{_nt('Bot iniciado')}* — Sin token API.\n"
            f"Mandá `/debug_env` para diagnosticar.")
