@@ -1143,7 +1143,14 @@ def ciclo_monitoreo():
 
     prov_nuevo = scrapear_proveedor()
     if not prov_nuevo:
-        print("⚠️ Proveedor 0 productos. Abortando."); return
+        # Usar datos del ultimo ciclo exitoso en vez de abortar
+        if prov_ant:
+            print("⚠️ Proveedor sin datos — usando cache del ultimo ciclo exitoso")
+            prov_nuevo = prov_ant
+        else:
+            print("⚠️ Proveedor 0 productos y sin cache. Abortando.")
+            tg(f"⚠️ *{_nt('Proveedor sin datos')}* — sin cache disponible. Se reintentará en el próximo ciclo.")
+            return
 
     prov_consolidado = {**prov_ant, **prov_nuevo}
     idx      = construir_indice(prov_nuevo)
