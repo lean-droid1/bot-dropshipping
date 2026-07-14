@@ -546,8 +546,9 @@ def scrapear_proveedor():
                 print(f"❌ Proveedor HTTP 202 x{reintentos_202} - abortando scrape")
                 tg(f"⚠️ *{NOMBRE_TIENDA}* — Proveedor no responde (HTTP 202 x5{' incluso via ScraperAPI' if via_scraperapi else ''}). Reintentará en el próximo ciclo.")
                 break
-            print(f"⚠️ Proveedor HTTP 202 ({reintentos_202}/5) - reintentando en 10s...")
-            time.sleep(10)
+            espera = 30 if reintentos_202 <= 2 else 60
+            print(f"⚠️ Proveedor HTTP 202 ({reintentos_202}/5) - reintentando en {espera}s...")
+            time.sleep(espera)
             continue
         if not r.text or not r.text.strip():
             print(f"⚠️ Proveedor respuesta vacía en pág {pagina}, reintentando...")
