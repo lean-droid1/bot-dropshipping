@@ -335,7 +335,7 @@ def obtener_catalogo(forzar=False, pids_refrescar=None):
             "id":pid, "nombre":nombre, "nombre_norm":normalizar(nombre),
             "precio_base":precio_base, "tiene_variantes":len(variantes)>0,
             "variantes":variantes, "published":p.get("published",True),
-            "descripcion": (p.get("description") or "").strip()
+            "descripcion": ((lambda d: (d.get("es") or d.get("en") or next(iter(d.values()),"")) if isinstance(d, dict) else str(d or ""))(p.get("description",""))).strip()
         })
 
     # Limpiar del cache productos que ya no existen
