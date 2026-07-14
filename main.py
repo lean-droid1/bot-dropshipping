@@ -76,6 +76,7 @@ NOMBRE_TIENDA  = _e("NOMBRE_TIENDA") or "🧪 PRUEBA"
 PROV_USER          = _e("PROV_USER")
 WEBHOOK_BASE_URL   = _e("WEBHOOK_BASE_URL")
 GROQ_API_KEY       = _e("GROQ_API_KEY")
+WEBSHARE_PROXY     = _e("WEBSHARE_PROXY")
 PROV_PASS      = _e("PROV_PASS")
 CUIT_PROVEEDOR = _e("CUIT_PROVEEDOR")
 PROV_LOGIN_URL = "https://rxzweb.com/wp-login.php"
@@ -508,16 +509,19 @@ def _prov_get(url, params=None, usar_scraperapi=False):
     if usar_scraperapi:
         r = _via_scraperapi(url, params)
         return r
+    proxies = {"http": WEBSHARE_PROXY, "https": WEBSHARE_PROXY} if WEBSHARE_PROXY else None
     for _ in range(3):
         try:
-            if CURL_CFFI_OK:
-                # curl-cffi imita TLS fingerprint de Chrome — bypasea Cloudflare
+            if CURL_CFFI_OK and not proxies:
+                # curl-cffi imita TLS fingerprint de Chrome — sin proxy
                 r = cf_requests.get(url, params=params, timeout=20,
                                     impersonate="chrome120",
                                     headers={"User-Agent": USER_AGENT})
             else:
-                r = requests.get(url, params=params, timeout=20,
-                                 headers={"User-Agent": USER_AGENT})
+                # Con proxy residencial Webshare — esquiva bloqueo por IP
+                r = requests.get(url, params=params, timeout=30,
+                                 headers={"User-Agent": USER_AGENT},
+                                 proxies=proxies)
             if r.status_code == 429: print("⚠️ Rate limit proveedor"); time.sleep(3); continue
             return r
         except Exception as e: print(f"⚠️ Proveedor API: {e}"); time.sleep(1)
