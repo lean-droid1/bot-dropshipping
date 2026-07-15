@@ -486,26 +486,38 @@ def run_fix_envio_gratis():
 # ══════════════════════════════════════════════════════════════════════════════
 # SCRAPING PROVEEDOR — API WOOCOMMERCE PÚBLICA
 # ══════════════════════════════════════════════════════════════════════════════
-SCRAPERAPI_KEY = _e("SCRAPERAPI_KEY")
+SCRAPERAPI_KEY  = _e("SCRAPERAPI_KEY")
+SCRAPERAPI_KEY2 = _e("SCRAPERAPI_KEY2")
 SCRAPERAPI_URL = "http://api.scraperapi.com"
 
 def _via_scraperapi(url, params=None):
-    """Pasa la request por ScraperAPI para evitar bloqueos tipo Cloudflare al proveedor."""
-    if not SCRAPERAPI_KEY:
+    """
+    Pasa la request por ScraperAPI rotando entre KEY y KEY2.
+    Si una falla o se queda sin créditos, prueba la otra automáticamente.
+    """
+    keys = [k for k in [SCRAPERAPI_KEY, SCRAPERAPI_KEY2] if k]
+    if not keys:
         print("⚠️ Sin SCRAPERAPI_KEY configurada — no puedo usar fallback")
         return None
     target = url
     if params:
         target += "?" + "&".join(f"{k}={v}" for k, v in params.items())
-    try:
-        r = requests.get(SCRAPERAPI_URL, params={
-            "api_key": SCRAPERAPI_KEY,
-            "url": target,
-        }, timeout=60)
-        return r
-    except Exception as e:
-        print(f"⚠️ ScraperAPI: {e}")
-        return None
+    for i, key in enumerate(keys, 1):
+        try:
+            r = requests.get(SCRAPERAPI_URL, params={
+                "api_key": key,
+                "url": target,
+            }, timeout=60)
+            if r.status_code == 403 or (r.status_code == 200 and not r.text.strip()):
+                print(f"⚠️ ScraperAPI key {i} sin créditos o bloqueada, probando siguiente...")
+                continue
+            print(f"✅ ScraperAPI key {i} respondió HTTP {r.status_code}")
+            return r
+        except Exception as e:
+            print(f"⚠️ ScraperAPI key {i}: {e}")
+            continue
+    print("❌ Todas las keys de ScraperAPI fallaron")
+    return None
 
 def _prov_get(url, params=None, usar_scraperapi=False):
     if usar_scraperapi:
@@ -560,10 +572,11 @@ def scrapear_proveedor():
             print(f"❌ Proveedor HTTP {r.status_code if r is not None else 'None'}"); break
         if r.status_code == 202:
             reintentos_202 += 1
-            # ScraperAPI deshabilitado — créditos agotados, se renuevan automáticamente
-            # Cuando se renueven, descomentar el bloque de abajo
-            # if reintentos_202 == 2 and not via_scraperapi and SCRAPERAPI_KEY:
-            #     via_scraperapi = True; continue
+            # Fallback ScraperAPI — rota entre KEY y KEY2 automáticamente
+            if reintentos_202 == 2 and not via_scraperapi and (SCRAPERAPI_KEY or SCRAPERAPI_KEY2):
+                print("🔄 Activando ScraperAPI como fallback...")
+                via_scraperapi = True
+                continue
             if reintentos_202 >= 5:
                 print(f"❌ Proveedor HTTP 202 x{reintentos_202} - abortando scrape")
                 tg(f"⚠️ *{NOMBRE_TIENDA}* — Proveedor no responde (HTTP 202 x5{' incluso via ScraperAPI' if via_scraperapi else ''}). Reintentará en el próximo ciclo.")
