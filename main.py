@@ -569,7 +569,14 @@ def scrapear_proveedor():
     while True:
         r = _prov_get(PROV_API, params={"per_page":100,"page":pagina}, usar_scraperapi=via_scraperapi)
         if not r or r.status_code not in (200, 201, 202):
-            print(f"❌ Proveedor HTTP {r.status_code if r is not None else 'None'}"); break
+            codigo = r.status_code if r is not None else 'None'
+            print(f"❌ Proveedor HTTP {codigo}")
+            # Si es 403 y tenemos ScraperAPI disponible, activarlo como fallback
+            if codigo == 403 and not via_scraperapi and (SCRAPERAPI_KEY or SCRAPERAPI_KEY2):
+                print("🔄 HTTP 403 — activando ScraperAPI como fallback...")
+                via_scraperapi = True
+                continue
+            break
         if r.status_code == 202:
             reintentos_202 += 1
             # Fallback ScraperAPI — rota entre KEY y KEY2 automáticamente
