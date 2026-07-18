@@ -1680,23 +1680,56 @@ def procesar_webhook_pedido_pagado(orden_id):
 # ══════════════════════════════════════════════════════════════════════════════
 # GENERACIÓN DE DESCRIPCIONES CON IA
 # ══════════════════════════════════════════════════════════════════════════════
+
+def buscar_specs_producto(nombre):
+    """
+    Busca especificaciones técnicas del producto en la web.
+    Usa DuckDuckGo para encontrar fichas técnicas del fabricante.
+    """
+    try:
+        query = nombre.replace(" ", "+") + "+especificaciones+ficha+tecnica"
+        r = requests.get(
+            f"https://duckduckgo.com/html/?q={query}",
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+            timeout=10
+        )
+        import re as _re
+        # Extraer snippets de texto de los resultados
+        snippets = _re.findall(r'<a class="result__snippet"[^>]*>(.*?)</a>', r.text)
+        # Limpiar HTML
+        limpios = []
+        for s in snippets[:5]:
+            limpio = _re.sub(r'<[^>]+>', '', s).strip()
+            if limpio and len(limpio) > 30:
+                limpios.append(limpio)
+        return " | ".join(limpios[:3]) if limpios else ""
+    except Exception as e:
+        print(f"⚠️ Búsqueda web specs: {e}")
+        return ""
+
+
 def generar_descripcion_ia(nombre, precio):
     """Llama a Groq API (Llama) para generar descripcion de producto. Gratis."""
     if not GROQ_API_KEY:
         return None, "Falta GROQ_API_KEY en Railway Variables"
+    # Buscar especificaciones técnicas en la web
+    specs = buscar_specs_producto(nombre)
+    contexto_specs = f"\nInformacion encontrada en la web sobre el producto:\n{specs}\n" if specs else ""
+
     prompt = (
         "Sos un experto en herramientas para tecnicos de reparacion electronica de celulares y placas en Argentina.\n\n"
         f"Genera una descripcion de producto para una tienda online orientada a tecnicos profesionales.\n"
         f"Producto: {nombre}\n"
-        f"Precio: ${precio:,}\n\n"
+        f"Precio: ${precio:,}\n"
+        f"{contexto_specs}\n"
         "La descripcion debe:\n"
         "- Estar en espanol argentino, sin tuteo\n"
-        "- Tener entre 100 y 200 palabras\n"
+        "- Tener entre 150 y 250 palabras\n"
         "- Explicar para que sirve y que problemas resuelve\n"
-        "- Mencionar compatibilidades o especificaciones si aplica\n"
+        "- Mencionar compatibilidades, modelos o especificaciones tecnicas reales si las encontras\n"
         "- Usar lenguaje tecnico apropiado para profesionales\n"
         "- NO usar markdown ni asteriscos, solo texto plano con saltos de linea\n"
-        "- NO inventar especificaciones que no conoces\n\n"
+        "- Solo incluir especificaciones que esten respaldadas por la informacion encontrada\n\n"
         "Solo devuelve la descripcion, sin titulo ni comentarios adicionales."
     )
     try:
