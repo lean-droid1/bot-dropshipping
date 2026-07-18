@@ -624,7 +624,11 @@ def scrapear_proveedor():
                     if not vid: continue
                     rv = _prov_get(f"{PROV_API}/{vid}", usar_scraperapi=via_scraperapi)
                     if not rv or rv.status_code != 200: continue
-                    vd = rv.json()
+                    if not rv.text or not rv.text.strip(): continue
+                    try:
+                        vd = rv.json()
+                    except Exception:
+                        continue
                     v_var_str   = vd.get("variation","")
                     v_nombre    = v_var_str.split(":",1)[1].strip() if ":" in v_var_str else v_var_str
                     v_precio    = _precio_real(vd)
@@ -1154,6 +1158,7 @@ def ciclo_monitoreo():
 
     # Guardar ped_proc YA para no perderlo si el ciclo aborta por fallo del proveedor
     db["pedidos_procesados"] = ped_proc
+    db["ultimo_orden_id"] = db.get("ultimo_orden_id", 0)  # Preservar entre ciclos
     escribir_db(db)
 
     # Gmail como backup (por si acaso)
@@ -1713,7 +1718,7 @@ def generar_descripcion_ia(nombre, precio):
 
 def set_descripcion_producto(pid, descripcion):
     """Sube la descripcion a Tienda Nube."""
-    r = _put(f"{API_BASE}/products/{pid}", {"description": descripcion})
+    r = _put(f"{API_BASE}/products/{pid}", {"description": {"es": descripcion}})
     return r is not None and r.status_code in (200, 201)
 
 
@@ -1862,6 +1867,60 @@ def tg_menu():
         print(f"❌ Menu: {e}")
 
 
+def run_buscar_todos_videos():
+    """
+    Busca videos de YouTube para todos los productos sin video
+    usando búsqueda web y los asigna automáticamente.
+    """
+    catalogo = obtener_catalogo(forzar=True)
+    if not catalogo:
+        tg("No pude obtener el catálogo."); return
+
+    sin_video = []
+    for prod in catalogo:
+        r = _get(f"{API_BASE}/products/{prod['id']}")
+        if r is not None and r.status_code == 200:
+            if not r.json().get("video_url"):
+                sin_video.append(prod)
+        time.sleep(0.3)
+
+    if not sin_video:
+        tg("Todos los productos ya tienen video asignado."); return
+
+    tg(f"Buscando videos para *{len(sin_video)}* productos sin video...")
+
+    ok = 0; sin_resultado = []
+    for prod in sin_video:
+        nombre = prod["nombre"]
+        # Buscar en YouTube via requests
+        query = nombre.replace(" ", "+") + "+herramienta+reparacion"
+        try:
+            r_yt = requests.get(
+                f"https://www.youtube.com/results?search_query={query}",
+                headers={"User-Agent": USER_AGENT}, timeout=10
+            )
+            import re as _re
+            # Extraer primer video ID del HTML
+            matches = _re_findall = _re.findall(r'"videoId":"([a-zA-Z0-9_-]{11})"', r_yt.text)
+            if matches:
+                video_url = f"https://www.youtube.com/watch?v={matches[0]}"
+                if set_video_producto(prod["id"], video_url):
+                    ok += 1
+                    print(f"Video OK: {nombre} -> {video_url}")
+                else:
+                    sin_resultado.append(nombre)
+            else:
+                sin_resultado.append(nombre)
+        except Exception as e:
+            print(f"Error buscando video para {nombre}: {e}")
+            sin_resultado.append(nombre)
+        time.sleep(1)
+
+    tg(f"*Videos asignados:* {ok}\n*Sin resultado:* {len(sin_resultado)}")
+    if sin_resultado:
+        tg("Sin video:\n" + "\n".join(f"• {n}" for n in sin_resultado[:20]))
+
+
 def procesar_cmd(texto):
     global _token, _store_id
     texto = texto.strip()
@@ -1991,6 +2050,11 @@ def procesar_cmd(texto):
             tg(f"✅ Respuesta recibida\nHTTP {r.status_code}\n`{r.text[:300]}`")
         except Exception as e:
             tg(f"❌ Excepción real: `{type(e).__name__}: {e}`")
+
+    elif cmd[0] == "/buscar_todos_videos":
+        if not _token: tg("Necesito el token primero."); return
+        threading.Thread(target=run_buscar_todos_videos, daemon=True).start()
+        tg("Buscando videos en YouTube para todos los productos sin video...")
 
     elif cmd[0] == "/set_video":
         if not _token: tg("Necesito el token primero."); return
