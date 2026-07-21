@@ -79,6 +79,19 @@ GROQ_API_KEY       = _e("GROQ_API_KEY")
 WEBSHARE_PROXY     = _e("WEBSHARE_PROXY")
 WEBSHARE_USER      = _e("WEBSHARE_USER")
 WEBSHARE_PASS      = _e("WEBSHARE_PASS")
+
+# ── Proxy residencial DataImpulse (bypass Cloudflare definitivo) ─────────────
+PROXY_HOST         = _e("PROXY_HOST")      # gw.dataimpulse.com
+PROXY_PORT         = _e("PROXY_PORT")      # 823
+PROXY_USER         = _e("PROXY_USER")
+PROXY_PASS         = _e("PROXY_PASS")
+
+def _get_residential_proxy():
+    """Arma URL del proxy residencial si las credenciales están configuradas."""
+    if PROXY_HOST and PROXY_PORT and PROXY_USER and PROXY_PASS:
+        return f"http://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
+    return None
+
 PROV_PASS      = _e("PROV_PASS")
 CUIT_PROVEEDOR = _e("CUIT_PROVEEDOR")
 PROV_LOGIN_URL = "https://rxzweb.com/wp-login.php"
@@ -261,7 +274,6 @@ _cat_cache = None
 _cat_ts    = 0
 
 def _fetch_variantes(pid):
-    """Descarga variantes de un producto desde la API. Devuelve lista o []."""
     r_var = _get(f"{API_BASE}/products/{pid}/variants", params={"per_page":200})
     variantes = []
     if r_var and r_var.status_code == 200:
@@ -277,13 +289,6 @@ def _fetch_variantes(pid):
     return variantes
 
 def obtener_catalogo(forzar=False, pids_refrescar=None):
-    """
-    Descarga el catalogo con cache inteligente de variantes en DB.
-    - Primera vez / producto nuevo: descarga variantes y las guarda en DB.
-    - Ciclos siguientes: usa las variantes cacheadas.
-    - pids_refrescar: set de IDs cuyas variantes hay que re-pedir.
-    - forzar=True: refresca lista de productos pero usa cache de variantes.
-    """
     global _cat_cache, _cat_ts
     if not forzar and _cat_cache and (time.time()-_cat_ts) < 300:
         return _cat_cache
@@ -293,7 +298,7 @@ def obtener_catalogo(forzar=False, pids_refrescar=None):
         pids_refrescar = set()
 
     db = leer_db()
-    var_cache = db.get("variantes_cache", {})  # {str(pid): [lista de variantes]}
+    var_cache = db.get("variantes_cache", {})
 
     print("📥 Descargando catálogo Tienda Negocio...")
     raw = []; pagina = 1
@@ -343,7 +348,6 @@ def obtener_catalogo(forzar=False, pids_refrescar=None):
             "descripcion": ((lambda d: (d.get("es") or d.get("en") or next(iter(d.values()),"")) if isinstance(d, dict) else str(d or ""))(p.get("description",""))).strip()
         })
 
-    # Limpiar del cache productos que ya no existen
     pids_actuales = {str(p.get("id")) for p in raw if p.get("id")}
     eliminados = [k for k in var_cache if k not in pids_actuales]
     for k in eliminados: del var_cache[k]
@@ -399,17 +403,11 @@ def set_envio_gratis(pid, activo):
 # ENVÍO GRATIS — LÓGICA CENTRALIZADA
 # ══════════════════════════════════════════════════════════════════════════════
 def _debe_tener_envio_gratis(pid, precio):
-    """
-    Devuelve True si el producto debe tener envío gratis.
-    Regla: precio >= ENVIO_GRATIS_MIN y NO está en la lista de pesados.
-    """
     if pid in PRODUCTOS_PESADOS_IDS:
         return False
     return precio >= ENVIO_GRATIS_MIN
 
 def _actualizar_envio_gratis_prod(prod, precio):
-    """Activa/desactiva envío gratis según precio. Excluye productos pesados.
-    Usa el precio máximo entre variantes para no desactivar por una variante barata."""
     pid = prod["id"]
     if prod.get("variantes"):
         precio_max = max(v["precio"] for v in prod["variantes"])
@@ -418,41 +416,28 @@ def _actualizar_envio_gratis_prod(prod, precio):
     activo = _debe_tener_envio_gratis(pid, precio_max)
     set_envio_gratis(pid, activo)
 
-
 def run_fix_envio_gratis():
-    """
-    Comando /fix_envio_gratis — recorre TODO el catálogo y aplica
-    la regla de envío gratis independientemente de si el precio cambió.
-    Útil para aplicar la lógica por primera vez o después de cambiar ENVIO_GRATIS_MIN.
-    """
     if not _token:
         tg("❌ Necesito el token primero."); return
-
     tg(f"🚚 *{_nt('Fix envío gratis iniciado')}*\nRecorriendo catálogo...")
     catalogo = obtener_catalogo(forzar=True)
     if not catalogo:
         tg("❌ No pude obtener el catálogo."); return
-
     db   = leer_db()
     prov = db.get("productos_proveedor", {})
     sinc = db.get("sincronizados", {})
     if not prov:
         tg("\u26a0\ufe0f Sin datos del proveedor. Esperá un ciclo primero."); return
     idx = construir_indice(prov)
-
     activados    = []
     desactivados = []
     pesados_skip = []
-
     for prod in catalogo:
         pid    = prod["id"]
         nombre = prod["nombre"]
-
         if pid in PRODUCTOS_PESADOS_IDS:
             pesados_skip.append(f"• *{nombre}* (pesado, sin tocar)")
             continue
-
-        # Usar precio calculado desde el proveedor (no el del catálogo que puede ser 0)
         _, datos_prov = buscar_en_indice(prod["nombre_norm"], idx)
         if datos_prov:
             if datos_prov.get("variantes"):
@@ -460,9 +445,7 @@ def run_fix_envio_gratis():
             else:
                 precio_max = precio_obj(datos_prov["precio_base"])
         else:
-            # Sin datos del proveedor: usar precio guardado en sincronizados
             precio_max = sinc.get(nombre, {}).get("precio", 0)
-
         if precio_max >= ENVIO_GRATIS_MIN:
             if set_envio_gratis(pid, True):
                 activados.append(f"• *{nombre}* — ${int(precio_max):,}")
@@ -470,13 +453,11 @@ def run_fix_envio_gratis():
             if set_envio_gratis(pid, False):
                 desactivados.append(f"• *{nombre}* — ${int(precio_max):,}")
         time.sleep(0.5)
-
     resumen = (f"✅ *{_nt('Fix envío gratis terminado')}*\n\n"
                f"🚚 Activados: *{len(activados)}*\n"
                f"❌ Desactivados: *{len(desactivados)}*\n"
                f"⏭️ Pesados (sin tocar): *{len(pesados_skip)}*")
     tg(resumen)
-
     if activados:
         for i in range(0, len(activados), 30):
             tg("🚚 *Con envío gratis:*\n\n" + "\n".join(activados[i:i+30]))
@@ -491,10 +472,6 @@ SCRAPERAPI_KEY2 = _e("SCRAPERAPI_KEY2")
 SCRAPERAPI_URL = "http://api.scraperapi.com"
 
 def _via_scraperapi(url, params=None):
-    """
-    Pasa la request por ScraperAPI rotando entre KEY y KEY2.
-    Si una falla o se queda sin créditos, prueba la otra automáticamente.
-    """
     keys = [k for k in [SCRAPERAPI_KEY, SCRAPERAPI_KEY2] if k]
     if not keys:
         print("⚠️ Sin SCRAPERAPI_KEY configurada — no puedo usar fallback")
@@ -523,38 +500,33 @@ def _prov_get(url, params=None, usar_scraperapi=False):
     if usar_scraperapi:
         r = _via_scraperapi(url, params)
         return r
-    # Construir proxies con autenticación correcta para HTTPS
-    if WEBSHARE_USER and WEBSHARE_PASS:
-        # Lista de proxies a rotar
-        _proxy_list = [
-            f"http://{WEBSHARE_USER}:{WEBSHARE_PASS}@31.59.20.176:6754",
-            f"http://{WEBSHARE_USER}:{WEBSHARE_PASS}@31.56.127.193:7684",
-            f"http://{WEBSHARE_USER}:{WEBSHARE_PASS}@45.38.107.97:6014",
-            f"http://{WEBSHARE_USER}:{WEBSHARE_PASS}@198.105.121.200:6462",
-            f"http://{WEBSHARE_USER}:{WEBSHARE_PASS}@64.137.96.74:6641",
-        ]
-        import random
-        _proxy_url = random.choice(_proxy_list)
-        proxies = {"http": _proxy_url, "https": _proxy_url}
-    elif WEBSHARE_PROXY:
-        proxies = {"http": WEBSHARE_PROXY, "https": WEBSHARE_PROXY}
-    else:
-        proxies = None
-    for _ in range(3):
+
+    # Prioridad: 1) Proxy residencial DataImpulse  2) curl-cffi directo  3) ScraperAPI
+    res_proxy = _get_residential_proxy()
+
+    for intento in range(3):
         try:
-            if CURL_CFFI_OK and not proxies:
-                # curl-cffi imita TLS fingerprint de Chrome — sin proxy
+            if res_proxy:
+                # Proxy residencial — IP de casa real, Cloudflare no bloquea
+                proxies = {"http": res_proxy, "https": res_proxy}
+                r = requests.get(url, params=params, timeout=30,
+                                 headers={"User-Agent": USER_AGENT},
+                                 proxies=proxies)
+            elif CURL_CFFI_OK:
+                # curl-cffi imita TLS fingerprint de Chrome
                 r = cf_requests.get(url, params=params, timeout=20,
                                     impersonate="chrome120",
                                     headers={"User-Agent": USER_AGENT})
             else:
-                # Con proxy residencial Webshare — esquiva bloqueo por IP
-                r = requests.get(url, params=params, timeout=30,
-                                 headers={"User-Agent": USER_AGENT},
-                                 proxies=proxies)
-            if r.status_code == 429: print("⚠️ Rate limit proveedor"); time.sleep(3); continue
+                r = requests.get(url, params=params, timeout=20,
+                                 headers={"User-Agent": USER_AGENT})
+
+            if r.status_code == 429:
+                print("⚠️ Rate limit proveedor"); time.sleep(3); continue
             return r
-        except Exception as e: print(f"⚠️ Proveedor API: {e}"); time.sleep(1)
+        except Exception as e:
+            print(f"⚠️ Proveedor API (intento {intento+1}/3): {e}")
+            time.sleep(2)
     return None
 
 def _precio_real(p):
@@ -571,7 +543,6 @@ def scrapear_proveedor():
         if not r or r.status_code not in (200, 201, 202):
             codigo = r.status_code if r is not None else 'None'
             print(f"❌ Proveedor HTTP {codigo}")
-            # Si es 403 y tenemos ScraperAPI disponible, activarlo como fallback
             if codigo == 403 and not via_scraperapi and (SCRAPERAPI_KEY or SCRAPERAPI_KEY2):
                 print("🔄 HTTP 403 — activando ScraperAPI como fallback...")
                 via_scraperapi = True
@@ -579,7 +550,6 @@ def scrapear_proveedor():
             break
         if r.status_code == 202:
             reintentos_202 += 1
-            # Fallback ScraperAPI — rota entre KEY y KEY2 automáticamente
             if reintentos_202 == 2 and not via_scraperapi and (SCRAPERAPI_KEY or SCRAPERAPI_KEY2):
                 print("🔄 Activando ScraperAPI como fallback...")
                 via_scraperapi = True
@@ -609,7 +579,7 @@ def scrapear_proveedor():
             nombre_base = normalizar(nombre_orig)
             tipo        = p.get("type","simple")
             woo_id      = p.get("id")
-            precio_pub      = _precio_real(p)   # precio activo (rebajado si hay oferta)
+            precio_pub      = _precio_real(p)
             precio_original = int(p.get("prices",{}).get("regular_price",0)) // 100
             en_oferta       = p.get("on_sale", False) and 0 < precio_pub < precio_original
             in_stock        = p.get("is_in_stock", False)
@@ -717,7 +687,6 @@ def construir_indice(prov):
             idx[base] = {"precio_base":d["precio"], "precio_anterior":d.get("precio_anterior",0),
                          "stock_base":d.get("stock",0),
                          "en_oferta":d.get("en_oferta",False), "variantes":{}}
-
         nombre_real = d.get("nombre_real", clave)
         if '(' in nombre_real:
             var_part = nombre_real.split('(',1)[-1].rstrip(')')
@@ -747,11 +716,6 @@ def buscar_en_indice(nombre_norm, idx):
 # SINCRONIZACIÓN DE PRECIOS
 # ══════════════════════════════════════════════════════════════════════════════
 def sincronizar_precios(prod, datos_prov):
-    """
-    Actualiza precios de todas las variantes (o el producto si no tiene).
-    Si el proveedor tiene oferta activa, usa promotional_price para mostrar
-    el precio original tachado junto al precio de oferta.
-    """
     pid            = prod["id"]
     variantes      = prod["variantes"]
     en_oferta      = datos_prov.get("en_oferta", False)
@@ -763,16 +727,13 @@ def sincronizar_precios(prod, datos_prov):
         if precio_actual > 0 and p > 0 and (p / precio_actual) < 0.40:
             print("BLOQUEADO baja >60%: " + prod.get("nombre","?")[:40])
             return False, 0, 0
-
         if en_oferta and precio_anterior > 0:
-            # Precio original tachado → precio oferta activo
             p_orig = precio_obj(precio_anterior)
             r = _put(f"{API_BASE}/products/{pid}", {
                 "price": str(int(p_orig)),
                 "promotional_price": str(int(p))
             })
         else:
-            # Sin oferta: precio normal, borrar precio promocional si había
             r = _put(f"{API_BASE}/products/{pid}", {
                 "price": str(int(p)),
                 "promotional_price": ""
@@ -803,7 +764,6 @@ def sincronizar_precios(prod, datos_prov):
             "precio_anterior": precio_obj(costo_ant) if costo_ant else 0,
             "en_oferta":       v_oferta
         }
-
     exitos = 0
     for vid, pd in precios.items():
         p = pd["precio"]
@@ -815,9 +775,7 @@ def sincronizar_precios(prod, datos_prov):
         if r and r.status_code in (200, 201): exitos += 1
         else: print(f"  ⚠️ precio variante {vid}: HTTP {r.status_code if r is not None else 'None'}")
         time.sleep(0.4)
-
     if not precios or exitos == 0: return False, 0, 0
-
     precio_min = min(pd["precio"] for pd in precios.values())
     precio_max = max(pd["precio"] for pd in precios.values())
     _actualizar_envio_gratis_prod(prod, precio_min)
@@ -833,9 +791,7 @@ def sincronizar_stock(prod, datos_prov, sinc):
     variantes   = prod["variantes"]
     vars_prov   = datos_prov.get("variantes", {})
     stock_base  = datos_prov.get("stock_base", 0)
-
     if stock_base >= 9999: return
-
     if variantes:
         for v in variantes:
             vnom  = normalizar(v["nombre"])
@@ -854,9 +810,6 @@ def sincronizar_stock(prod, datos_prov, sinc):
             set_stock_producto(pid, stock_base)
             sinc.setdefault(nombre_real,{})["stock_sinc"] = stock_base
 
-# ══════════════════════════════════════════════════════════════════════════════
-# MARCAR SIN STOCK
-# ══════════════════════════════════════════════════════════════════════════════
 def marcar_sin_stock(prod):
     pid = prod["id"]; variantes = prod["variantes"]
     if variantes:
@@ -881,26 +834,21 @@ def run_sync_total():
     sinc = db.get("sincronizados",{})
     if not prov:
         tg("⚠️ Sin datos del proveedor. Esperá un ciclo de monitoreo primero."); return
-
     catalogo = obtener_catalogo(forzar=True)
     if not catalogo:
         tg("❌ No pude obtener el catálogo de la API."); return
-    db = leer_db()  # Re-leer para no pisar variantes_cache
+    db = leer_db()
     sinc = db.get("sincronizados", sinc)
-
     idx   = construir_indice(prov)
     total = len(catalogo)
     act_precios   = []
     act_sin_stock = []
     errores       = []
-
     tg(f"🔄 *{_nt('Sync total iniciada')}*\n{total} productos a procesar...")
-
     for i, prod in enumerate(catalogo):
         nombre_real = prod["nombre"]
         precio_web  = prod["precio_base"]
         _, datos_prov = buscar_en_indice(prod["nombre_norm"], idx)
-
         if datos_prov is None:
             if marcar_sin_stock(prod):
                 sinc[nombre_real] = {"sin_stock": True}
@@ -911,7 +859,6 @@ def run_sync_total():
             if sinc.get(nombre_real,{}).get("sin_stock"):
                 precio_guardado = sinc[nombre_real].get("precio",0)
                 sinc[nombre_real] = {"precio":precio_guardado} if precio_guardado else {}
-
             ok, p_min, p_max = sincronizar_precios(prod, datos_prov)
             if ok:
                 sinc.setdefault(nombre_real,{})["precio"] = p_min
@@ -921,21 +868,16 @@ def run_sync_total():
                     act_precios.append(f"• *{nombre_real}* {etiq}\n  Antes: ${int(precio_web):,} → *Nuevo: {rango}*")
             else:
                 errores.append(nombre_real)
-
             sincronizar_stock(prod, datos_prov, sinc)
-
         if (i+1) % 50 == 0: print(f"   Sync [{i+1}/{total}]")
-
     db["sincronizados"] = sinc
     escribir_db(db)
-
     resumen = (f"✅ *{_nt('Sync total terminada')}*\n\n"
                f"📊 Total: *{total}*\n"
                f"💲 Precios actualizados: *{len(act_precios)}*\n"
                f"📦 Sin stock: *{len(act_sin_stock)}*\n")
     if errores: resumen += f"⚠️ Errores: *{len(errores)}*"
     tg(resumen)
-
     for i in range(0, len(act_precios), 20):
         tg(f"💲 *Precios actualizados:*\n\n" + "\n\n".join(act_precios[i:i+20]))
     for i in range(0, len(act_sin_stock), 30):
@@ -1045,40 +987,24 @@ def generar_excel():
 # CICLO DE MONITOREO
 # ══════════════════════════════════════════════════════════════════════════════
 
-# ══════════════════════════════════════════════════════════════════════════════
-# DETECCIÓN DE ÓRDENES VIA API (más confiable que Gmail)
-# ══════════════════════════════════════════════════════════════════════════════
 def chequear_ordenes_api():
-    """
-    Consulta GET /orders buscando pedidos nuevos desde el último conocido.
-    No depende de emails leídos. Se ejecuta en cada ciclo.
-    Primera ejecución: guarda el estado actual sin notificar (evita spam de órdenes viejas).
-    """
     if not _token: return []
     try:
         db  = leer_db()
         ultimo_id = db.get("ultimo_orden_id", 0)
-
         params = {"per_page": 50}
         if ultimo_id:
             params["since_id"] = ultimo_id
-
         r = _get(f"{API_BASE}/orders", params=params)
         if r is None or r.status_code != 200:
             detalle = r.text[:150] if r is not None else "Sin respuesta"
             print(f"⚠️ Órdenes API: HTTP {r.status_code if r is not None else 'None'} — {detalle}")
             return []
-
         data    = r.json()
         ordenes = data.get("results", data) if isinstance(data, dict) else data
         if not isinstance(ordenes, list) or not ordenes:
             return []
-
         max_id = max(o.get("id", 0) for o in ordenes)
-
-        # Primera ejecución o DB reseteada: guardar estado sin notificar.
-        # Marcamos TODAS las ordenes existentes como procesadas
-        # para evitar spam tras un redeploy de Railway.
         if ultimo_id == 0:
             db["ultimo_orden_id"] = max_id
             ya_proc = db.get("pedidos_procesados", [])
@@ -1090,39 +1016,30 @@ def chequear_ordenes_api():
             escribir_db(db)
             print(f"   Ordenes API: primer ciclo — {len(ordenes)} ordenes marcadas como procesadas")
             return []
-
-        # Actualizar ultimo ID conocido
         if max_id > ultimo_id:
             db["ultimo_orden_id"] = max_id
             escribir_db(db)
-
         print(f"   Ordenes API: {len(ordenes)} desde ID {ultimo_id}")
         return ordenes
-
     except Exception as e:
         print(f"❌ chequear_ordenes_api: {e}")
         return []
 
-
 def notificar_orden_nueva(orden):
-    """Arma y envía notificación Telegram para una orden nueva."""
     num      = str(orden.get("number", orden.get("id", "?")))
     productos = orden.get("products", [])
     total    = float(orden.get("total") or 0)
     pago_st  = orden.get("payment_status", "?")
     envio    = orden.get("shipping", {})
     metodo   = envio.get("pickup_type", "") or envio.get("method", "") or ""
-
     db   = leer_db()
     prov = db.get("productos_proveedor", {})
-
     msg  = "🛒 *" + _nt("¡Nuevo Pedido #" + num + "!") + "*\n\n"
     msg += f"💰 Total: *${total:,.0f}*\n"
     msg += f"💳 Pago: *{pago_st}*\n"
     if metodo:
         msg += f"📦 Envío: *{metodo}*\n"
     msg += "\n"
-
     if prov:
         idx = construir_indice(prov)
         for item in productos:
@@ -1139,7 +1056,6 @@ def notificar_orden_nueva(orden):
     else:
         for item in productos:
             msg += f"• *{item.get('name','?')}* x{item.get('quantity',1)}\n"
-
     tg(msg)
 
 def ciclo_monitoreo():
@@ -1148,27 +1064,19 @@ def ciclo_monitoreo():
     prov_ant    = db.get("productos_proveedor",{})
     sinc        = db.get("sincronizados",{})
     ped_proc    = db.get("pedidos_procesados",[])
-
-    # Detección de órdenes via API (principal) + Gmail (backup)
     for orden in chequear_ordenes_api():
         oid = str(orden.get("id", ""))
         if oid not in ped_proc:
             notificar_orden_nueva(orden)
             ped_proc.append(oid)
-
-    # Guardar ped_proc YA para no perderlo si el ciclo aborta por fallo del proveedor
     db["pedidos_procesados"] = ped_proc
-    db["ultimo_orden_id"] = db.get("ultimo_orden_id", 0)  # Preservar entre ciclos
+    db["ultimo_orden_id"] = db.get("ultimo_orden_id", 0)
     escribir_db(db)
-
-    # Gmail como backup (por si acaso)
     for ped in chequear_gmail():
         if ped["id"] not in ped_proc:
             ped_proc.append(ped["id"])
-
     prov_nuevo = scrapear_proveedor()
     if not prov_nuevo:
-        # Usar datos del ultimo ciclo exitoso en vez de abortar
         if prov_ant:
             print("⚠️ Proveedor sin datos — usando cache del ultimo ciclo exitoso")
             prov_nuevo = prov_ant
@@ -1176,35 +1084,24 @@ def ciclo_monitoreo():
             print("⚠️ Proveedor 0 productos y sin cache. Abortando.")
             tg(f"⚠️ *{_nt('Proveedor sin datos')}* — sin cache disponible. Se reintentará en el próximo ciclo.")
             return
-
     prov_consolidado = {**prov_ant, **prov_nuevo}
     idx      = construir_indice(prov_nuevo)
-
-    # Leer pids marcados para refrescar variantes en este ciclo
     pids_refrescar = set(db.get("pids_refrescar", []))
-    db["pids_refrescar"] = []  # Limpiar para el proximo ciclo
-
+    db["pids_refrescar"] = []
     catalogo = obtener_catalogo(pids_refrescar=pids_refrescar) if _token else []
-    db = leer_db()  # Re-leer para no pisar variantes_cache guardado por obtener_catalogo
+    db = leer_db()
     sinc = db.get("sincronizados", sinc)
-
     bloque_nuevos = ""; bloque_recuperados = ""
     lineas_precios    = []
     lineas_sin_stock  = []
     lineas_stock_bajo = []
-
-    # ── Analizar novedades del proveedor ──────────────────────────────────────
     ofertas_nuevas = {}
     for clave, datos in prov_nuevo.items():
         viejo = prov_ant.get(clave, {})
-
-        # Oferta nueva real del proveedor
         if datos["en_oferta"] and datos.get("precio_anterior",0) > datos["precio"] and not viejo.get("en_oferta", False):
             base = datos["nombre_base_proveedor"]
             if base not in ofertas_nuevas:
                 ofertas_nuevas[base] = datos
-
-        # Producto nuevo que no tengo en mi web
         base_norm = datos.get("nombre_base_proveedor", clave)
         tengo = any(match(p["nombre_norm"], base_norm) for p in catalogo) if catalogo else False
         if not tengo and not viejo:
@@ -1212,16 +1109,12 @@ def ciclo_monitoreo():
             if any(w in clave for w in PALABRAS_INTERES):
                 bloque_nuevos += (f"• *{datos['nombre_real']}*\n"
                                   f"  Costo: ${datos['precio']:,} → Sugerido: ${p_sug:,}\n\n")
-
-        # Stock recuperado
         if viejo and not viejo.get("stock", True) and datos.get("stock", True):
             nombre_r = datos["nombre_real"]
             if sinc.get(nombre_r,{}).get("sin_stock"):
                 precio_guardado = sinc[nombre_r].get("precio",0)
                 sinc[nombre_r]  = {"precio":precio_guardado} if precio_guardado else {}
                 bloque_recuperados += f"• *{nombre_r}*\n\n"
-
-        # Alerta stock bajo
         stock = datos.get("stock", 0)
         if isinstance(stock, (int,float)) and 0 < stock <= ALERTA_STOCK and stock < 9999:
             nombre_r = datos["nombre_real"]
@@ -1229,22 +1122,17 @@ def ciclo_monitoreo():
             if ultimo_alerta_stock != int(stock):
                 lineas_stock_bajo.append(f"• *{nombre_r}*: {int(stock)} unidad{'es' if stock>1 else ''}")
                 sinc.setdefault(nombre_r,{})["alerta_stock_cant"] = int(stock)
-
-    # Guardar y notificar ofertas pendientes
     if ofertas_nuevas:
         db["ofertas_pendientes"] = ofertas_nuevas
         nums = [f"{i+1}. *{d['nombre_real']}*\n   Reg: ${d.get('precio_anterior',0):,} → 🔥 ${d['precio']:,}"
                 for i,(k,d) in enumerate(ofertas_nuevas.items())]
         tg(f"🏷️ *{_nt('Ofertas nuevas del Proveedor')}*\n\n" + "\n".join(nums) +
            f"\n\nUsá `/aplicar_ofertas todos` o `/aplicar_ofertas 1 3` para aplicarlas.")
-
-    # ── Actualizar mi tienda ──────────────────────────────────────────────────
     for prod in catalogo:
         nombre_real = prod["nombre"]
         precio_web  = prod["precio_base"]
         sync_actual = sinc.get(nombre_real, {})
         _, datos_prov = buscar_en_indice(prod["nombre_norm"], idx)
-
         if datos_prov is None:
             if not sync_actual.get("sin_stock", False):
                 if marcar_sin_stock(prod):
@@ -1256,7 +1144,6 @@ def ciclo_monitoreo():
                 precio_guardado = sync_actual.get("precio", 0)
                 sinc[nombre_real] = {"precio": precio_guardado} if precio_guardado else {}
                 sync_actual = sinc[nombre_real]
-
             p_obj_calc = precio_obj(datos_prov["precio_base"])
             if p_obj_calc != sync_actual.get("precio", 0):
                 ratio = (p_obj_calc / precio_web) if precio_web > 0 else 1
@@ -1270,7 +1157,6 @@ def ciclo_monitoreo():
                     ok, p_min, p_max = sincronizar_precios(prod, datos_prov)
                     if ok:
                         sinc.setdefault(nombre_real, {})["precio"] = p_min
-                        # Marcar para refrescar variantes en el proximo ciclo
                         db.setdefault("pids_refrescar", [])
                         if prod["tiene_variantes"] and prod["id"] not in db["pids_refrescar"]:
                             db["pids_refrescar"].append(prod["id"])
@@ -1283,12 +1169,8 @@ def ciclo_monitoreo():
                             linea += " Nuevo $" + rango
                             lineas_precios.append(linea)
             else:
-                # Precio no cambió → igual verificar envío gratis por si no estaba aplicado
                 _actualizar_envio_gratis_prod(prod, p_obj_calc)
-
             sincronizar_stock(prod, datos_prov, sinc)
-
-    # ── Notificaciones ────────────────────────────────────────────────────────
     if bloque_nuevos:
         tg(f"🔥 *{_nt('¡Nuevo producto en el Proveedor!')}*\n\n{bloque_nuevos}")
     if bloque_recuperados:
@@ -1299,10 +1181,8 @@ def ciclo_monitoreo():
         tg(f"📦 *{_nt('Marcados sin stock:')}*\n\n" + "\n".join(lineas_sin_stock[i:i+30]))
     if lineas_stock_bajo:
         tg(f"⚠️ *{_nt('Stock bajo en proveedor:')}*\n\n" + "\n".join(lineas_stock_bajo))
-
     if not any([bloque_nuevos, bloque_recuperados, lineas_precios, lineas_sin_stock, lineas_stock_bajo]):
         print("✅ Sin cambios.")
-
     db["productos_proveedor"] = prov_consolidado
     db["sincronizados"]       = sinc
     db["pedidos_procesados"]  = ped_proc
@@ -1425,33 +1305,27 @@ def procesar_orden_pagada(datos_orden):
     productos  = datos_orden.get("products", datos_orden.get("line_items", []))
     envio_tipo = datos_orden.get("shipping", {}).get("pickup_type", "shipping")
     es_retiro  = "pickup" in str(envio_tipo).lower() or "retiro" in str(envio_tipo).lower()
-
     db      = leer_db()
     prov    = db.get("productos_proveedor", {})
     idx     = construir_indice(prov)
-
     items_pedido = []
     hay_problema = False
     lineas_msg   = ["Orden pagada #" + num_orden, ""]
-
     for item in productos:
         nombre   = item.get("name", item.get("product_name","?"))
         cantidad = item.get("quantity", 1)
         nn       = normalizar(nombre)
         _, dp    = buscar_en_indice(nn, idx)
-
         if dp is None:
             lineas_msg.append("NO ENCONTRADO: " + nombre + " x" + str(cantidad))
             hay_problema = True
             continue
-
         stock_disp = dp.get("stock_base", 0)
         if stock_disp < cantidad:
             lineas_msg.append("STOCK BAJO: " + nombre + " x" + str(cantidad) + " (disponible: " + str(stock_disp) + ")")
             hay_problema = True
         else:
             lineas_msg.append("OK: " + nombre + " x" + str(cantidad))
-
         woo_id = None; var_id = None
         for clave, d in prov.items():
             base = normalizar(d.get("nombre_base_proveedor", clave))
@@ -1463,9 +1337,7 @@ def procesar_orden_pagada(datos_orden):
                         if normalizar(d2.get("nombre_base_proveedor",""))==base and "(" not in d2.get("nombre_real",""):
                             woo_id=d2.get("woo_id"); break
                 break
-
         items_pedido.append({"nombre":nombre,"product_id":woo_id,"variation_id":var_id,"quantity":cantidad})
-
     ship = datos_orden.get("shipping", {})
     datos_cli = {
         "first_name": cliente.get("first_name",""),
@@ -1478,7 +1350,6 @@ def procesar_orden_pagada(datos_orden):
         "email":      cliente.get("email",""),
     }
     nota = "Orden cliente #" + num_orden + (" - RETIRO EN LOCAL" if es_retiro else "")
-
     sep = chr(10)
     if hay_problema:
         lineas_msg.append("")
@@ -1501,18 +1372,9 @@ def procesar_orden_pagada(datos_orden):
 # COMANDOS TELEGRAM
 # ══════════════════════════════════════════════════════════════════════════════
 def run_productos_sin_cargar(modo_todo=False):
-    """
-    Muestra productos del proveedor que no están cargados en la tienda.
-    Excluye siempre: Pantallas/Modulos y Baterias.
-    modo_todo=False → filtra por PALABRAS_INTERES
-    modo_todo=True  → muestra todo (menos categorías excluidas)
-    """
     if not _token:
         tg("❌ Necesito el token primero."); return
-
     tg(f"🔍 *{_nt('Buscando productos del proveedor sin cargar...')}*")
-
-    # Scrapear proveedor fresco con categorías
     productos_prov = {}; pagina = 1
     while True:
         r = _prov_get(PROV_API, params={"per_page":100,"page":pagina})
@@ -1522,7 +1384,6 @@ def run_productos_sin_cargar(modo_todo=False):
         for p in lote:
             nombre = p.get("name","").strip()
             if not nombre or len(nombre) < 4: continue
-            # Chequear categorías excluidas
             cats = [c.get("slug","").lower() + " " + c.get("name","").lower()
                     for c in p.get("categories",[])]
             cats_str = " ".join(cats)
@@ -1539,11 +1400,8 @@ def run_productos_sin_cargar(modo_todo=False):
             }
         if len(lote) < 100: break
         pagina += 1; time.sleep(0.5)
-
     catalogo = obtener_catalogo()
     cat_norms = {p["nombre_norm"] for p in catalogo}
-
-    # Filtrar los que no están en mi tienda
     sin_cargar = []
     for norm, datos in productos_prov.items():
         en_tienda = any(match(norm, cn) for cn in cat_norms)
@@ -1551,28 +1409,22 @@ def run_productos_sin_cargar(modo_todo=False):
         if not modo_todo:
             if not any(w in norm for w in PALABRAS_INTERES): continue
         sin_cargar.append(datos)
-
     if not sin_cargar:
         modo_txt = "en toda la lista" if modo_todo else "con palabras de interés"
         tg(f"ℹ️ No hay productos sin cargar {modo_txt}."); return
-
     modo_txt = "🗂 *Todos* (sin Pantallas/Baterías)" if modo_todo else "🎯 *Filtrado por palabras de interés*"
     header = f"📦 *{_nt('Productos sin cargar en tu tienda')}*\n{modo_txt}\nTotal: *{len(sin_cargar)}*"
     tg(header)
-
     lineas = []
     for d in sin_cargar:
         stock_txt = f"Stock: {d['stock']}" if d['stock'] < 9999 else "Stock: ∞"
         linea = f"• *{d['nombre_real']}*\n  Costo: ${d['precio']:,} → Sugerido: ${d['precio_sug']:,} | {stock_txt}"
         lineas.append(linea)
-
     for i in range(0, len(lineas), 20):
         tg("\n\n".join(lineas[i:i+20]))
 
-
-
 # ══════════════════════════════════════════════════════════════════════════════
-# WEBHOOK SERVER — Recibe eventos de Tienda Nube en tiempo real
+# WEBHOOK SERVER
 # ══════════════════════════════════════════════════════════════════════════════
 if FLASK_OK:
     flask_app = Flask(__name__)
@@ -1602,44 +1454,33 @@ if FLASK_OK:
         print(f"🌐 Webhook server en puerto {port}")
         flask_app.run(host="0.0.0.0", port=port, debug=False, use_reloader=False)
 
-
 def obtener_orden(orden_id):
-    """Obtiene datos completos de una orden desde la API de Tienda Nube."""
     r = _get(f"{API_BASE}/orders/{orden_id}")
     if r and r.status_code == 200:
         return r.json()
     print(f"❌ No pude obtener orden {orden_id}: HTTP {r.status_code if r is not None else 'None'}")
     return None
 
-
 def procesar_webhook_pedido_nuevo(orden_id):
-    """
-    Webhook order/created: notifica al instante con items y chequeo de stock.
-    Reemplaza la detección por Gmail para pedidos nuevos.
-    """
-    time.sleep(1)  # Espera breve para que TN termine de guardar
+    time.sleep(1)
     orden = obtener_orden(orden_id)
     if not orden:
         tg("⚠️ *" + _nt('Nuevo pedido') + f"* recibido pero no pude obtener detalles (ID: {orden_id})")
         return
-
     num      = str(orden.get("number", orden_id))
     productos = orden.get("products", [])
     total    = orden.get("total", "0")
     pago_st  = orden.get("payment_status", "?")
     envio    = orden.get("shipping", {})
     metodo   = envio.get("pickup_type", "") or envio.get("method", "")
-
     db   = leer_db()
     prov = db.get("productos_proveedor", {})
-
     msg = "🛒 *" + _nt('¡Nuevo Pedido #' + num + '!') + "*\n\n"
     msg += f"💰 Total: *${float(total or 0):,.0f}*\n"
     msg += f"💳 Pago: *{pago_st}*\n"
     if metodo:
         msg += f"📦 Envío: *{metodo}*\n"
     msg += "\n"
-
     if prov:
         idx = construir_indice(prov)
         for item in productos:
@@ -1657,35 +1498,22 @@ def procesar_webhook_pedido_nuevo(orden_id):
     else:
         for item in productos:
             msg += f"• *{item.get('name','?')}* x{item.get('quantity',1)}\n"
-
     tg(msg)
 
-
 def procesar_webhook_pedido_pagado(orden_id):
-    """
-    Webhook order/paid: notifica pago confirmado y dispara compra automática.
-    """
     time.sleep(1)
     orden = obtener_orden(orden_id)
     if not orden:
         tg("⚠️ *" + _nt('Pedido pagado') + f"* pero no pude obtener detalles (ID: {orden_id})")
         return
-
     num = str(orden.get("number", orden_id))
     tg("💚 *" + _nt('¡Pago confirmado! Pedido #' + num) + "*")
     procesar_orden_pagada(orden)
 
-
-
 # ══════════════════════════════════════════════════════════════════════════════
 # GENERACIÓN DE DESCRIPCIONES CON IA
 # ══════════════════════════════════════════════════════════════════════════════
-
 def buscar_specs_producto(nombre):
-    """
-    Busca especificaciones técnicas del producto en la web.
-    Usa DuckDuckGo para encontrar fichas técnicas del fabricante.
-    """
     try:
         query = nombre.replace(" ", "+") + "+especificaciones+ficha+tecnica"
         r = requests.get(
@@ -1694,9 +1522,7 @@ def buscar_specs_producto(nombre):
             timeout=10
         )
         import re as _re
-        # Extraer snippets de texto de los resultados
         snippets = _re.findall(r'<a class="result__snippet"[^>]*>(.*?)</a>', r.text)
-        # Limpiar HTML
         limpios = []
         for s in snippets[:5]:
             limpio = _re.sub(r'<[^>]+>', '', s).strip()
@@ -1707,15 +1533,11 @@ def buscar_specs_producto(nombre):
         print(f"⚠️ Búsqueda web specs: {e}")
         return ""
 
-
 def generar_descripcion_ia(nombre, precio):
-    """Llama a Groq API (Llama) para generar descripcion de producto. Gratis."""
     if not GROQ_API_KEY:
         return None, "Falta GROQ_API_KEY en Railway Variables"
-    # Buscar especificaciones técnicas en la web
     specs = buscar_specs_producto(nombre)
     contexto_specs = f"\nInformacion encontrada en la web sobre el producto:\n{specs}\n" if specs else ""
-
     prompt = (
         "Sos un experto en herramientas para tecnicos de reparacion electronica de celulares y placas en Argentina.\n\n"
         f"Genera una descripcion de producto para una tienda online orientada a tecnicos profesionales.\n"
@@ -1748,33 +1570,22 @@ def generar_descripcion_ia(nombre, precio):
     except Exception as e:
         return None, f"Error Groq API: {e}"
 
-
 def set_descripcion_producto(pid, descripcion):
-    """Sube la descripcion a Tienda Nube."""
     r = _put(f"{API_BASE}/products/{pid}", {"description": {"es": descripcion}})
     return r is not None and r.status_code in (200, 201)
 
-
 def run_generar_todas_descripciones():
-    """
-    Recorre el catalogo y genera descripciones para productos que no tienen.
-    Envia progreso cada 10 productos.
-    """
     catalogo = obtener_catalogo(forzar=True)
     if not catalogo:
         tg("No pude obtener el catalogo."); return
-
     sin_desc = [p for p in catalogo if not p.get("descripcion")]
     total = len(sin_desc)
-
     if not sin_desc:
         tg("Todos los productos ya tienen descripcion."); return
-
     tg(f"*{_nt('Generando descripciones')}*\n\n"
        f"Productos sin descripcion: *{total}*\n"
        f"Tiempo estimado: ~{total * 3 // 60} minutos\n\n"
        f"Te aviso cada 10 productos.")
-
     ok = 0; errores = []; i = 0
     for prod in sin_desc:
         i += 1
@@ -1789,33 +1600,23 @@ def run_generar_todas_descripciones():
             errores.append(prod["nombre"])
         if i % 10 == 0:
             tg(f"Progreso: *{i}/{total}* ({ok} OK, {len(errores)} errores)")
-        time.sleep(2)  # Evitar rate limits
-
+        time.sleep(2)
     tg(f"*{_nt('Descripciones completadas')}*\n\n"
        f"Exitosas: *{ok}*\n"
        f"Errores: *{len(errores)}*" +
        (f"\n\nFallaron:\n" + "\n".join(f"• {e}" for e in errores[:10]) if errores else ""))
 
-
-
 def run_ver_ofertas_proveedor():
-    """
-    Muestra TODAS las ofertas activas del proveedor en este momento.
-    Las enumera para poder aplicar todas o solo algunas con /aplicar_ofertas.
-    """
     db   = leer_db()
     prov = db.get("productos_proveedor", {})
     if not prov:
         tg("Sin datos del proveedor. Esperá un ciclo primero."); return
-
-    # Filtrar solo los que tienen oferta activa
     ofertas = {}
     for clave, d in prov.items():
         if not d.get("en_oferta"): continue
         precio     = d.get("precio", 0)
         precio_ant = d.get("precio_anterior", 0)
         if not precio or not precio_ant or precio >= precio_ant: continue
-        # Usar nombre base del proveedor para agrupar (evitar duplicados de variantes)
         base = d.get("nombre_base_proveedor", clave)
         if base not in ofertas:
             ofertas[base] = {
@@ -1826,10 +1627,8 @@ def run_ver_ofertas_proveedor():
                 "precio_web_ant": precio_obj(precio_ant),
                 "descuento":      round((1 - precio / precio_ant) * 100),
             }
-
     if not ofertas:
         tg("No hay ofertas activas del proveedor en este momento."); return
-
     lista = list(ofertas.items())
     lineas = []
     for i, (base, d) in enumerate(lista, 1):
@@ -1839,8 +1638,6 @@ def run_ver_ofertas_proveedor():
             f"   Costo: ~~${d['precio_anterior']:,}~~ → ${d['precio']:,} (-{d['descuento']}%)\n"
             f"   Tu precio: ~~${d['precio_web_ant']:,}~~ → *${d['precio_web']:,}* (ahorrás ${ahorro:,})"
         )
-
-    # Guardar en DB para que /aplicar_ofertas pueda usarlas
     db["ofertas_pendientes"] = {base: {
         "nombre_real":    d["nombre_real"],
         "precio":         d["precio"],
@@ -1850,24 +1647,18 @@ def run_ver_ofertas_proveedor():
         "nombre_base_proveedor": base,
     } for base, d in lista}
     escribir_db(db)
-
     encabezado = (f"*{_nt('Ofertas activas del proveedor')}*\n"
                   f"Total: *{len(lista)}*\n\n"
                   f"Usá `/aplicar_ofertas todos` o `/aplicar_ofertas 1 3 5` para aplicar.")
-
     tg(encabezado)
     for i in range(0, len(lineas), 15):
         tg("\n\n".join(lineas[i:i+15]))
 
-
 def set_video_producto(pid, url):
-    """Sube URL de video YouTube a Tienda Nube."""
     r = _put(f"{API_BASE}/products/{pid}", {"video_url": url})
     return r is not None and r.status_code in (200, 201)
 
-
 def tg_menu():
-    """Envía menú interactivo con botones inline agrupados por categoría."""
     if not TELEGRAM_TOKEN or not CHAT_ID: return
     keyboard = {
         "inline_keyboard": [
@@ -1899,16 +1690,10 @@ def tg_menu():
     except Exception as e:
         print(f"❌ Menu: {e}")
 
-
 def run_buscar_todos_videos():
-    """
-    Busca videos de YouTube para todos los productos sin video
-    usando búsqueda web y los asigna automáticamente.
-    """
     catalogo = obtener_catalogo(forzar=True)
     if not catalogo:
         tg("No pude obtener el catálogo."); return
-
     sin_video = []
     for prod in catalogo:
         r = _get(f"{API_BASE}/products/{prod['id']}")
@@ -1916,16 +1701,12 @@ def run_buscar_todos_videos():
             if not r.json().get("video_url"):
                 sin_video.append(prod)
         time.sleep(0.3)
-
     if not sin_video:
         tg("Todos los productos ya tienen video asignado."); return
-
     tg(f"Buscando videos para *{len(sin_video)}* productos sin video...")
-
     ok = 0; sin_resultado = []
     for prod in sin_video:
         nombre = prod["nombre"]
-        # Buscar en YouTube via requests
         query = nombre.replace(" ", "+") + "+herramienta+reparacion"
         try:
             r_yt = requests.get(
@@ -1933,8 +1714,7 @@ def run_buscar_todos_videos():
                 headers={"User-Agent": USER_AGENT}, timeout=10
             )
             import re as _re
-            # Extraer primer video ID del HTML
-            matches = _re_findall = _re.findall(r'"videoId":"([a-zA-Z0-9_-]{11})"', r_yt.text)
+            matches = _re.findall(r'"videoId":"([a-zA-Z0-9_-]{11})"', r_yt.text)
             if matches:
                 video_url = f"https://www.youtube.com/watch?v={matches[0]}"
                 if set_video_producto(prod["id"], video_url):
@@ -1948,16 +1728,13 @@ def run_buscar_todos_videos():
             print(f"Error buscando video para {nombre}: {e}")
             sin_resultado.append(nombre)
         time.sleep(1)
-
     tg(f"*Videos asignados:* {ok}\n*Sin resultado:* {len(sin_resultado)}")
     if sin_resultado:
         tg("Sin video:\n" + "\n".join(f"• {n}" for n in sin_resultado[:20]))
 
-
 def procesar_cmd(texto):
     global _token, _store_id
     texto = texto.strip()
-
     if "?code=" in texto:
         code = texto.split("?code=")[1].split("&")[0].strip()
         tg("🔄 Canjeando código OAuth...")
@@ -1968,27 +1745,22 @@ def procesar_cmd(texto):
         else:
             tg("❌ Token fallido. El código dura 1 minuto.")
         return
-
     cmd = texto.lower().split()
     if not cmd: return
 
     if cmd[0] == "/menu":
         tg_menu()
-
     elif cmd[0] == "/ayuda":
         tg(AYUDA)
-
     elif cmd[0] == "/estado_api":
         if _token:
             tg(f"✅ *Token activo*\nStore ID: `{_store_id}`\nToken: `{_token[:12]}...`")
         else:
             tg("❌ Sin token. Mandá el `?code=` para obtenerlo.")
-
     elif cmd[0] == "/borrar_token":
         _token = _store_id = None
         db = leer_db(); db.pop("api_token",None); db.pop("api_user_id",None)
         escribir_db(db); tg("🗑️ Token eliminado.")
-
     elif cmd[0] == "/listar":
         if not _token: tg("❌ Necesito el token primero."); return
         tg("⏳ Cargando catálogo...")
@@ -2003,15 +1775,12 @@ def procesar_cmd(texto):
         msg = f"📦 *{len(catalogo)} productos:*\n\n" + "\n".join(lineas)
         if len(catalogo) > 50: msg += f"\n\n_...y {len(catalogo)-50} más_"
         tg(msg)
-
     elif cmd[0] == "/sync_total":
         if not _token: tg("❌ Necesito el token primero."); return
         threading.Thread(target=run_sync_total, daemon=True).start()
-
     elif cmd[0] == "/fix_envio_gratis":
         if not _token: tg("❌ Necesito el token primero."); return
         threading.Thread(target=run_fix_envio_gratis, daemon=True).start()
-
     elif cmd[0] == "/ocultar":
         if not _token: tg("❌ Necesito el token primero."); return
         nombre = " ".join(texto.split()[1:])
@@ -2021,7 +1790,6 @@ def procesar_cmd(texto):
             if set_visibilidad(prod["id"],False): tg(f"🚫 *{prod['nombre']}* ocultado.")
             else: tg("❌ No pude ocultar.")
         else: tg(f"❌ No encontré *{nombre}*.")
-
     elif cmd[0] == "/publicar":
         if not _token: tg("❌ Necesito el token primero."); return
         nombre = " ".join(texto.split()[1:])
@@ -2031,7 +1799,6 @@ def procesar_cmd(texto):
             if set_visibilidad(prod["id"],True): tg(f"✅ *{prod['nombre']}* publicado.")
             else: tg("❌ No pude publicar.")
         else: tg(f"❌ No encontré *{nombre}*.")
-
     elif cmd[0] == "/stock":
         if not _token: tg("❌ Necesito el token primero."); return
         partes = texto.split()
@@ -2046,7 +1813,6 @@ def procesar_cmd(texto):
                 ok = set_stock_producto(prod["id"],nuevo)
             tg(f"📦 *{prod['nombre']}* → stock *{nuevo}*." if ok else "❌ No pude actualizar.")
         else: tg(f"❌ No encontré *{nombre}*.")
-
     elif cmd[0] == "/precio":
         if not _token: tg("❌ Necesito el token primero."); return
         partes = texto.split()
@@ -2061,7 +1827,6 @@ def procesar_cmd(texto):
                 ok = set_precio_producto(prod["id"],nuevo)
             tg(f"💲 *{prod['nombre']}* → *${nuevo:,}*." if ok else "❌ No pude actualizar.")
         else: tg(f"❌ No encontré *{nombre}*.")
-
     elif cmd[0] == "/exportar_precios":
         tg("⏳ Generando Excel...")
         data, msg = generar_excel()
@@ -2070,11 +1835,9 @@ def procesar_cmd(texto):
             if not tg_doc(data, f"precios_{fecha}.xlsx", caption=msg):
                 tg("❌ Excel generado pero falló el envío.")
         else: tg(msg)
-
     elif cmd[0] == "/ciclo":
         tg(f"🔄 *{_nt('Ciclo manual iniciado')}*")
         threading.Thread(target=ciclo_monitoreo, daemon=True).start()
-
     elif cmd[0] == "/debug_ordenes":
         if not _token: tg("❌ Necesito el token primero."); return
         tg("🔄 Probando GET /orders directo...")
@@ -2083,17 +1846,14 @@ def procesar_cmd(texto):
             tg(f"✅ Respuesta recibida\nHTTP {r.status_code}\n`{r.text[:300]}`")
         except Exception as e:
             tg(f"❌ Excepción real: `{type(e).__name__}: {e}`")
-
     elif cmd[0] == "/buscar_todos_videos":
         if not _token: tg("Necesito el token primero."); return
         threading.Thread(target=run_buscar_todos_videos, daemon=True).start()
         tg("Buscando videos en YouTube para todos los productos sin video...")
-
     elif cmd[0] == "/set_video":
         if not _token: tg("Necesito el token primero."); return
         partes = texto.split()
         if len(partes) < 3: tg("Uso: `/set_video Nombre del producto https://youtube.com/...`"); return
-        # Último token es la URL, el resto es el nombre
         url = partes[-1]
         nombre = " ".join(partes[1:-1])
         if "youtube.com" not in url and "youtu.be" not in url:
@@ -2105,7 +1865,6 @@ def procesar_cmd(texto):
             tg(f"Video agregado a *{prod['nombre']}*")
         else:
             tg("No pude agregar el video.")
-
     elif cmd[0] == "/generar_descripcion":
         if not _token: tg("Necesito el token primero."); return
         if not GROQ_API_KEY:
@@ -2123,14 +1882,12 @@ def procesar_cmd(texto):
             tg(f"*{prod['nombre']}*\n\n{desc}")
         else:
             tg("No pude subir la descripcion a Tienda Nube.")
-
     elif cmd[0] == "/generar_todas_descripciones":
         if not _token: tg("Necesito el token primero."); return
         if not GROQ_API_KEY:
             tg("Falta `GROQ_API_KEY` en Railway Variables."); return
         threading.Thread(target=run_generar_todas_descripciones, daemon=True).start()
         tg(f"Iniciando generacion masiva de descripciones...")
-
     elif cmd[0] == "/test_scraperapi":
         if not SCRAPERAPI_KEY:
             tg("❌ Falta `SCRAPERAPI_KEY` en Railway Variables."); return
@@ -2145,7 +1902,6 @@ def procesar_cmd(texto):
                 tg(f"⚠️ HTTP 200 pero no pude parsear JSON: {e}")
         else:
             tg(f"❌ ScraperAPI HTTP {r.status_code if r is not None else 'Sin respuesta'}")
-
     elif cmd[0] == "/registrar_webhooks":
         if not _token: tg("❌ Necesito el token primero."); return
         if not WEBHOOK_BASE_URL:
@@ -2166,7 +1922,6 @@ def procesar_cmd(texto):
             except Exception as e:
                 resultados.append(f"❌ `{evento}` — Error: {e}")
         tg("*Webhooks:*\n" + "\n".join(resultados))
-
     elif cmd[0] == "/ver_webhooks":
         if not _token: tg("❌ Necesito el token primero."); return
         r = _get(f"{API_BASE}/webhooks")
@@ -2179,22 +1934,18 @@ def procesar_cmd(texto):
             tg("🔗 *Webhooks activos:*\n\n" + "\n\n".join(lineas))
         else:
             tg(f"❌ HTTP {r.status_code if r is not None else 'None'}")
-
     elif cmd[0] == "/borrar_webhook":
         if not _token: tg("❌ Necesito el token primero."); return
         wid = texto.split()[1] if len(texto.split()) > 1 else ""
         if not wid: tg("Uso: /borrar_webhook ID"); return
         r = requests.delete(f"{API_BASE}/webhooks/{wid}", headers=_h(), timeout=30)
         tg(f"✅ Webhook {wid} borrado." if r and r.status_code in (200,204) else f"❌ HTTP {r.status_code if r is not None else 'None'}")
-
     elif cmd[0] == "/productos_sin_cargar":
         if not _token: tg("❌ Necesito el token primero."); return
         modo_todo = len(cmd) > 1 and cmd[1] == "todo"
         threading.Thread(target=run_productos_sin_cargar, args=(modo_todo,), daemon=True).start()
-
     elif cmd[0] == "/ver_ofertas_proveedor":
         threading.Thread(target=run_ver_ofertas_proveedor, daemon=True).start()
-
     elif cmd[0] == "/aplicar_ofertas":
         db = leer_db()
         ofertas = db.get("ofertas_pendientes", {})
@@ -2232,7 +1983,6 @@ def procesar_cmd(texto):
         db["ofertas_pendientes"] = {}
         escribir_db(db)
         tg("✅ *Ofertas aplicadas:*\n\n" + "\n\n".join(aplicadas))
-
     elif cmd[0] == "/debug_match":
         nombre = " ".join(texto.split()[1:]).strip()
         if not nombre: tg("Uso: /debug_match Nombre del producto"); return
@@ -2282,7 +2032,6 @@ def procesar_cmd(texto):
         else:
             lineas.append("CATALOGO API: " + ("NO encontrado" if _token else "sin token"))
         tg("\n".join(lineas))
-
     elif cmd[0] == "/debug_producto":
         if not _token: tg("Sin token."); return
         pid = texto.split()[1] if len(texto.split()) > 1 else ""
@@ -2293,7 +2042,6 @@ def procesar_cmd(texto):
         sep = chr(10)
         info = [k + ": " + str(v) for k,v in d.items() if not isinstance(v,(dict,list))]
         tg("Producto " + str(pid) + ":" + sep + sep.join(info[:25]))
-
     elif cmd[0] == "/debug_env":
         t = os.environ.get("API_TOKEN",""); u = os.environ.get("API_USER_ID","")
         lineas = [
@@ -2308,7 +2056,6 @@ def procesar_cmd(texto):
             "MARGEN: "         + str(MARGEN),
         ]
         tg("Diagnóstico:\n" + "\n".join(lineas))
-
     elif cmd[0] == "/confirmar_pedido":
         partes = texto.split()
         if len(partes) < 2:
@@ -2327,7 +2074,6 @@ def procesar_cmd(texto):
             escribir_db(db)
         else:
             tg(f"❌ No pude hacer el pedido #{num}. Intentá manualmente.")
-
     else:
         tg("❓ Comando no reconocido. Mandá `/ayuda`.")
 
@@ -2342,18 +2088,15 @@ def escuchar_telegram():
             if r.status_code == 200:
                 for u in r.json().get("result",[]):
                     offset = u["update_id"] + 1
-                    # Mensaje de texto normal
                     msg = u.get("message",{}); texto = msg.get("text","")
                     if str(msg.get("chat",{}).get("id","")) == CHAT_ID and texto:
                         print(f"📨 {texto[:60]}")
                         try: procesar_cmd(texto)
                         except Exception as e: print(f"❌ Cmd: {e}")
-                    # Callback de botón inline
                     cb = u.get("callback_query",{})
                     if cb and str(cb.get("message",{}).get("chat",{}).get("id","")) == CHAT_ID:
                         cb_data = cb.get("data","")
                         cb_id   = cb.get("id","")
-                        # Responder al callback para quitar el "reloj" del botón
                         try:
                             requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/answerCallbackQuery",
                                 json={"callback_query_id": cb_id}, timeout=5)
@@ -2374,6 +2117,11 @@ if __name__ == "__main__":
     print(f"   API_USER_ID env: {os.environ.get('API_USER_ID','NO')}")
     print(f"   NOMBRE_TIENDA:   {NOMBRE_TIENDA}")
     print(f"   MARGEN:          {MARGEN} ({round((1-MARGEN)*100)}% ganancia)")
+    rp = _get_residential_proxy()
+    if rp:
+        print(f"   ✅ Proxy residencial: {PROXY_HOST}:{PROXY_PORT}")
+    else:
+        print(f"   ⚠️ Sin proxy residencial — usando curl-cffi directo")
 
     cargar_token()
 
