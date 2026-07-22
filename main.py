@@ -560,17 +560,48 @@ def _stock_real(p):
 
 def scrapear_proveedor():
     productos = {}; pagina = 1; reintentos_202 = 0; via_scraperapi = False
-    # Test rápido del proxy
+    # Test diagnóstico del proxy
     if _get_residential_proxy():
-        import subprocess
-        proxy_url = f"http://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
-        test = subprocess.run(
-            ['curl', '-s', '-x', proxy_url,
-             '--connect-timeout', '5', '--max-time', '10',
-             'https://api.ipify.org/'],
-            capture_output=True, text=True, timeout=15
-        )
-        print(f"   🔍 Test proxy: exit={test.returncode} ip={test.stdout.strip()[:30]} err={test.stderr.strip()[:80]}")
+        import subprocess, socket, base64
+        print("   🔍 Diagnóstico proxy DataImpulse:")
+        # Test 1: Puerto accesible?
+        try:
+            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            sock.settimeout(5)
+            sock.connect((PROXY_HOST, int(PROXY_PORT)))
+            sock.close()
+            print(f"      ✅ Test 1 — Puerto {PROXY_PORT} accesible")
+        except Exception as e:
+            print(f"      ❌ Test 1 — Puerto {PROXY_PORT} bloqueado: {e}")
+        # Test 2: curl con credenciales en URL
+        try:
+            proxy_url = f"http://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
+            t2 = subprocess.run(
+                ['curl', '-s', '-x', proxy_url, '--max-time', '10', 'http://api.ipify.org/'],
+                capture_output=True, text=True, timeout=12)
+            print(f"      {'✅' if t2.returncode==0 and t2.stdout.strip() else '❌'} Test 2 — curl -x URL: exit={t2.returncode} out={t2.stdout.strip()[:40]} err={t2.stderr.strip()[:60]}")
+        except Exception as e:
+            print(f"      ❌ Test 2 — curl: {e}")
+        # Test 3: curl con --proxy-user separado
+        try:
+            t3 = subprocess.run(
+                ['curl', '-s', '--proxy', f'http://{PROXY_HOST}:{PROXY_PORT}',
+                 '--proxy-user', f'{PROXY_USER}:{PROXY_PASS}',
+                 '--max-time', '10', 'http://api.ipify.org/'],
+                capture_output=True, text=True, timeout=12)
+            print(f"      {'✅' if t3.returncode==0 and t3.stdout.strip() else '❌'} Test 3 — curl --proxy-user: exit={t3.returncode} out={t3.stdout.strip()[:40]} err={t3.stderr.strip()[:60]}")
+        except Exception as e:
+            print(f"      ❌ Test 3 — curl: {e}")
+        # Test 4: requests con header Proxy-Authorization explícito
+        try:
+            creds = base64.b64encode(f"{PROXY_USER}:{PROXY_PASS}".encode()).decode()
+            proxies = {"http": f"http://{PROXY_HOST}:{PROXY_PORT}", "https": f"http://{PROXY_HOST}:{PROXY_PORT}"}
+            t4 = requests.get("http://api.ipify.org/", proxies=proxies,
+                              headers={"User-Agent": USER_AGENT, "Proxy-Authorization": f"Basic {creds}"},
+                              timeout=10)
+            print(f"      {'✅' if t4.status_code==200 else '❌'} Test 4 — requests+header: HTTP {t4.status_code} body={t4.text.strip()[:40]}")
+        except Exception as e:
+            print(f"      ❌ Test 4 — requests: {str(e)[:80]}")
     print("📥 API proveedor...")
     while True:
         r = _prov_get(PROV_API, params={"per_page":100,"page":pagina}, usar_scraperapi=via_scraperapi)
