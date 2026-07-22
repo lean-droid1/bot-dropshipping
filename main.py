@@ -505,45 +505,20 @@ def _prov_get(url, params=None, usar_scraperapi=False):
 
     for intento in range(3):
         try:
-            if res_proxy:
-                import subprocess
-                full_url = url
-                if params:
-                    full_url += "?" + "&".join(f"{k}={v}" for k, v in params.items())
-                proxy_url = f"http://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
-                result = subprocess.run(
-                    ['curl', '-s',
-                     '-x', proxy_url,
-                     '-H', f'User-Agent: {USER_AGENT}',
-                     '--connect-timeout', '15',
-                     '--max-time', '30',
-                     full_url],
-                    capture_output=True, text=True, timeout=35
-                )
-                body = result.stdout.strip()
-                if result.returncode != 0 or not body:
-                    print(f"⚠️ curl exit {result.returncode}: {result.stderr[:120]}")
-                    time.sleep(2)
-                    continue
-                cr_code = 200
-                if '<html' in body.lower()[:300]:
-                    cr_code = 202
-                class _CurlResp:
-                    def __init__(self, code, text):
-                        self.status_code = code
-                        self.text = text
-                        self.content = text.encode('utf-8')
-                    def json(self):
-                        return json.loads(self.text)
-                return _CurlResp(cr_code, body)
+            if CURL_CFFI_OK and res_proxy:
+                # curl-cffi + proxy residencial ThorData — bypass Cloudflare definitivo
+                r = cf_requests.get(url, params=params, timeout=25,
+                                    impersonate="chrome124",
+                                    proxy=res_proxy,
+                                    headers={"User-Agent": USER_AGENT})
             elif CURL_CFFI_OK:
+                # curl-cffi sin proxy — funciona si la IP no está bloqueada
                 r = cf_requests.get(url, params=params, timeout=20,
-                                    impersonate="chrome120",
+                                    impersonate="chrome124",
                                     headers={"User-Agent": USER_AGENT})
             else:
                 r = requests.get(url, params=params, timeout=20,
                                  headers={"User-Agent": USER_AGENT})
-
             if r.status_code == 429:
                 print("⚠️ Rate limit proveedor"); time.sleep(3); continue
             return r
@@ -560,48 +535,6 @@ def _stock_real(p):
 
 def scrapear_proveedor():
     productos = {}; pagina = 1; reintentos_202 = 0; via_scraperapi = False
-    # Test diagnóstico del proxy
-    if _get_residential_proxy():
-        import subprocess, socket, base64
-        print("   🔍 Diagnóstico proxy DataImpulse:")
-        # Test 1: Puerto accesible?
-        try:
-            sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-            sock.settimeout(5)
-            sock.connect((PROXY_HOST, int(PROXY_PORT)))
-            sock.close()
-            print(f"      ✅ Test 1 — Puerto {PROXY_PORT} accesible")
-        except Exception as e:
-            print(f"      ❌ Test 1 — Puerto {PROXY_PORT} bloqueado: {e}")
-        # Test 2: curl con credenciales en URL
-        try:
-            proxy_url = f"http://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
-            t2 = subprocess.run(
-                ['curl', '-s', '-x', proxy_url, '--max-time', '10', 'http://api.ipify.org/'],
-                capture_output=True, text=True, timeout=12)
-            print(f"      {'✅' if t2.returncode==0 and t2.stdout.strip() else '❌'} Test 2 — curl -x URL: exit={t2.returncode} out={t2.stdout.strip()[:40]} err={t2.stderr.strip()[:60]}")
-        except Exception as e:
-            print(f"      ❌ Test 2 — curl: {e}")
-        # Test 3: curl con --proxy-user separado
-        try:
-            t3 = subprocess.run(
-                ['curl', '-s', '--proxy', f'http://{PROXY_HOST}:{PROXY_PORT}',
-                 '--proxy-user', f'{PROXY_USER}:{PROXY_PASS}',
-                 '--max-time', '10', 'http://api.ipify.org/'],
-                capture_output=True, text=True, timeout=12)
-            print(f"      {'✅' if t3.returncode==0 and t3.stdout.strip() else '❌'} Test 3 — curl --proxy-user: exit={t3.returncode} out={t3.stdout.strip()[:40]} err={t3.stderr.strip()[:60]}")
-        except Exception as e:
-            print(f"      ❌ Test 3 — curl: {e}")
-        # Test 4: requests con header Proxy-Authorization explícito
-        try:
-            creds = base64.b64encode(f"{PROXY_USER}:{PROXY_PASS}".encode()).decode()
-            proxies = {"http": f"http://{PROXY_HOST}:{PROXY_PORT}", "https": f"http://{PROXY_HOST}:{PROXY_PORT}"}
-            t4 = requests.get("http://api.ipify.org/", proxies=proxies,
-                              headers={"User-Agent": USER_AGENT, "Proxy-Authorization": f"Basic {creds}"},
-                              timeout=10)
-            print(f"      {'✅' if t4.status_code==200 else '❌'} Test 4 — requests+header: HTTP {t4.status_code} body={t4.text.strip()[:40]}")
-        except Exception as e:
-            print(f"      ❌ Test 4 — requests: {str(e)[:80]}")
     print("📥 API proveedor...")
     while True:
         r = _prov_get(PROV_API, params={"per_page":100,"page":pagina}, usar_scraperapi=via_scraperapi)
@@ -652,7 +585,12 @@ def scrapear_proveedor():
 
             if precio_pub == 0: continue
 
-            if tipo == "variable":
+            # Optimización: solo buscar variantes de productos conocidos con variantes
+            # Esto ahorra ~50 llamadas HTTP por ciclo
+            PRODUCTOS_CON_VARIANTES = {'jc face id flex tag', 'jc bateria flex tag', 'maneral mango mijing'}
+            es_variable_conocido = tipo == "variable" and any(pv in nombre_base for pv in PRODUCTOS_CON_VARIANTES)
+
+            if es_variable_conocido:
                 variaciones = p.get("variations", [])
                 for var_info in variaciones:
                     vid = var_info.get("id")
