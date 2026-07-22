@@ -501,17 +501,21 @@ def _prov_get(url, params=None, usar_scraperapi=False):
         r = _via_scraperapi(url, params)
         return r
 
-    # Prioridad: 1) Proxy residencial + curl-cffi  2) curl-cffi directo  3) requests
     res_proxy = _get_residential_proxy()
 
     for intento in range(3):
         try:
             if res_proxy and CURL_CFFI_OK:
-                # curl-cffi + proxy residencial — mejor combo
-                r = cf_requests.get(url, params=params, timeout=30,
-                                    impersonate="chrome120",
-                                    headers={"User-Agent": USER_AGENT},
-                                    proxy=res_proxy)
+                # Setear proxy via env para que curl-cffi lo tome nativamente
+                os.environ['https_proxy'] = res_proxy
+                os.environ['http_proxy'] = res_proxy
+                try:
+                    r = cf_requests.get(url, params=params, timeout=30,
+                                        impersonate="chrome120",
+                                        headers={"User-Agent": USER_AGENT})
+                finally:
+                    os.environ.pop('https_proxy', None)
+                    os.environ.pop('http_proxy', None)
             elif CURL_CFFI_OK:
                 r = cf_requests.get(url, params=params, timeout=20,
                                     impersonate="chrome120",
