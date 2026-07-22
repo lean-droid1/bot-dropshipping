@@ -505,17 +505,30 @@ def _prov_get(url, params=None, usar_scraperapi=False):
 
     for intento in range(3):
         try:
-            if res_proxy and CURL_CFFI_OK:
-                from curl_cffi import CurlOpt
-                s = cf_requests.Session(impersonate="chrome120")
-                s.curl.setopt(CurlOpt.PROXY, f"http://{PROXY_HOST}:{PROXY_PORT}")
-                s.curl.setopt(CurlOpt.PROXYUSERPWD, f"{PROXY_USER}:{PROXY_PASS}")
+            if res_proxy:
+                import subprocess
                 full_url = url
                 if params:
                     full_url += "?" + "&".join(f"{k}={v}" for k, v in params.items())
-                r = s.get(full_url, timeout=30,
-                          headers={"User-Agent": USER_AGENT})
-                s.close()
+                result = subprocess.run([
+                    'curl', '-s', '-x', res_proxy,
+                    '-H', f'User-Agent: {USER_AGENT}',
+                    '--max-time', '30',
+                    full_url
+                ], capture_output=True, text=True, timeout=35)
+                if result.returncode == 0 and result.stdout.strip():
+                    class CurlResp:
+                        status_code = 200
+                        text = result.stdout
+                        content = result.stdout.encode()
+                        def json(self): return json.loads(self.text)
+                    r = CurlResp()
+                    if '<html' in r.text.lower()[:200]:
+                        r.status_code = 202
+                    return r
+                else:
+                    print(f"⚠️ curl exit {result.returncode}: {result.stderr[:100]}")
+                    time.sleep(2); continue
             elif CURL_CFFI_OK:
                 r = cf_requests.get(url, params=params, timeout=20,
                                     impersonate="chrome120",
