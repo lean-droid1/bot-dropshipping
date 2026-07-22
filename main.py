@@ -506,16 +506,16 @@ def _prov_get(url, params=None, usar_scraperapi=False):
     for intento in range(3):
         try:
             if res_proxy and CURL_CFFI_OK:
-                # Setear proxy via env para que curl-cffi lo tome nativamente
-                os.environ['https_proxy'] = res_proxy
-                os.environ['http_proxy'] = res_proxy
-                try:
-                    r = cf_requests.get(url, params=params, timeout=30,
-                                        impersonate="chrome120",
-                                        headers={"User-Agent": USER_AGENT})
-                finally:
-                    os.environ.pop('https_proxy', None)
-                    os.environ.pop('http_proxy', None)
+                from curl_cffi import CurlOpt
+                s = cf_requests.Session(impersonate="chrome120")
+                s.curl.setopt(CurlOpt.PROXY, f"http://{PROXY_HOST}:{PROXY_PORT}")
+                s.curl.setopt(CurlOpt.PROXYUSERPWD, f"{PROXY_USER}:{PROXY_PASS}")
+                full_url = url
+                if params:
+                    full_url += "?" + "&".join(f"{k}={v}" for k, v in params.items())
+                r = s.get(full_url, timeout=30,
+                          headers={"User-Agent": USER_AGENT})
+                s.close()
             elif CURL_CFFI_OK:
                 r = cf_requests.get(url, params=params, timeout=20,
                                     impersonate="chrome120",
@@ -531,7 +531,6 @@ def _prov_get(url, params=None, usar_scraperapi=False):
             print(f"⚠️ Proveedor API (intento {intento+1}/3): {e}")
             time.sleep(2)
     return None
-
 def _precio_real(p):
     return int(p.get("prices",{}).get("price", 0)) // 100
 
