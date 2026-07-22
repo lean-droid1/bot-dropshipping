@@ -506,17 +506,34 @@ def _prov_get(url, params=None, usar_scraperapi=False):
     for intento in range(3):
         try:
             if res_proxy:
-                import httpx
-                with httpx.Client(proxy=res_proxy, timeout=30) as client:
-                    r = client.get(url, params=params,
-                                   headers={"User-Agent": USER_AGENT})
-                    class HResp:
-                        status_code = r.status_code
-                        text = r.text
-                        content = r.content
-                        headers = dict(r.headers)
-                        def json(self): return r.json()
-                    return HResp()
+                import subprocess
+                full_url = url
+                if params:
+                    full_url += "?" + "&".join(f"{k}={v}" for k, v in params.items())
+                proxy_str = f"http://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
+                print(f"   curl proxy intento {intento+1}...")
+                result = subprocess.run([
+                    'curl', '-s', '-x', proxy_str,
+                    '-H', f'User-Agent: {USER_AGENT}',
+                    '-w', '\\n%{http_code}',
+                    '--max-time', '30',
+                    full_url
+                ], capture_output=True, text=True, timeout=35)
+                lines = result.stdout.strip().rsplit('\n', 1)
+                body = lines[0] if len(lines) > 0 else ''
+                code = int(lines[-1]) if len(lines) > 1 and lines[-1].isdigit() else 0
+                if result.returncode != 0 or not body:
+                    print(f"⚠️ curl exit {result.returncode}: {result.stderr[:100]}")
+                    time.sleep(2); continue
+                class CurlResp:
+                    status_code = code if code > 0 else 200
+                    text = body
+                    content = body.encode()
+                    def json(self): return json.loads(self.text)
+                r = CurlResp()
+                if '<html' in body.lower()[:200]:
+                    r.status_code = 202
+                return r
             elif CURL_CFFI_OK:
                 r = cf_requests.get(url, params=params, timeout=20,
                                     impersonate="chrome120",
@@ -524,7 +541,6 @@ def _prov_get(url, params=None, usar_scraperapi=False):
             else:
                 r = requests.get(url, params=params, timeout=20,
                                  headers={"User-Agent": USER_AGENT})
-
             if r.status_code == 429:
                 print("⚠️ Rate limit proveedor"); time.sleep(3); continue
             return r
