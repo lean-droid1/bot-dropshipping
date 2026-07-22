@@ -506,21 +506,20 @@ def _prov_get(url, params=None, usar_scraperapi=False):
     for intento in range(3):
         try:
             if CURL_CFFI_OK and res_proxy:
-                # curl-cffi + proxy residencial ThorData — bypass Cloudflare definitivo
                 r = cf_requests.get(url, params=params, timeout=25,
                                     impersonate="chrome124",
-                                    proxy=res_proxy,
-                                    headers={"User-Agent": USER_AGENT})
+                                    proxy=res_proxy)
             elif CURL_CFFI_OK:
-                # curl-cffi sin proxy — funciona si la IP no está bloqueada
                 r = cf_requests.get(url, params=params, timeout=20,
-                                    impersonate="chrome124",
-                                    headers={"User-Agent": USER_AGENT})
+                                    impersonate="chrome124")
             else:
                 r = requests.get(url, params=params, timeout=20,
                                  headers={"User-Agent": USER_AGENT})
             if r.status_code == 429:
                 print("⚠️ Rate limit proveedor"); time.sleep(3); continue
+            if r.status_code == 403 and res_proxy and intento < 2:
+                print(f"⚠️ Cloudflare 403 (intento {intento+1}/3) — reintentando...")
+                time.sleep(2); continue
             return r
         except Exception as e:
             print(f"⚠️ Proveedor API (intento {intento+1}/3): {e}")
