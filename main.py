@@ -506,7 +506,7 @@ def _prov_get(url, params=None, usar_scraperapi=False):
     for intento in range(3):
         try:
             if CURL_CFFI_OK and res_proxy:
-                r = cf_requests.get(url, params=params, timeout=25,
+                r = cf_requests.get(url, params=params, timeout=45,
                                     impersonate="chrome124",
                                     proxy=res_proxy)
             elif CURL_CFFI_OK:
@@ -519,11 +519,11 @@ def _prov_get(url, params=None, usar_scraperapi=False):
                 print("⚠️ Rate limit proveedor"); time.sleep(3); continue
             if r.status_code == 403 and res_proxy and intento < 2:
                 print(f"⚠️ Cloudflare 403 (intento {intento+1}/3) — reintentando...")
-                time.sleep(2); continue
+                time.sleep(3); continue
             return r
         except Exception as e:
             print(f"⚠️ Proveedor API (intento {intento+1}/3): {e}")
-            time.sleep(2)
+            time.sleep(3)
     return None
 
 def _precio_real(p):
@@ -535,6 +535,16 @@ def _stock_real(p):
 def scrapear_proveedor():
     productos = {}; pagina = 1; reintentos_202 = 0; via_scraperapi = False
     print("📥 API proveedor...")
+    # Calentar proxy con request liviano
+    if _get_residential_proxy() and CURL_CFFI_OK:
+        try:
+            print("   🔥 Calentando proxy...")
+            cf_requests.get("https://rxzweb.com/", impersonate="chrome124",
+                           proxy=_get_residential_proxy(), timeout=15)
+            time.sleep(1)
+            print("   ✅ Proxy calentado")
+        except Exception as e:
+            print(f"   ⚠️ Calentamiento: {e}")
     while True:
         r = _prov_get(PROV_API, params={"per_page":100,"page":pagina}, usar_scraperapi=via_scraperapi)
         if not r or r.status_code not in (200, 201, 202):
