@@ -631,6 +631,91 @@ def scrapear_proveedor():
                     productos[clave] = {
                         "nombre_real":           f"{nombre_orig} ({v_nombre})",
                         "nombre_base_proveedor": nombre_base,
+def _stock_real(p):
+    return p.get("add_to_cart",{}).get("maximum") or 0
+
+def scrapear_proveedor():
+    productos = {}; pagina = 1; reintentos_202 = 0; via_scraperapi = False
+    # Test rápido del proxy
+    import subprocess
+    proxy_str = f"http://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
+    test = subprocess.run(['curl', '-s', '-x', proxy_str, '--max-time', '10', '--connect-timeout', '5', 'https://api.ipify.org/'], capture_output=True, text=True, timeout=15)
+    print(f"   🔍 Test proxy: exit={test.returncode} ip={test.stdout[:30]} err={test.stderr[:80]}")
+    print("📥 API proveedor...")
+    while True:
+        r = _prov_get(PROV_API, params={"per_page":100,"page":pagina}, usar_scraperapi=via_scraperapi)
+        if not r or r.status_code not in (200, 201, 202):
+            codigo = r.status_code if r is not None else 'None'
+            print(f"❌ Proveedor HTTP {codigo}")
+            if codigo == 403 and not via_scraperapi and (SCRAPERAPI_KEY or SCRAPERAPI_KEY2):
+                print("🔄 HTTP 403 — activando ScraperAPI como fallback...")
+                via_scraperapi = True
+                continue
+            break
+        if r.status_code == 202:
+            reintentos_202 += 1
+            if reintentos_202 == 2 and not via_scraperapi and (SCRAPERAPI_KEY or SCRAPERAPI_KEY2):
+                print("🔄 Activando ScraperAPI como fallback...")
+                via_scraperapi = True
+                continue
+            if reintentos_202 >= 5:
+                print(f"❌ Proveedor HTTP 202 x{reintentos_202} - abortando scrape")
+                tg(f"⚠️ *{NOMBRE_TIENDA}* — Proveedor no responde (HTTP 202 x5{' incluso via ScraperAPI' if via_scraperapi else ''}). Reintentará en el próximo ciclo.")
+                break
+            espera = 30 if reintentos_202 <= 2 else 60
+            print(f"⚠️ Proveedor HTTP 202 ({reintentos_202}/5) - reintentando en {espera}s...")
+            time.sleep(espera)
+            continue
+        if not r.text or not r.text.strip():
+            print(f"⚠️ Proveedor respuesta vacía en pág {pagina}, reintentando...")
+            time.sleep(5)
+            continue
+        try:
+            lote = r.json()
+        except Exception as e:
+            print(f"⚠️ Proveedor JSON inválido pág {pagina}: {e}")
+            break
+        if not lote: break
+
+        for p in lote:
+            nombre_orig = p.get("name","").strip()
+            if not nombre_orig or len(nombre_orig) < 4: continue
+            nombre_base = normalizar(nombre_orig)
+            tipo        = p.get("type","simple")
+            woo_id      = p.get("id")
+            precio_pub      = _precio_real(p)
+            precio_original = int(p.get("prices",{}).get("regular_price",0)) // 100
+            en_oferta       = p.get("on_sale", False) and 0 < precio_pub < precio_original
+            in_stock        = p.get("is_in_stock", False)
+            stock_base      = _stock_real(p)
+
+            if precio_pub == 0: continue
+
+            if tipo == "variable":
+                variaciones = p.get("variations", [])
+                for var_info in variaciones:
+                    vid = var_info.get("id")
+                    if not vid: continue
+                    rv = _prov_get(f"{PROV_API}/{vid}", usar_scraperapi=via_scraperapi)
+                    if not rv or rv.status_code != 200: continue
+                    if not rv.text or not rv.text.strip(): continue
+                    try:
+                        vd = rv.json()
+                    except Exception:
+                        continue
+                    v_var_str   = vd.get("variation","")
+                    v_nombre    = v_var_str.split(":",1)[1].strip() if ":" in v_var_str else v_var_str
+                    v_precio    = _precio_real(vd)
+                    v_stock     = _stock_real(vd)
+                    v_original  = int(vd.get("prices",{}).get("regular_price",0)) // 100
+                    v_oferta    = vd.get("on_sale", False) and 0 < v_precio < v_original
+                    v_instock   = vd.get("is_in_stock", False)
+                    if v_precio == 0: continue
+
+                    clave = normalizar(f"{nombre_orig} ({v_nombre})")
+                    productos[clave] = {
+                        "nombre_real":           f"{nombre_orig} ({v_nombre})",
+                        "nombre_base_proveedor": nombre_base,
                         "precio":                v_precio,
                         "precio_anterior":       v_original if v_oferta else 0,
                         "en_oferta":             v_oferta,
