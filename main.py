@@ -501,19 +501,18 @@ def _prov_get(url, params=None, usar_scraperapi=False):
         r = _via_scraperapi(url, params)
         return r
 
-    # Prioridad: 1) Proxy residencial DataImpulse  2) curl-cffi directo  3) ScraperAPI
+    # Prioridad: 1) Proxy residencial + curl-cffi  2) curl-cffi directo  3) requests
     res_proxy = _get_residential_proxy()
 
     for intento in range(3):
         try:
-            if res_proxy:
-                # Proxy residencial — IP de casa real, Cloudflare no bloquea
-                proxies = {"http": res_proxy, "https": res_proxy}
-                r = requests.get(url, params=params, timeout=30,
-                                 headers={"User-Agent": USER_AGENT},
-                                 proxies=proxies)
+            if res_proxy and CURL_CFFI_OK:
+                # curl-cffi + proxy residencial — mejor combo
+                r = cf_requests.get(url, params=params, timeout=30,
+                                    impersonate="chrome120",
+                                    headers={"User-Agent": USER_AGENT},
+                                    proxy=res_proxy)
             elif CURL_CFFI_OK:
-                # curl-cffi imita TLS fingerprint de Chrome
                 r = cf_requests.get(url, params=params, timeout=20,
                                     impersonate="chrome120",
                                     headers={"User-Agent": USER_AGENT})
