@@ -803,7 +803,23 @@ def sincronizar_stock(prod, datos_prov, sinc):
     variantes   = prod["variantes"]
     vars_prov   = datos_prov.get("variantes", {})
     stock_base  = datos_prov.get("stock_base", 0)
-    if stock_base >= 9999: return
+
+    if stock_base >= 9999:
+        # Stock ilimitado — pero restaurar si estaba en 0
+        necesita_restaurar = sinc.get(nombre_real,{}).get("sin_stock") or sinc.get(nombre_real,{}).get("stock_sinc") == 0
+        if necesita_restaurar:
+            if variantes:
+                for v in variantes:
+                    set_stock_variante(v["id"], 10)
+                    sinc.setdefault(nombre_real,{})[f"stock_{v['id']}"] = 10
+                    time.sleep(0.3)
+            else:
+                set_stock_producto(pid, 10)
+                sinc.setdefault(nombre_real,{})["stock_sinc"] = 10
+            sinc.get(nombre_real,{}).pop("sin_stock", None)
+            print(f"   🔄 Stock restaurado: {nombre_real}")
+        return
+
     if variantes:
         for v in variantes:
             vnom  = normalizar(v["nombre"])
