@@ -1765,6 +1765,7 @@ def tg_menu():
              {"text": "⏸️ Apagar scraping", "callback_data": "/apagar"}],
             [{"text": "🔁 Ciclo Manual", "callback_data": "/ciclo"},
              {"text": "📊 Estado", "callback_data": "/estado_scraping"}],
+            [{"text": "🔬 Test Proxy", "callback_data": "/test_proxy"}],
             [{"text": "🏷️ Ver Ofertas Proveedor", "callback_data": "/ver_ofertas_proveedor"}],
             [{"text": "🛠️ Debug Env", "callback_data": "/debug_env"}],
             [{"text": "📄 Ayuda completa", "callback_data": "/ayuda"}],
@@ -1860,6 +1861,67 @@ def procesar_cmd(texto):
            f"• Web ComerciApp: {web_ok}\\n"
            f"• Margen: {MARGEN} (~{round((1-MARGEN)*100)}% ganancia)\\n"
            f"• Ciclo: cada {CICLO_MINUTOS} min")
+        return
+    elif cmd[0] == "/test_proxy":
+        def _test_proxy():
+            res = ["🔬 *Diagnóstico de conexión al proveedor*\n"]
+            proxy = _get_residential_proxy()
+            # 0) Config
+            res.append(f"*Proxy configurado:* {'SÍ' if proxy else 'NO — faltan PROXY_HOST/PORT/USER/PASS'}")
+            if proxy:
+                # Mostrar host:puerto sin exponer user/pass
+                res.append(f"  `{PROXY_HOST}:{PROXY_PORT}`")
+            res.append(f"*curl-cffi:* {'✅ disponible' if CURL_CFFI_OK else '❌ no instalado'}")
+            res.append("")
+
+            # 1) Sin proxy (directo) — para ver si Cloudflare bloquea
+            res.append("*1) Directo (sin proxy):*")
+            try:
+                if CURL_CFFI_OK:
+                    r = cf_requests.get("https://rxzweb.com/wp-json/wc/store/v1/products",
+                                        params={"per_page": 1}, impersonate="chrome124", timeout=20)
+                    res.append(f"  HTTP {r.status_code} " + ("✅ pasa" if r.status_code == 200 else "⚠️ (Cloudflare suele dar 202/403 acá)"))
+                else:
+                    res.append("  ⏭️ (curl-cffi no disponible)")
+            except Exception as e:
+                res.append(f"  ❌ {type(e).__name__}: {str(e)[:120]}")
+            res.append("")
+
+            # 2) Con proxy — el que usa el bot
+            res.append("*2) Con proxy residencial:*")
+            if not proxy:
+                res.append("  ⏭️ sin proxy configurado")
+            elif not CURL_CFFI_OK:
+                res.append("  ⏭️ curl-cffi no disponible")
+            else:
+                try:
+                    r = cf_requests.get("https://rxzweb.com/", impersonate="chrome124", proxy=proxy, timeout=20)
+                    res.append(f"  Calentamiento HTTP {r.status_code} " + ("✅" if r.status_code in (200, 202, 403) else "⚠️"))
+                    time.sleep(1)
+                    r2 = cf_requests.get("https://rxzweb.com/wp-json/wc/store/v1/products",
+                                         params={"per_page": 1}, impersonate="chrome124", proxy=proxy, timeout=30)
+                    if r2.status_code == 200:
+                        try:
+                            n = len(r2.json())
+                            res.append(f"  Scrape HTTP 200 ✅ — devolvió {n} producto(s)")
+                        except Exception:
+                            res.append("  Scrape HTTP 200 pero respuesta no-JSON ⚠️")
+                    else:
+                        res.append(f"  Scrape HTTP {r2.status_code} ⚠️")
+                except Exception as e:
+                    err = str(e)
+                    res.append(f"  ❌ {type(e).__name__}: {err[:140]}")
+                    if "WRONG_VERSION_NUMBER" in err:
+                        res.append("  💡 *Esto es proxy caído/sin saldo* o puerto/protocolo mal. Revisá ThorData.")
+                    elif "407" in err or "authentication" in err.lower():
+                        res.append("  💡 *User/pass del proxy incorrectos* (407).")
+                    elif "timed out" in err.lower() or "timeout" in err.lower():
+                        res.append("  💡 *El proxy no responde* — host/puerto mal o servicio caído.")
+            res.append("")
+            res.append("_Si (1) falla con 202/403 pero (2) también falla → problema del proxy._")
+            tg("\n".join(res))
+        tg("🔬 Probando conexión... (tarda ~30s)")
+        threading.Thread(target=_test_proxy, daemon=True).start()
         return
     elif cmd[0] == "/ayuda":
         tg(AYUDA)
