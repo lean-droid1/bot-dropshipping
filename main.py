@@ -37,8 +37,14 @@ API_BASE         = "https://developers.tiendanegocio.com/v1"
 PROV_API         = "https://rxzweb.com/wp-json/wc/store/v1/products"
 USER_AGENT       = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 
+# ── ComerciApp (web nueva de Leandro) — destino de la sincronización ──────────
+# El bot escribe el catálogo del proveedor acá vía API key (header X-Bot-Key).
+COMERCIAPP_API   = (os.environ.get("COMERCIAPP_API") or "").strip().rstrip("/")  # ej: https://sistema-unificado-api-production.up.railway.app
+COMERCIAPP_KEY   = (os.environ.get("BOT_API_KEY") or "").strip()                 # la misma BOT_API_KEY del backend
+COMERCIAPP_SECCION = (os.environ.get("COMERCIAPP_SECCION_ID") or "").strip()     # opcional: id de la sección DEPOSITO (si no, el backend la busca)
+
 # Márgenes y alertas (configurables via Railway Variables)
-MARGEN           = float(os.environ.get("MARGEN", "0.78"))   # /0.78 = 22% ganancia
+MARGEN           = float(os.environ.get("MARGEN", "0.90"))   # /0.90 = ~11% de ganancia
 ALERTA_STOCK       = 3       # Alerta Telegram cuando stock llega a este numero
 ENVIO_GRATIS_MIN   = 100000  # Activar envio gratis en productos >= este precio
 
@@ -135,6 +141,7 @@ def leer_db():
                 d.setdefault("variantes_cache", {})
                 d.setdefault("pids_refrescar", [])
                 d.setdefault("ultimo_orden_id", 0)
+                d.setdefault("scraping_activo", False)  # arranca APAGADO tras cada deploy (evita bloqueo RXZ)
                 return d
         except Exception: pass
     return {"productos_proveedor":{}, "sincronizados":{}, "pedidos_procesados":[], "ofertas_pendientes":{}, "ordenes":{}}
@@ -234,7 +241,61 @@ def canjear_code(code):
     return None
 
 # ══════════════════════════════════════════════════════════════════════════════
-# API TIENDA NEGOCIO
+# ══════════════════════════════════════════════════════════════════════════════
+# API COMERCIAPP (web nueva) — destino de la sincronización
+# ══════════════════════════════════════════════════════════════════════════════
+def _ca_headers():
+    return {"Content-Type": "application/json", "X-Bot-Key": COMERCIAPP_KEY}
+
+def comerciapp_ok():
+    return bool(COMERCIAPP_API and COMERCIAPP_KEY)
+
+def comerciapp_sync(lote):
+    """Manda un lote de productos a ComerciApp (/api/bot/sync). Devuelve el JSON de respuesta o None."""
+    if not comerciapp_ok():
+        print("⚠️ ComerciApp no configurado (COMERCIAPP_API / BOT_API_KEY)")
+        return None
+    payload = {"productos": lote}
+    if COMERCIAPP_SECCION:
+        try: payload["seccion_id"] = int(COMERCIAPP_SECCION)
+        except Exception: pass
+    for intento in range(3):
+        try:
+            r = requests.post(f"{COMERCIAPP_API}/api/bot/sync", headers=_ca_headers(), json=payload, timeout=60)
+            if r.status_code in (200, 201):
+                return r.json()
+            print(f"⚠️ ComerciApp sync HTTP {r.status_code}: {r.text[:200]}")
+            if r.status_code in (401, 503):  # auth/config error → no reintentar
+                return None
+        except Exception as e:
+            print(f"❌ ComerciApp sync: {e}")
+        time.sleep(3 * (intento + 1))
+    return None
+
+def comerciapp_skus_existentes():
+    """Devuelve dict {sku: stock} de los productos RXZ- que ya existen en ComerciApp."""
+    if not comerciapp_ok(): return {}
+    try:
+        r = requests.get(f"{COMERCIAPP_API}/api/bot/skus", headers=_ca_headers(), timeout=40)
+        if r.status_code == 200:
+            return {row["sku"]: row.get("stock", 0) for row in r.json().get("skus", [])}
+    except Exception as e:
+        print(f"❌ ComerciApp skus: {e}")
+    return {}
+
+def comerciapp_stock_cero(skus):
+    """Pone stock 0 a una lista de SKU en ComerciApp (los que se cayeron del proveedor)."""
+    if not comerciapp_ok() or not skus: return 0
+    try:
+        r = requests.post(f"{COMERCIAPP_API}/api/bot/stock-cero", headers=_ca_headers(), json={"skus": skus}, timeout=40)
+        if r.status_code == 200:
+            return r.json().get("afectados", 0)
+    except Exception as e:
+        print(f"❌ ComerciApp stock-cero: {e}")
+    return 0
+
+# ══════════════════════════════════════════════════════════════════════════════
+# API TIENDA NEGOCIO (LEGACY — ya no se usa, apuntamos a ComerciApp)
 # ══════════════════════════════════════════════════════════════════════════════
 def _h(): return {"Authorization":f"Bearer {_token}","User-Agent":USER_AGENT,"Content-Type":"application/json"}
 
@@ -632,6 +693,11 @@ def scrapear_proveedor():
                     }
                     time.sleep(0.25)
             else:
+                # Imagen principal y categoría del proveedor
+                imgs = p.get("images", []) or []
+                img_url = (imgs[0].get("src") or imgs[0].get("thumbnail") or "") if imgs else ""
+                cats = p.get("categories", []) or []
+                cat_nombre = (cats[0].get("name") or "") if cats else ""
                 productos[nombre_base] = {
                     "nombre_real":           nombre_orig,
                     "nombre_base_proveedor": nombre_base,
@@ -640,6 +706,8 @@ def scrapear_proveedor():
                     "en_oferta":             en_oferta,
                     "stock":                 stock_base if in_stock else 0,
                     "woo_id":                woo_id,
+                    "imagen":                img_url,
+                    "categoria":             cat_nombre,
                 }
 
         print(f"   Pág {pagina}: {len(lote)} prods (total entradas: {len(productos)})")
@@ -1088,134 +1156,137 @@ def notificar_orden_nueva(orden):
 
 def ciclo_monitoreo():
     print(f"\n─── 🔄 Ciclo {datetime.now().strftime('%H:%M')} ───")
-    db          = leer_db()
-    prov_ant    = db.get("productos_proveedor",{})
-    sinc        = db.get("sincronizados",{})
-    ped_proc    = db.get("pedidos_procesados",[])
-    for orden in chequear_ordenes_api():
-        oid = str(orden.get("id", ""))
-        if oid not in ped_proc:
-            notificar_orden_nueva(orden)
-            ped_proc.append(oid)
-    db["pedidos_procesados"] = ped_proc
-    db["ultimo_orden_id"] = db.get("ultimo_orden_id", 0)
-    escribir_db(db)
-    for ped in chequear_gmail():
-        if ped["id"] not in ped_proc:
-            ped_proc.append(ped["id"])
+    db = leer_db()
+
+    # ── Botón ON/OFF: si el scraping está apagado, no salir a RXZ ──
+    if not db.get("scraping_activo", False):
+        print("⏸️  Scraping APAGADO — encendé con /encender (o botón del menú).")
+        return
+
+    prov_ant = db.get("productos_proveedor", {})
+
+    # 1) Traer catálogo del proveedor (fuente de verdad)
     prov_nuevo = scrapear_proveedor()
     if not prov_nuevo:
         if prov_ant:
-            print("⚠️ Proveedor sin datos — usando cache del ultimo ciclo exitoso")
+            print("⚠️ Proveedor sin datos — usando cache del último ciclo exitoso")
             prov_nuevo = prov_ant
         else:
             print("⚠️ Proveedor 0 productos y sin cache. Abortando.")
             tg(f"⚠️ *{_nt('Proveedor sin datos')}* — sin cache disponible. Se reintentará en el próximo ciclo.")
             return
+
     prov_consolidado = {**prov_ant, **prov_nuevo}
-    idx      = construir_indice(prov_nuevo)
-    pids_refrescar = set(db.get("pids_refrescar", []))
-    db["pids_refrescar"] = []
-    catalogo = obtener_catalogo(pids_refrescar=pids_refrescar) if _token else []
-    db = leer_db()
-    sinc = db.get("sincronizados", sinc)
-    bloque_nuevos = ""; bloque_recuperados = ""
-    lineas_precios    = []
-    lineas_sin_stock  = []
-    lineas_stock_bajo = []
+
+    # 2) Detectar OFERTAS nuevas y VARIACIONES (comparando proveedor vs proveedor) → alertas Telegram
     ofertas_nuevas = {}
+    lineas_stock_bajo = []
     for clave, datos in prov_nuevo.items():
         viejo = prov_ant.get(clave, {})
-        if datos["en_oferta"] and datos.get("precio_anterior",0) > datos["precio"] and not viejo.get("en_oferta", False):
-            base = datos["nombre_base_proveedor"]
+        # Oferta nueva
+        if datos.get("en_oferta") and datos.get("precio_anterior", 0) > datos["precio"] and not viejo.get("en_oferta", False):
+            base = datos.get("nombre_base_proveedor", clave)
             if base not in ofertas_nuevas:
                 ofertas_nuevas[base] = datos
-        base_norm = datos.get("nombre_base_proveedor", clave)
-        tengo = any(match(p["nombre_norm"], base_norm) for p in catalogo) if catalogo else False
-        if not tengo and not viejo:
-            p_sug = precio_obj(datos["precio"])
-            if any(w in clave for w in PALABRAS_INTERES):
-                bloque_nuevos += (f"• *{datos['nombre_real']}*\n"
-                                  f"  Costo: ${datos['precio']:,} → Sugerido: ${p_sug:,}\n\n")
-        if viejo and not viejo.get("stock", True) and datos.get("stock", True):
-            nombre_r = datos["nombre_real"]
-            if sinc.get(nombre_r,{}).get("sin_stock"):
-                precio_guardado = sinc[nombre_r].get("precio",0)
-                sinc[nombre_r]  = {"precio":precio_guardado} if precio_guardado else {}
-                bloque_recuperados += f"• *{nombre_r}*\n\n"
+        # Stock bajo en proveedor
         stock = datos.get("stock", 0)
-        if isinstance(stock, (int,float)) and 0 < stock <= ALERTA_STOCK and stock < 9999:
-            nombre_r = datos["nombre_real"]
-            ultimo_alerta_stock = sinc.get(nombre_r,{}).get("alerta_stock_cant")
-            if ultimo_alerta_stock != int(stock):
-                lineas_stock_bajo.append(f"• *{nombre_r}*: {int(stock)} unidad{'es' if stock>1 else ''}")
-                sinc.setdefault(nombre_r,{})["alerta_stock_cant"] = int(stock)
+        if isinstance(stock, (int, float)) and 0 < stock <= ALERTA_STOCK and stock < 9999:
+            lineas_stock_bajo.append(f"• *{datos['nombre_real']}*: {int(stock)} unidad{'es' if stock > 1 else ''}")
+
+    # 3) Armar el LOTE para ComerciApp (upsert por SKU = RXZ-{woo_id})
+    lote = []
+    skus_con_stock = set()
+    cambios_precio = []   # para alerta Telegram
+    for clave, datos in prov_nuevo.items():
+        woo_id = datos.get("woo_id")
+        if not woo_id:
+            continue
+        sku = f"RXZ-{woo_id}"
+        costo = datos.get("precio", 0)
+        if costo <= 0:
+            continue
+        precio_venta = precio_obj(costo)
+        stock = datos.get("stock", 0) or 0
+        en_oferta = datos.get("en_oferta", False)
+        precio_anterior = datos.get("precio_anterior", 0)
+
+        # Precio y oferta: en la web nueva precio_base = precio normal, precio_oferta = precio con descuento
+        precio_base = precio_venta
+        precio_oferta = 0
+        if en_oferta and precio_anterior > 0:
+            precio_base = precio_obj(precio_anterior)   # precio "regular" tachado
+            precio_oferta = precio_venta                # precio con descuento
+
+        envio_gratis = precio_venta >= ENVIO_GRATIS_MIN and int(woo_id) not in PRODUCTOS_PESADOS_IDS
+
+        prod_lote = {
+            "sku": sku,
+            "nombre": datos.get("nombre_real", ""),
+            "precio_base": precio_base,
+            "precio_oferta": precio_oferta,
+            "stock": int(stock) if stock else 0,
+            "imagen": datos.get("imagen", ""),
+            "categoria": datos.get("categoria", ""),
+            "envio_gratis": envio_gratis,
+        }
+        lote.append(prod_lote)
+        if stock and stock > 0:
+            skus_con_stock.add(sku)
+
+        # Alerta de cambio de precio (comparando con el ciclo anterior del proveedor)
+        viejo = prov_ant.get(clave, {})
+        costo_viejo = viejo.get("precio", 0)
+        if costo_viejo and costo_viejo != costo:
+            pv_viejo = precio_obj(costo_viejo)
+            if pv_viejo != precio_venta:
+                flecha = "🔼" if precio_venta > pv_viejo else "🔽"
+                cambios_precio.append(f"{flecha} *{datos['nombre_real']}*: ${pv_viejo:,} → ${precio_venta:,}")
+
+    # 4) Enviar el lote a ComerciApp
+    resumen = None
+    if lote:
+        resumen = comerciapp_sync(lote)
+        if resumen:
+            print(f"   ✅ ComerciApp: {resumen.get('insertados',0)} nuevos, {resumen.get('actualizados',0)} actualizados, {resumen.get('errores',0)} errores")
+        else:
+            tg(f"⚠️ *{_nt('Error sincronizando con la web')}* — el lote no se pudo enviar. Reintentará en el próximo ciclo.")
+
+    # 5) Productos que se CAYERON del proveedor → stock 0 en la web
+    caidos = []
+    skus_web = comerciapp_skus_existentes()
+    if skus_web:
+        skus_proveedor = {f"RXZ-{d.get('woo_id')}" for d in prov_nuevo.values() if d.get("woo_id")}
+        for sku, stock_web in skus_web.items():
+            if sku not in skus_proveedor and (stock_web or 0) > 0:
+                caidos.append(sku)
+        if caidos:
+            afectados = comerciapp_stock_cero(caidos)
+            print(f"   📉 {afectados} productos caídos del proveedor → stock 0")
+
+    # 6) Notificaciones Telegram
     if ofertas_nuevas:
         db["ofertas_pendientes"] = ofertas_nuevas
         nums = [f"{i+1}. *{d['nombre_real']}*\n   Reg: ${d.get('precio_anterior',0):,} → 🔥 ${d['precio']:,}"
-                for i,(k,d) in enumerate(ofertas_nuevas.items())]
-        tg(f"🏷️ *{_nt('Ofertas nuevas del Proveedor')}*\n\n" + "\n".join(nums) +
-           f"\n\nUsá `/aplicar_ofertas todos` o `/aplicar_ofertas 1 3` para aplicarlas.")
-    for prod in catalogo:
-        nombre_real = prod["nombre"]
-        precio_web  = prod["precio_base"]
-        sync_actual = sinc.get(nombre_real, {})
-        _, datos_prov = buscar_en_indice(prod["nombre_norm"], idx)
-        if datos_prov is None:
-            if not sync_actual.get("sin_stock", False):
-                if marcar_sin_stock(prod):
-                    sinc[nombre_real] = {**sync_actual, "sin_stock": True}
-                    etiq = f"({len(prod['variantes'])} var.)" if prod["tiene_variantes"] else "(sin var.)"
-                    lineas_sin_stock.append(f"• *{nombre_real}* {etiq}")
-        else:
-            if sync_actual.get("sin_stock"):
-                precio_guardado = sync_actual.get("precio", 0)
-                sinc[nombre_real] = {"precio": precio_guardado} if precio_guardado else {}
-                sync_actual = sinc[nombre_real]
-            p_obj_calc = precio_obj(datos_prov["precio_base"])
-            if p_obj_calc != sync_actual.get("precio", 0):
-                ratio = (p_obj_calc / precio_web) if precio_web > 0 else 1
-                if ratio < 0.40:
-                    alerta = "[" + NOMBRE_TIENDA + "] PRECIO BLOQUEADO baja >60%: "
-                    alerta += nombre_real + " actual $" + str(int(precio_web))
-                    alerta += " calculado $" + str(p_obj_calc)
-                    alerta += " | verificar /debug_match"
-                    tg(alerta)
-                else:
-                    ok, p_min, p_max = sincronizar_precios(prod, datos_prov)
-                    if ok:
-                        sinc.setdefault(nombre_real, {})["precio"] = p_min
-                        db.setdefault("pids_refrescar", [])
-                        if prod["tiene_variantes"] and prod["id"] not in db["pids_refrescar"]:
-                            db["pids_refrescar"].append(prod["id"])
-                        if int(precio_web) != p_min:
-                            rango = str(p_min) if p_min == p_max else str(p_min) + "-" + str(p_max)
-                            nvar = len(prod["variantes"])
-                            etiq = "(" + str(nvar) + " var.)" if prod["tiene_variantes"] else "(sin var.)"
-                            linea = nombre_real + " " + etiq
-                            linea += " | Antes $" + str(int(precio_web))
-                            linea += " Nuevo $" + rango
-                            lineas_precios.append(linea)
-            else:
-                _actualizar_envio_gratis_prod(prod, p_obj_calc)
-            sincronizar_stock(prod, datos_prov, sinc)
-    if bloque_nuevos:
-        tg(f"🔥 *{_nt('¡Nuevo producto en el Proveedor!')}*\n\n{bloque_nuevos}")
-    if bloque_recuperados:
-        tg(f"🔄 *{_nt('¡Stock recuperado en Proveedor!')}*\n\n{bloque_recuperados}")
-    for i in range(0, len(lineas_precios), 20):
-        tg(f"💲 *{_nt('Precios actualizados:')}*\n\n" + "\n\n".join(lineas_precios[i:i+20]))
-    for i in range(0, len(lineas_sin_stock), 30):
-        tg(f"📦 *{_nt('Marcados sin stock:')}*\n\n" + "\n".join(lineas_sin_stock[i:i+30]))
+                for i, (k, d) in enumerate(ofertas_nuevas.items())]
+        tg(f"🏷️ *{_nt('Ofertas nuevas del Proveedor')}*\n\n" + "\n".join(nums))
+    for i in range(0, len(cambios_precio), 20):
+        tg(f"💲 *{_nt('Precios actualizados:')}*\n\n" + "\n".join(cambios_precio[i:i+20]))
     if lineas_stock_bajo:
-        tg(f"⚠️ *{_nt('Stock bajo en proveedor:')}*\n\n" + "\n".join(lineas_stock_bajo))
-    if not any([bloque_nuevos, bloque_recuperados, lineas_precios, lineas_sin_stock, lineas_stock_bajo]):
-        print("✅ Sin cambios.")
+        for i in range(0, len(lineas_stock_bajo), 30):
+            tg(f"⚠️ *{_nt('Stock bajo en proveedor:')}*\n\n" + "\n".join(lineas_stock_bajo[i:i+30]))
+    if resumen:
+        partes = []
+        if resumen.get("insertados"): partes.append(f"🆕 {resumen['insertados']} nuevos")
+        if resumen.get("actualizados"): partes.append(f"🔄 {resumen['actualizados']} actualizados")
+        if caidos: partes.append(f"📉 {len(caidos)} sin stock")
+        if partes:
+            tg(f"✅ *{_nt('Sync web')}*\n" + " | ".join(partes))
+
+    if not any([ofertas_nuevas, cambios_precio, lineas_stock_bajo, caidos]):
+        print("✅ Sin cambios relevantes.")
+
+    # 7) Guardar estado
     db["productos_proveedor"] = prov_consolidado
-    db["sincronizados"]       = sinc
-    db["pedidos_procesados"]  = ped_proc
-    db["api_token"]           = _token
-    db["api_user_id"]         = _store_id
     escribir_db(db)
     print("─── ✅ Ciclo completado ───")
 
@@ -1690,19 +1761,12 @@ def tg_menu():
     if not TELEGRAM_TOKEN or not CHAT_ID: return
     keyboard = {
         "inline_keyboard": [
-            [{"text": "🔄 Sync Total", "callback_data": "/sync_total"},
-             {"text": "🔁 Ciclo Manual", "callback_data": "/ciclo"}],
-            [{"text": "📋 Listar Productos", "callback_data": "/listar"},
-             {"text": "📦 Sin Cargar", "callback_data": "/productos_sin_cargar todo"}],
-            [{"text": "🏷️ Ver Ofertas Proveedor", "callback_data": "/ver_ofertas_proveedor"},
-             {"text": "✅ Aplicar Ofertas", "callback_data": "/aplicar_ofertas todos"}],
-            [{"text": "🚚 Fix Envío Gratis", "callback_data": "/fix_envio_gratis"},
-             {"text": "📊 Exportar Precios", "callback_data": "/exportar_precios"}],
-            [{"text": "✍️ Generar Descripciones", "callback_data": "/generar_todas_descripciones"}],
-            [{"text": "🔗 Ver Webhooks", "callback_data": "/ver_webhooks"},
-             {"text": "📡 Registrar Webhooks", "callback_data": "/registrar_webhooks"}],
-            [{"text": "🔑 Estado API", "callback_data": "/estado_api"},
-             {"text": "🛠️ Debug Env", "callback_data": "/debug_env"}],
+            [{"text": "▶️ Encender scraping", "callback_data": "/encender"},
+             {"text": "⏸️ Apagar scraping", "callback_data": "/apagar"}],
+            [{"text": "🔁 Ciclo Manual", "callback_data": "/ciclo"},
+             {"text": "📊 Estado", "callback_data": "/estado_scraping"}],
+            [{"text": "🏷️ Ver Ofertas Proveedor", "callback_data": "/ver_ofertas_proveedor"}],
+            [{"text": "🛠️ Debug Env", "callback_data": "/debug_env"}],
             [{"text": "📄 Ayuda completa", "callback_data": "/ayuda"}],
         ]
     }
@@ -1776,8 +1840,27 @@ def procesar_cmd(texto):
     cmd = texto.lower().split()
     if not cmd: return
 
-    if cmd[0] == "/menu":
-        tg_menu()
+    if cmd[0] == "/encender":
+        db = leer_db(); db["scraping_activo"] = True; escribir_db(db)
+        tg(f"▶️ *Scraping ENCENDIDO* — el bot va a sincronizar cada {CICLO_MINUTOS} min.\\n\\nCorriendo un ciclo ahora...")
+        try: ciclo_monitoreo()
+        except Exception as e: tg(f"⚠️ Error en el ciclo: `{e}`")
+        return
+    elif cmd[0] == "/apagar":
+        db = leer_db(); db["scraping_activo"] = False; escribir_db(db)
+        tg("⏸️ *Scraping APAGADO* — no va a salir al proveedor hasta que lo enciendas con /encender.\\n\\nUsalo antes de deployar cambios del bot para no bloquear RXZ.")
+        return
+    elif cmd[0] == "/estado_scraping":
+        db = leer_db()
+        activo = db.get("scraping_activo", False)
+        n_prov = len(db.get("productos_proveedor", {}))
+        web_ok = "✅ configurada" if comerciapp_ok() else "❌ falta COMERCIAPP_API / BOT_API_KEY"
+        tg(f"{'▶️ ENCENDIDO' if activo else '⏸️ APAGADO'}\\n\\n"
+           f"• Proveedor en cache: {n_prov} productos\\n"
+           f"• Web ComerciApp: {web_ok}\\n"
+           f"• Margen: {MARGEN} (~{round((1-MARGEN)*100)}% ganancia)\\n"
+           f"• Ciclo: cada {CICLO_MINUTOS} min")
+        return
     elif cmd[0] == "/ayuda":
         tg(AYUDA)
     elif cmd[0] == "/estado_api":
@@ -1864,8 +1947,18 @@ def procesar_cmd(texto):
                 tg("❌ Excel generado pero falló el envío.")
         else: tg(msg)
     elif cmd[0] == "/ciclo":
-        tg(f"🔄 *{_nt('Ciclo manual iniciado')}*")
-        threading.Thread(target=ciclo_monitoreo, daemon=True).start()
+        tg(f"🔄 *{_nt('Ciclo manual iniciado')}* (corre aunque el scraping esté apagado)")
+        def _ciclo_manual():
+            db = leer_db()
+            era_activo = db.get("scraping_activo", False)
+            if not era_activo:
+                db["scraping_activo"] = True; escribir_db(db)
+            try:
+                ciclo_monitoreo()
+            finally:
+                if not era_activo:
+                    db2 = leer_db(); db2["scraping_activo"] = False; escribir_db(db2)
+        threading.Thread(target=_ciclo_manual, daemon=True).start()
     elif cmd[0] == "/debug_ordenes":
         if not _token: tg("❌ Necesito el token primero."); return
         tg("🔄 Probando GET /orders directo...")
@@ -2141,25 +2234,25 @@ def escuchar_telegram():
 # ══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     print("🚀 Bot iniciado...")
-    print(f"   API_TOKEN env:   {'SÍ (' + os.environ.get('API_TOKEN','')[:8] + '...)' if os.environ.get('API_TOKEN') else 'NO'}")
-    print(f"   API_USER_ID env: {os.environ.get('API_USER_ID','NO')}")
     print(f"   NOMBRE_TIENDA:   {NOMBRE_TIENDA}")
     print(f"   MARGEN:          {MARGEN} ({round((1-MARGEN)*100)}% ganancia)")
+    print(f"   ComerciApp API:  {'SÍ (' + COMERCIAPP_API[:40] + '...)' if COMERCIAPP_API else 'NO — falta COMERCIAPP_API'}")
+    print(f"   BOT_API_KEY:     {'SÍ' if COMERCIAPP_KEY else 'NO — falta BOT_API_KEY'}")
     rp = _get_residential_proxy()
     if rp:
         print(f"   ✅ Proxy residencial: {PROXY_HOST}:{PROXY_PORT}")
     else:
         print(f"   ⚠️ Sin proxy residencial — usando curl-cffi directo")
 
-    cargar_token()
-
-    if _token:
-        tg(f"🟢 *{_nt('Bot iniciado')}* — Token activo (store_id: `{_store_id}`)\n\n"
-           f"Mandá `/menu` para abrir el panel de control con botones.\n"
-           f"Mandá `/ayuda` para ver todos los comandos.")
-    else:
-        tg(f"🟡 *{_nt('Bot iniciado')}* — Sin token API.\n"
-           f"Mandá `/debug_env` para diagnosticar.")
+    _db_ini = leer_db()
+    _scr = _db_ini.get("scraping_activo", False)
+    _web = "✅" if comerciapp_ok() else "❌ falta config"
+    tg(f"{'🟢' if comerciapp_ok() else '🟡'} *{_nt('Bot iniciado')}*\\n\\n"
+       f"• Scraping: {'▶️ ENCENDIDO' if _scr else '⏸️ APAGADO (arranca así tras cada deploy)'}\\n"
+       f"• Web ComerciApp: {_web}\\n"
+       f"• Margen: {MARGEN}\\n\\n"
+       f"Mandá /encender para arrancar la sincronización.\\n"
+       f"Mandá /menu para el panel de botones.")
 
     threading.Thread(target=escuchar_telegram, daemon=True).start()
     if FLASK_OK:
@@ -2170,11 +2263,11 @@ if __name__ == "__main__":
         ciclo_monitoreo()
     except Exception as e:
         print(f"⚠️ Error en ciclo inicial: {e}")
-        tg(f"⚠️ *{_nt('Error en ciclo inicial')}*\n`{e}`\nEl bot sigue activo, reintentará en {CICLO_MINUTOS} min.")
+        tg(f"⚠️ *{_nt('Error en ciclo inicial')}*\\n`{e}`\\nEl bot sigue activo, reintentará en {CICLO_MINUTOS} min.")
     while True:
         time.sleep(CICLO_MINUTOS * 60)
         try:
             ciclo_monitoreo()
         except Exception as e:
             print(f"⚠️ Error en ciclo: {e}")
-            tg(f"⚠️ *{_nt('Error en ciclo')}*\n`{e}`\nReintentando en {CICLO_MINUTOS} min.")
+            tg(f"⚠️ *{_nt('Error en ciclo')}*\\n`{e}`\\nReintentando en {CICLO_MINUTOS} min.")
