@@ -1248,6 +1248,15 @@ def ciclo_monitoreo():
         resumen = comerciapp_sync(lote)
         if resumen:
             print(f"   ✅ ComerciApp: {resumen.get('insertados',0)} nuevos, {resumen.get('actualizados',0)} actualizados, {resumen.get('errores',0)} errores")
+            # Si hubo muchos errores, mostrar el detalle (el backend manda hasta 10 ejemplos)
+            if resumen.get('errores', 0) > 0:
+                pe = resumen.get('primer_error', '')
+                ejemplos = (resumen.get('detalles') or [])[:3]
+                txt = "\n".join([f"• `{d.get('sku','?')}`: {d.get('error','?')}" for d in ejemplos])
+                msg = f"⚠️ *{_nt('Errores al cargar en la web')}* ({resumen.get('errores')} de {resumen.get('total')})\n"
+                if pe: msg += f"\nError principal:\n`{pe}`\n"
+                if txt: msg += f"\nEjemplos:\n{txt}"
+                tg(msg)
         else:
             tg(f"⚠️ *{_nt('Error sincronizando con la web')}* — el lote no se pudo enviar. Reintentará en el próximo ciclo.")
 
