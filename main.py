@@ -1843,23 +1843,23 @@ def procesar_cmd(texto):
 
     if cmd[0] == "/encender":
         db = leer_db(); db["scraping_activo"] = True; escribir_db(db)
-        tg(f"▶️ *Scraping ENCENDIDO* — el bot va a sincronizar cada {CICLO_MINUTOS} min.\\n\\nCorriendo un ciclo ahora...")
+        tg(f"▶️ *Scraping ENCENDIDO* — el bot va a sincronizar cada {CICLO_MINUTOS} min.\n\nCorriendo un ciclo ahora...")
         try: ciclo_monitoreo()
         except Exception as e: tg(f"⚠️ Error en el ciclo: `{e}`")
         return
     elif cmd[0] == "/apagar":
         db = leer_db(); db["scraping_activo"] = False; escribir_db(db)
-        tg("⏸️ *Scraping APAGADO* — no va a salir al proveedor hasta que lo enciendas con /encender.\\n\\nUsalo antes de deployar cambios del bot para no bloquear RXZ.")
+        tg("⏸️ *Scraping APAGADO* — no va a salir al proveedor hasta que lo enciendas con /encender.\n\nUsalo antes de deployar cambios del bot para no bloquear RXZ.")
         return
     elif cmd[0] == "/estado_scraping":
         db = leer_db()
         activo = db.get("scraping_activo", False)
         n_prov = len(db.get("productos_proveedor", {}))
         web_ok = "✅ configurada" if comerciapp_ok() else "❌ falta COMERCIAPP_API / BOT_API_KEY"
-        tg(f"{'▶️ ENCENDIDO' if activo else '⏸️ APAGADO'}\\n\\n"
-           f"• Proveedor en cache: {n_prov} productos\\n"
-           f"• Web ComerciApp: {web_ok}\\n"
-           f"• Margen: {MARGEN} (~{round((1-MARGEN)*100)}% ganancia)\\n"
+        tg(f"{'▶️ ENCENDIDO' if activo else '⏸️ APAGADO'}\n\n"
+           f"• Proveedor en cache: {n_prov} productos\n"
+           f"• Web ComerciApp: {web_ok}\n"
+           f"• Margen: {MARGEN} (~{round((1-MARGEN)*100)}% ganancia)\n"
            f"• Ciclo: cada {CICLO_MINUTOS} min")
         return
     elif cmd[0] == "/test_proxy":
@@ -2309,11 +2309,11 @@ if __name__ == "__main__":
     _db_ini = leer_db()
     _scr = _db_ini.get("scraping_activo", False)
     _web = "✅" if comerciapp_ok() else "❌ falta config"
-    tg(f"{'🟢' if comerciapp_ok() else '🟡'} *{_nt('Bot iniciado')}*\\n\\n"
-       f"• Scraping: {'▶️ ENCENDIDO' if _scr else '⏸️ APAGADO (arranca así tras cada deploy)'}\\n"
-       f"• Web ComerciApp: {_web}\\n"
-       f"• Margen: {MARGEN}\\n\\n"
-       f"Mandá /encender para arrancar la sincronización.\\n"
+    tg(f"{'🟢' if comerciapp_ok() else '🟡'} *{_nt('Bot iniciado')}*\n\n"
+       f"• Scraping: {'▶️ ENCENDIDO' if _scr else '⏸️ APAGADO (arranca así tras cada deploy)'}\n"
+       f"• Web ComerciApp: {_web}\n"
+       f"• Margen: {MARGEN}\n\n"
+       f"Mandá /encender para arrancar la sincronización.\n"
        f"Mandá /menu para el panel de botones.")
 
     threading.Thread(target=escuchar_telegram, daemon=True).start()
@@ -2325,11 +2325,11 @@ if __name__ == "__main__":
         ciclo_monitoreo()
     except Exception as e:
         print(f"⚠️ Error en ciclo inicial: {e}")
-        tg(f"⚠️ *{_nt('Error en ciclo inicial')}*\\n`{e}`\\nEl bot sigue activo, reintentará en {CICLO_MINUTOS} min.")
+        tg(f"⚠️ *{_nt('Error en ciclo inicial')}*\n`{e}`\nEl bot sigue activo, reintentará en {CICLO_MINUTOS} min.")
     while True:
         time.sleep(CICLO_MINUTOS * 60)
         try:
             ciclo_monitoreo()
         except Exception as e:
             print(f"⚠️ Error en ciclo: {e}")
-            tg(f"⚠️ *{_nt('Error en ciclo')}*\\n`{e}`\\nReintentando en {CICLO_MINUTOS} min.")
+            tg(f"⚠️ *{_nt('Error en ciclo')}*\n`{e}`\nReintentando en {CICLO_MINUTOS} min.")
