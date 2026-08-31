@@ -43,6 +43,11 @@ COMERCIAPP_API   = (os.environ.get("COMERCIAPP_API") or "").strip().rstrip("/") 
 COMERCIAPP_KEY   = (os.environ.get("BOT_API_KEY") or "").strip()                 # la misma BOT_API_KEY del backend
 COMERCIAPP_SECCION = (os.environ.get("COMERCIAPP_SECCION_ID") or "").strip()     # opcional: id de la sección DEPOSITO (si no, el backend la busca)
 
+# ── Categorías del proveedor a EXCLUIR (no cargar ni avisar) ──────────────────
+# Se comparan en minúsculas y por coincidencia parcial. Editable por Telegram con
+# /excluir_categoria y /incluir_categoria (se guarda en la DB del bot).
+CATEGORIAS_EXCLUIDAS_DEFAULT = ['modulos', 'módulos', 'baterias', 'baterías']
+
 # Márgenes y alertas (configurables via Railway Variables)
 MARGEN           = float(os.environ.get("MARGEN", "0.90"))   # /0.90 = ~11% de ganancia
 ALERTA_STOCK       = 3       # Alerta Telegram cuando stock llega a este numero
@@ -142,6 +147,8 @@ def leer_db():
                 d.setdefault("pids_refrescar", [])
                 d.setdefault("ultimo_orden_id", 0)
                 d.setdefault("scraping_activo", False)  # arranca APAGADO tras cada deploy (evita bloqueo RXZ)
+                d.setdefault("categorias_excluidas", CATEGORIAS_EXCLUIDAS_DEFAULT)
+                d.setdefault("categorias_conocidas", [])  # para detectar categorías nuevas del proveedor
                 return d
         except Exception: pass
     return {"productos_proveedor":{}, "sincronizados":{}, "pedidos_procesados":[], "ofertas_pendientes":{}, "ordenes":{}}
@@ -593,8 +600,21 @@ def _precio_real(p):
 def _stock_real(p):
     return p.get("add_to_cart",{}).get("maximum") or 0
 
-def scrapear_proveedor():
+def _categoria_excluida(cat_nombre, excluidas):
+    """True si la categoría está en la lista de excluidas (parcial, minúsculas, sin acentos)."""
+    if not cat_nombre: return False
+    def _sin_acentos(s):
+        return (s.lower().strip()
+                .replace('á','a').replace('é','e').replace('í','i')
+                .replace('ó','o').replace('ú','u'))
+    c = _sin_acentos(cat_nombre)
+    return any(_sin_acentos(ex) in c for ex in excluidas)
+
+def scrapear_proveedor(excluidas=None):
+    if excluidas is None:
+        excluidas = leer_db().get("categorias_excluidas", CATEGORIAS_EXCLUIDAS_DEFAULT)
     productos = {}; pagina = 1; reintentos_202 = 0; via_scraperapi = False
+    categorias_vistas = set()  # todas las categorías que aparecen en el proveedor este ciclo
     print("📥 API proveedor...")
     # Calentar proxy con request liviano
     if _get_residential_proxy() and CURL_CFFI_OK:
@@ -655,6 +675,15 @@ def scrapear_proveedor():
 
             if precio_pub == 0: continue
 
+            # Categoría del proveedor (la primera) — para filtro y detección de categorías nuevas
+            cats = p.get("categories", []) or []
+            cat_nombre = (cats[0].get("name") or "") if cats else ""
+            if cat_nombre:
+                categorias_vistas.add(cat_nombre)
+            # Filtro: si la categoría está excluida (módulos, baterías), saltar el producto
+            if _categoria_excluida(cat_nombre, excluidas):
+                continue
+
             # Optimización: solo buscar variantes de productos conocidos con variantes
             # Esto ahorra ~50 llamadas HTTP por ciclo
             PRODUCTOS_CON_VARIANTES = {'jc face id flex tag', 'jc bateria flex tag', 'maneral mango mijing'}
@@ -693,11 +722,25 @@ def scrapear_proveedor():
                     }
                     time.sleep(0.25)
             else:
-                # Imagen principal y categoría del proveedor
+                # Imagen principal + TODAS las imágenes de la galería del proveedor
                 imgs = p.get("images", []) or []
-                img_url = (imgs[0].get("src") or imgs[0].get("thumbnail") or "") if imgs else ""
-                cats = p.get("categories", []) or []
-                cat_nombre = (cats[0].get("name") or "") if cats else ""
+                lista_imgs = []
+                for im in imgs:
+                    u = im.get("src") or im.get("thumbnail") or ""
+                    if u and u not in lista_imgs:
+                        lista_imgs.append(u)
+                img_url = lista_imgs[0] if lista_imgs else ""
+                # Descripción (limpia HTML básico), peso y dimensiones
+                import re as _re
+                desc_raw = p.get("description", "") or p.get("short_description", "") or ""
+                desc = _re.sub(r"<[^>]+>", "", desc_raw).strip()[:2000]
+                peso = 0.0
+                try: peso = float(p.get("weight") or 0)
+                except Exception: peso = 0.0
+                dims = p.get("dimensions", {}) or {}
+                def _fdim(x):
+                    try: return float(x or 0)
+                    except Exception: return 0.0
                 productos[nombre_base] = {
                     "nombre_real":           nombre_orig,
                     "nombre_base_proveedor": nombre_base,
@@ -707,7 +750,13 @@ def scrapear_proveedor():
                     "stock":                 stock_base if in_stock else 0,
                     "woo_id":                woo_id,
                     "imagen":                img_url,
+                    "imagenes":              lista_imgs,
                     "categoria":             cat_nombre,
+                    "descripcion":           desc,
+                    "peso":                  peso,
+                    "alto":                  _fdim(dims.get("height")),
+                    "ancho":                 _fdim(dims.get("width")),
+                    "largo":                 _fdim(dims.get("length")),
                 }
 
         print(f"   Pág {pagina}: {len(lote)} prods (total entradas: {len(productos)})")
@@ -715,6 +764,7 @@ def scrapear_proveedor():
         pagina += 1; time.sleep(0.5)
 
     print(f"   ✅ {len(productos)} entradas del proveedor")
+    scrapear_proveedor.ultimas_categorias = sorted(categorias_vistas)
     return productos
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1164,9 +1214,10 @@ def ciclo_monitoreo():
         return
 
     prov_ant = db.get("productos_proveedor", {})
+    excluidas = db.get("categorias_excluidas", CATEGORIAS_EXCLUIDAS_DEFAULT)
 
-    # 1) Traer catálogo del proveedor (fuente de verdad)
-    prov_nuevo = scrapear_proveedor()
+    # 1) Traer catálogo del proveedor (fuente de verdad), filtrando categorías excluidas
+    prov_nuevo = scrapear_proveedor(excluidas)
     if not prov_nuevo:
         if prov_ant:
             print("⚠️ Proveedor sin datos — usando cache del último ciclo exitoso")
@@ -1175,6 +1226,24 @@ def ciclo_monitoreo():
             print("⚠️ Proveedor 0 productos y sin cache. Abortando.")
             tg(f"⚠️ *{_nt('Proveedor sin datos')}* — sin cache disponible. Se reintentará en el próximo ciclo.")
             return
+
+    # Detección de CATEGORÍAS NUEVAS del proveedor
+    cats_ahora = getattr(scrapear_proveedor, "ultimas_categorias", [])
+    cats_conocidas = db.get("categorias_conocidas", [])
+    if cats_conocidas:  # no avisar en el primer ciclo (todo sería "nuevo")
+        cats_nuevas = [c for c in cats_ahora if c not in cats_conocidas]
+        if cats_nuevas:
+            excl_txt = ""
+            nuevas_excluidas = [c for c in cats_nuevas if _categoria_excluida(c, excluidas)]
+            nuevas_incluidas = [c for c in cats_nuevas if not _categoria_excluida(c, excluidas)]
+            msg = f"🆕 *{_nt('Categorías nuevas en el proveedor')}*\n\n"
+            if nuevas_incluidas:
+                msg += "✅ Se van a cargar:\n" + "\n".join(f"• {c}" for c in nuevas_incluidas) + "\n"
+            if nuevas_excluidas:
+                msg += "\n🚫 Excluidas (no se cargan):\n" + "\n".join(f"• {c}" for c in nuevas_excluidas)
+            tg(msg)
+    if cats_ahora:
+        db["categorias_conocidas"] = sorted(set(cats_conocidas) | set(cats_ahora))
 
     prov_consolidado = {**prov_ant, **prov_nuevo}
 
@@ -1226,7 +1295,13 @@ def ciclo_monitoreo():
             "precio_oferta": precio_oferta,
             "stock": int(stock) if stock else 0,
             "imagen": datos.get("imagen", ""),
+            "imagenes": datos.get("imagenes", []),
             "categoria": datos.get("categoria", ""),
+            "descripcion": datos.get("descripcion", ""),
+            "peso": datos.get("peso", 0),
+            "alto": datos.get("alto", 0),
+            "ancho": datos.get("ancho", 0),
+            "largo": datos.get("largo", 0),
             "envio_gratis": envio_gratis,
         }
         lote.append(prod_lote)
@@ -1775,6 +1850,8 @@ def tg_menu():
             [{"text": "🔁 Ciclo Manual", "callback_data": "/ciclo"},
              {"text": "📊 Estado", "callback_data": "/estado_scraping"}],
             [{"text": "🔬 Test Proxy", "callback_data": "/test_proxy"}],
+            [{"text": "📂 Ver Categorías", "callback_data": "/ver_categorias"}],
+            [{"text": "🧹 Limpiar DEPOSITO", "callback_data": "/limpiar_deposito"}],
             [{"text": "🏷️ Ver Ofertas Proveedor", "callback_data": "/ver_ofertas_proveedor"}],
             [{"text": "🛠️ Debug Env", "callback_data": "/debug_env"}],
             [{"text": "📄 Ayuda completa", "callback_data": "/ayuda"}],
@@ -1870,6 +1947,61 @@ def procesar_cmd(texto):
            f"• Web ComerciApp: {web_ok}\n"
            f"• Margen: {MARGEN} (~{round((1-MARGEN)*100)}% ganancia)\n"
            f"• Ciclo: cada {CICLO_MINUTOS} min")
+        return
+    elif cmd[0] == "/ver_categorias":
+        db = leer_db()
+        conocidas = db.get("categorias_conocidas", [])
+        excluidas = db.get("categorias_excluidas", CATEGORIAS_EXCLUIDAS_DEFAULT)
+        if not conocidas:
+            tg("ℹ️ Todavía no hay categorías registradas. Corré /ciclo una vez y volvé a probar.")
+            return
+        lineas = []
+        for c in conocidas:
+            marca = "🚫" if _categoria_excluida(c, excluidas) else "✅"
+            lineas.append(f"{marca} {c}")
+        tg(f"📂 *Categorías del proveedor*\n\n" + "\n".join(lineas) +
+           f"\n\n✅ = se cargan | 🚫 = excluidas\n\nUsá `/excluir_categoria nombre` o `/incluir_categoria nombre`.")
+        return
+    elif cmd[0] == "/excluir_categoria":
+        if len(cmd) < 2:
+            tg("Usá: `/excluir_categoria nombre` (ej: `/excluir_categoria baterias`)"); return
+        nombre = " ".join(texto.split()[1:]).strip()
+        db = leer_db()
+        excl = db.get("categorias_excluidas", CATEGORIAS_EXCLUIDAS_DEFAULT)
+        if nombre.lower() not in [e.lower() for e in excl]:
+            excl.append(nombre)
+            db["categorias_excluidas"] = excl
+            escribir_db(db)
+            tg(f"🚫 Categoría *{nombre}* agregada a excluidas. No se cargará en el próximo ciclo.\n\n(Los productos ya cargados de esa categoría no se borran solos — si querés, limpiá y recargá.)")
+        else:
+            tg(f"ℹ️ *{nombre}* ya estaba excluida.")
+        return
+    elif cmd[0] == "/incluir_categoria":
+        if len(cmd) < 2:
+            tg("Usá: `/incluir_categoria nombre`"); return
+        nombre = " ".join(texto.split()[1:]).strip()
+        db = leer_db()
+        excl = db.get("categorias_excluidas", CATEGORIAS_EXCLUIDAS_DEFAULT)
+        nueva = [e for e in excl if e.lower() != nombre.lower() and nombre.lower() not in e.lower()]
+        db["categorias_excluidas"] = nueva
+        escribir_db(db)
+        tg(f"✅ Categoría *{nombre}* incluida. Se cargará en el próximo /ciclo.")
+        return
+    elif cmd[0] == "/limpiar_deposito":
+        if not comerciapp_ok():
+            tg("❌ ComerciApp no configurado."); return
+        tg("🧹 *Limpiando DEPOSITO...* (borra TODOS los productos de esa sección para recargar sin duplicados)")
+        def _limpiar():
+            try:
+                r = requests.post(f"{COMERCIAPP_API}/api/bot/limpiar-deposito", headers=_ca_headers(), json={}, timeout=60)
+                if r.status_code == 200:
+                    d = r.json()
+                    tg(f"✅ *DEPOSITO limpio* — {d.get('borrados',0)} productos borrados.\n\nAhora mandá /ciclo para recargar los 416 productos con SKU correcto (sin duplicados y con todas las fotos).")
+                else:
+                    tg(f"❌ Error al limpiar: HTTP {r.status_code}\n`{r.text[:200]}`")
+            except Exception as e:
+                tg(f"❌ Error: `{e}`")
+        threading.Thread(target=_limpiar, daemon=True).start()
         return
     elif cmd[0] == "/test_proxy":
         def _test_proxy():
