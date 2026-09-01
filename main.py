@@ -1913,22 +1913,87 @@ def run_buscar_todos_videos():
         tg("Sin video:\n" + "\n".join(f"• {n}" for n in sin_resultado[:20]))
 
 def _scrapear_empretienda_fotos():
-    """Recorre la tienda vieja de Empretienda y devuelve [{nombre, imagenes:[url]}] SOLO de productos en stock."""
+    """Recorre la tienda vieja de Empretienda vía su API interna /v4/product y devuelve
+    [{nombre, imagenes:[url]}] SOLO de productos en stock. Paginación con filter_page."""
     from bs4 import BeautifulSoup
     import re as _re
     TIENDA = (os.environ.get("EMPRETIENDA_URL") or "https://leandroidgremio.empretienda.com.ar").rstrip("/")
-    ua = {"User-Agent": USER_AGENT}
+
+    sess = requests.Session()
+    sess.headers.update({"User-Agent": USER_AGENT})
+
+    # 1) Cargar la página de productos para obtener cookies de sesión + CSRF token
+    csrf = ""
+    try:
+        r0 = sess.get(f"{TIENDA}/productos", timeout=30)
+        m = _re.search(r'name=["\']csrf-token["\']\s+content=["\']([^"\']+)["\']', r0.text)
+        if not m:
+            m = _re.search(r'csrf[_-]?token["\']?\s*[:=]\s*["\']([^"\']+)["\']', r0.text, _re.I)
+        if m: csrf = m.group(1)
+    except Exception as e:
+        print(f"   Empretienda: no pude obtener CSRF ({e})")
+
+    api_headers = {
+        "X-Requested-With": "XMLHttpRequest",
+        "Accept": "application/json, text/javascript, */*; q=0.01",
+        "Referer": f"{TIENDA}/productos",
+    }
+    if csrf:
+        api_headers["X-CSRF-TOKEN"] = csrf
+        print(f"   Empretienda: CSRF token obtenido ✓")
 
     def _get(url):
         for _ in range(3):
             try:
-                r = requests.get(url, headers=ua, timeout=30)
-                if r.status_code == 200: return r.text
+                r = sess.get(url, headers=api_headers, timeout=30)
+                if r.status_code == 200:
+                    return r
             except Exception: pass
             time.sleep(2)
         return None
 
-    def _parse(html):
+    def _extraer_de_json(data):
+        """Empretienda /v4/product devuelve productos. Busca lista y extrae nombre/imagen/stock."""
+        out = []
+        prods = None
+        if isinstance(data, dict):
+            for k in ("products", "productos", "items", "results", "data"):
+                v = data.get(k)
+                if isinstance(v, list): prods = v; break
+                if isinstance(v, dict):
+                    for k2 in ("products", "productos", "items"):
+                        if isinstance(v.get(k2), list): prods = v[k2]; break
+                if prods: break
+            if prods is None:
+                for k in ("html", "view", "content"):
+                    if isinstance(data.get(k), str) and "<img" in data[k]:
+                        return _extraer_de_html(data[k])
+        elif isinstance(data, list):
+            prods = data
+        if not prods: return out
+        for p in prods:
+            if not isinstance(p, dict): continue
+            nombre = (p.get("name") or p.get("nombre") or p.get("title") or "").strip()
+            img = ""
+            for ik in ("image", "imagen", "img", "thumbnail", "picture", "photo", "images", "imagenes"):
+                v = p.get(ik)
+                if isinstance(v, str) and v: img = v; break
+                if isinstance(v, dict): 
+                    img = v.get("url") or v.get("src") or ""
+                    if img: break
+                if isinstance(v, list) and v:
+                    img = (v[0].get("url") or v[0].get("src")) if isinstance(v[0], dict) else str(v[0])
+                    if img: break
+            stock = p.get("stock", p.get("in_stock", p.get("available", 1)))
+            en_stock = True
+            if isinstance(stock, bool): en_stock = stock
+            elif isinstance(stock, (int, float)): en_stock = stock > 0
+            elif isinstance(stock, str): en_stock = stock.lower() not in ("0","false","no","sin stock","")
+            if nombre and img:
+                out.append({"nombre": nombre, "imagen": img, "en_stock": en_stock})
+        return out
+
+    def _extraer_de_html(html):
         soup = BeautifulSoup(html, "lxml")
         out = []
         for img in soup.find_all("img", alt=_re.compile(r"^Producto\s*-", _re.I)):
@@ -1945,35 +2010,48 @@ def _scrapear_empretienda_fotos():
             out.append({"nombre": nombre, "imagen": src, "en_stock": not sin_stock})
         return out
 
-    home = _get(TIENDA)
-    if not home: return []
-    soup = BeautifulSoup(home, "lxml")
-    cats = set()
-    for a in soup.find_all("a", href=True):
-        path = a["href"].replace(TIENDA, "").strip("/")
-        if path and not path.startswith("#") and path not in (
-            "productos","contacto","carrito","login","register","recover","cuenta"):
-            if path.count("/") <= 1:
-                cats.add(path)
-
     vistos = {}
-    for ruta in ["productos"] + sorted(cats):
-        base = f"{TIENDA}/{ruta}"
-        pagina = 1
-        while pagina <= 30:
-            url = base if pagina == 1 else f"{base}?page={pagina}"
-            html = _get(url)
-            if not html: break
-            prods = _parse(html)
-            if not prods: break
-            nuevos = 0
-            for p in prods:
-                if p["nombre"] not in vistos:
-                    vistos[p["nombre"]] = p; nuevos += 1
-            print(f"   Empretienda {ruta} pág {pagina}: {len(prods)} ({nuevos} nuevos)")
-            if nuevos == 0 or len(prods) < 10: break
-            pagina += 1; time.sleep(0.5)
-        time.sleep(0.3)
+    pagina = 1
+    debug_mostrado = False
+    while pagina <= 100:
+        url = f"{TIENDA}/v4/product?filter_page={pagina}&filter_order=0"
+        r = _get(url)
+        if not r: break
+        prods = []
+        raw = None
+        try:
+            raw = r.json()
+        except Exception:
+            prods = _extraer_de_html(r.text)
+        if raw is not None:
+            # DEBUG: en la primera página, mostrar la estructura para ajustar si hace falta
+            if not debug_mostrado:
+                debug_mostrado = True
+                try:
+                    if isinstance(raw, dict):
+                        print(f"   [debug] claves del JSON: {list(raw.keys())[:10]}")
+                        # buscar la primera lista de dicts para ver sus claves
+                        for k, v in raw.items():
+                            if isinstance(v, list) and v and isinstance(v[0], dict):
+                                print(f"   [debug] '{k}'[0] claves: {list(v[0].keys())[:20]}")
+                                break
+                            if isinstance(v, dict):
+                                for k2, v2 in v.items():
+                                    if isinstance(v2, list) and v2 and isinstance(v2[0], dict):
+                                        print(f"   [debug] '{k}.{k2}'[0] claves: {list(v2[0].keys())[:20]}")
+                                        break
+                    elif isinstance(raw, list) and raw and isinstance(raw[0], dict):
+                        print(f"   [debug] item[0] claves: {list(raw[0].keys())[:20]}")
+                except Exception: pass
+            prods = _extraer_de_json(raw)
+        if not prods: break
+        nuevos = 0
+        for p in prods:
+            if p["nombre"] not in vistos:
+                vistos[p["nombre"]] = p; nuevos += 1
+        print(f"   Empretienda /v4/product pág {pagina}: {len(prods)} ({nuevos} nuevos)")
+        if nuevos == 0: break
+        pagina += 1; time.sleep(0.4)
 
     fotos = [{"nombre": n, "imagenes": [d["imagen"]]}
              for n, d in vistos.items() if d["en_stock"] and d["imagen"]]
