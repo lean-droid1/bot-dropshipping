@@ -1851,6 +1851,7 @@ def tg_menu():
              {"text": "📊 Estado", "callback_data": "/estado_scraping"}],
             [{"text": "🔬 Test Proxy", "callback_data": "/test_proxy"}],
             [{"text": "📂 Ver Categorías", "callback_data": "/ver_categorias"}],
+            [{"text": "📸 Migrar Fotos Empretienda", "callback_data": "/migrar_fotos"}],
             [{"text": "🧹 Limpiar DEPOSITO", "callback_data": "/limpiar_deposito"}],
             [{"text": "🏷️ Ver Ofertas Proveedor", "callback_data": "/ver_ofertas_proveedor"}],
             [{"text": "🛠️ Debug Env", "callback_data": "/debug_env"}],
@@ -1910,6 +1911,74 @@ def run_buscar_todos_videos():
     tg(f"*Videos asignados:* {ok}\n*Sin resultado:* {len(sin_resultado)}")
     if sin_resultado:
         tg("Sin video:\n" + "\n".join(f"• {n}" for n in sin_resultado[:20]))
+
+def _scrapear_empretienda_fotos():
+    """Recorre la tienda vieja de Empretienda y devuelve [{nombre, imagenes:[url]}] SOLO de productos en stock."""
+    from bs4 import BeautifulSoup
+    import re as _re
+    TIENDA = (os.environ.get("EMPRETIENDA_URL") or "https://leandroidgremio.empretienda.com.ar").rstrip("/")
+    ua = {"User-Agent": USER_AGENT}
+
+    def _get(url):
+        for _ in range(3):
+            try:
+                r = requests.get(url, headers=ua, timeout=30)
+                if r.status_code == 200: return r.text
+            except Exception: pass
+            time.sleep(2)
+        return None
+
+    def _parse(html):
+        soup = BeautifulSoup(html, "lxml")
+        out = []
+        for img in soup.find_all("img", alt=_re.compile(r"^Producto\s*-", _re.I)):
+            alt = img.get("alt", "")
+            nombre = _re.sub(r"^Producto\s*-\s*", "", alt).strip()
+            src = img.get("src") or img.get("data-src") or ""
+            if not nombre or not src: continue
+            cont = img; sin_stock = False
+            for _ in range(4):
+                cont = cont.parent
+                if cont is None: break
+                if "SIN STOCK" in cont.get_text(" ", strip=True).upper():
+                    sin_stock = True; break
+            out.append({"nombre": nombre, "imagen": src, "en_stock": not sin_stock})
+        return out
+
+    home = _get(TIENDA)
+    if not home: return []
+    soup = BeautifulSoup(home, "lxml")
+    cats = set()
+    for a in soup.find_all("a", href=True):
+        path = a["href"].replace(TIENDA, "").strip("/")
+        if path and not path.startswith("#") and path not in (
+            "productos","contacto","carrito","login","register","recover","cuenta"):
+            if path.count("/") <= 1:
+                cats.add(path)
+
+    vistos = {}
+    for ruta in ["productos"] + sorted(cats):
+        base = f"{TIENDA}/{ruta}"
+        pagina = 1
+        while pagina <= 30:
+            url = base if pagina == 1 else f"{base}?page={pagina}"
+            html = _get(url)
+            if not html: break
+            prods = _parse(html)
+            if not prods: break
+            nuevos = 0
+            for p in prods:
+                if p["nombre"] not in vistos:
+                    vistos[p["nombre"]] = p; nuevos += 1
+            print(f"   Empretienda {ruta} pág {pagina}: {len(prods)} ({nuevos} nuevos)")
+            if nuevos == 0 or len(prods) < 10: break
+            pagina += 1; time.sleep(0.5)
+        time.sleep(0.3)
+
+    fotos = [{"nombre": n, "imagenes": [d["imagen"]]}
+             for n, d in vistos.items() if d["en_stock"] and d["imagen"]]
+    print(f"   Empretienda: {len(vistos)} únicos, {len(fotos)} en stock con foto")
+    return fotos
 
 def procesar_cmd(texto):
     global _token, _store_id
@@ -1986,6 +2055,43 @@ def procesar_cmd(texto):
         db["categorias_excluidas"] = nueva
         escribir_db(db)
         tg(f"✅ Categoría *{nombre}* incluida. Se cargará en el próximo /ciclo.")
+        return
+    elif cmd[0] == "/migrar_fotos" or cmd[0] == "/migrar_fotos_aplicar":
+        aplicar = (cmd[0] == "/migrar_fotos_aplicar")
+        if not comerciapp_ok():
+            tg("❌ ComerciApp no configurado."); return
+        tg(f"📸 *Migrando fotos de Empretienda* (modo {'APLICAR' if aplicar else 'REPORTAR'})...\n\nEsto recorre tu tienda vieja y tarda 1-2 min. Aguantá.")
+        def _migrar():
+            try:
+                fotos = _scrapear_empretienda_fotos()
+                if not fotos:
+                    tg("❌ No encontré fotos en Empretienda. Revisá que la tienda esté online."); return
+                r = requests.post(
+                    f"{COMERCIAPP_API}/api/bot/fotos-por-nombre",
+                    headers=_ca_headers(),
+                    json={"fotos": fotos, "modo": "aplicar" if aplicar else "reportar"},
+                    timeout=180)
+                if r.status_code != 200:
+                    tg(f"❌ Error HTTP {r.status_code}\n`{r.text[:200]}`"); return
+                res = r.json()
+                msg = (f"📊 *Resultado migración de fotos*\n\n"
+                       f"• Productos en tu tienda: {res.get('total_productos')}\n"
+                       f"• Fotos scrapeadas (en stock): {res.get('total_fotos')}\n"
+                       f"• Matchearon por nombre: {res.get('matcheados')}\n"
+                       f"   ↳ ya tenían foto: {res.get('ya_con_foto')}\n"
+                       f"   ↳ sin foto (candidatos): {res.get('sin_foto_matcheados')}\n"
+                       f"• No matchearon: {res.get('sin_match')}\n")
+                if aplicar:
+                    msg += f"\n✅ *Fotos aplicadas: {res.get('aplicados')}*"
+                else:
+                    msg += f"\n_(Modo reportar — no se aplicó nada.)_\nSi los candidatos se ven bien, mandá /migrar_fotos_aplicar"
+                tg(msg)
+                ej = res.get("ejemplos_sin_match")
+                if ej:
+                    tg("Ejemplos que NO matchearon:\n" + "\n".join(f"• {n}" for n in ej[:20]))
+            except Exception as e:
+                tg(f"❌ Error: `{e}`")
+        threading.Thread(target=_migrar, daemon=True).start()
         return
     elif cmd[0] == "/limpiar_deposito":
         if not comerciapp_ok():
