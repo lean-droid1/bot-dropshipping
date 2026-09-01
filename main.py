@@ -1953,44 +1953,38 @@ def _scrapear_empretienda_fotos():
         return None
 
     def _extraer_de_json(data):
-        """Empretienda /v4/product devuelve productos. Busca lista y extrae nombre/imagen/stock."""
+        """Empretienda /v4/product devuelve {status, data:[...], message}.
+        Cada producto: p_nombre, p_link (slug), p_datos_stock, p_desactivado, etc.
+        La imagen NO viene en el listado — se saca del detalle vía p_link."""
         out = []
         prods = None
         if isinstance(data, dict):
-            for k in ("products", "productos", "items", "results", "data"):
-                v = data.get(k)
-                if isinstance(v, list): prods = v; break
-                if isinstance(v, dict):
-                    for k2 in ("products", "productos", "items"):
-                        if isinstance(v.get(k2), list): prods = v[k2]; break
-                if prods: break
-            if prods is None:
-                for k in ("html", "view", "content"):
-                    if isinstance(data.get(k), str) and "<img" in data[k]:
-                        return _extraer_de_html(data[k])
+            v = data.get("data")
+            if isinstance(v, list): prods = v
+            elif isinstance(v, dict):
+                for k2 in ("products", "productos", "items", "data"):
+                    if isinstance(v.get(k2), list): prods = v[k2]; break
         elif isinstance(data, list):
             prods = data
         if not prods: return out
         for p in prods:
             if not isinstance(p, dict): continue
-            nombre = (p.get("name") or p.get("nombre") or p.get("title") or "").strip()
-            img = ""
-            for ik in ("image", "imagen", "img", "thumbnail", "picture", "photo", "images", "imagenes"):
-                v = p.get(ik)
-                if isinstance(v, str) and v: img = v; break
-                if isinstance(v, dict): 
-                    img = v.get("url") or v.get("src") or ""
-                    if img: break
-                if isinstance(v, list) and v:
-                    img = (v[0].get("url") or v[0].get("src")) if isinstance(v[0], dict) else str(v[0])
-                    if img: break
-            stock = p.get("stock", p.get("in_stock", p.get("available", 1)))
+            nombre = str(p.get("p_nombre") or p.get("nombre") or p.get("name") or "").strip()
+            link = str(p.get("p_link") or p.get("link") or p.get("slug") or "").strip()
+            # Stock: p_datos_stock puede ser número, o p_desactivado marca inactivo
+            desactivado = p.get("p_desactivado")
+            stock_raw = p.get("p_datos_stock", p.get("stock", 1))
             en_stock = True
-            if isinstance(stock, bool): en_stock = stock
-            elif isinstance(stock, (int, float)): en_stock = stock > 0
-            elif isinstance(stock, str): en_stock = stock.lower() not in ("0","false","no","sin stock","")
-            if nombre and img:
-                out.append({"nombre": nombre, "imagen": img, "en_stock": en_stock})
+            if desactivado in (1, "1", True, "true"): en_stock = False
+            if isinstance(stock_raw, (int, float)): en_stock = en_stock and stock_raw > 0
+            elif isinstance(stock_raw, str):
+                # p_datos_stock puede ser JSON o número en texto
+                try:
+                    n = int(_re.search(r'-?\d+', stock_raw).group()) if _re.search(r'-?\d+', stock_raw) else 1
+                    en_stock = en_stock and n > 0
+                except Exception: pass
+            if nombre and link:
+                out.append({"nombre": nombre, "link": link, "en_stock": en_stock, "imagen": ""})
         return out
 
     def _extraer_de_html(html):
@@ -2053,9 +2047,35 @@ def _scrapear_empretienda_fotos():
         if nuevos == 0: break
         pagina += 1; time.sleep(0.4)
 
-    fotos = [{"nombre": n, "imagenes": [d["imagen"]]}
-             for n, d in vistos.items() if d["en_stock"] and d["imagen"]]
-    print(f"   Empretienda: {len(vistos)} únicos, {len(fotos)} en stock con foto")
+    # 2) Para los productos EN STOCK, sacar la imagen del detalle (p_link → página del producto)
+    def _imagen_de_detalle(link):
+        """Abre la página del producto y saca la primera imagen de CloudFront."""
+        url = link if link.startswith("http") else f"{TIENDA}/{link.lstrip('/')}"
+        try:
+            r = sess.get(url, headers={"Referer": f"{TIENDA}/productos"}, timeout=25)
+            if r.status_code != 200: return ""
+            html = r.text
+            # og:image es la más confiable
+            m = _re.search(r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)["\']', html, _re.I)
+            if m and "cloudfront" in m.group(1): return m.group(1)
+            # Si no, primera imagen de producto de CloudFront
+            m2 = _re.search(r'(https://[a-z0-9]+\.cloudfront\.net/[a-f0-9]+\.(?:webp|jpg|jpeg|png))', html, _re.I)
+            if m2: return m2.group(1)
+        except Exception: pass
+        return ""
+
+    en_stock_items = [(n, d) for n, d in vistos.items() if d["en_stock"] and d.get("link")]
+    print(f"   Empretienda: {len(vistos)} únicos, {len(en_stock_items)} en stock — bajando imágenes...")
+    fotos = []
+    for i, (n, d) in enumerate(en_stock_items):
+        img = _imagen_de_detalle(d["link"])
+        if img:
+            fotos.append({"nombre": n, "imagenes": [img]})
+        if (i + 1) % 25 == 0:
+            print(f"   ...imágenes {i+1}/{len(en_stock_items)}")
+        time.sleep(0.2)
+
+    print(f"   Empretienda: {len(fotos)} en stock con foto")
     return fotos
 
 def procesar_cmd(texto):
