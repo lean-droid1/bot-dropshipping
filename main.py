@@ -2048,32 +2048,38 @@ def _scrapear_empretienda_fotos():
         pagina += 1; time.sleep(0.4)
 
     # 2) Para los productos EN STOCK, sacar la imagen del detalle (p_link → página del producto)
-    LOGO_HINT = "b46658fdd682a6efb760fb748395a5285f78efb5"  # el logo de la tienda (para descartarlo)
-    debug_detalle = [False]
+    LOGO_HINT = "b46658fdd682a6efb760fb748395a5285f78efb5"  # el logo de la tienda (descartar)
+    debug_detalle = [0]
     def _imagen_de_detalle(link):
-        """Abre la página del producto y saca la primera imagen de CloudFront del producto."""
+        """Abre la página del producto y saca la imagen principal (og:image o CloudFront)."""
         url = link if link.startswith("http") else f"{TIENDA}/{link.lstrip('/')}"
         try:
             r = sess.get(url, headers={"Referer": f"{TIENDA}/productos"}, timeout=25)
             if r.status_code != 200: return ""
             html = r.text
-            # Debug: en el primer detalle, mostrar qué URLs de cloudfront hay
-            if not debug_detalle[0]:
-                debug_detalle[0] = True
-                muestras = _re.findall(r'https://[a-z0-9]+\.cloudfront\.net/[^\s"\'<>)]+', html)[:8]
-                print(f"   [debug detalle] URL: {url}")
-                for m in muestras: print(f"   [debug detalle] cloudfront: {m[:110]}")
-            # Todas las imágenes de cloudfront con extensión de imagen
-            todas = _re.findall(r'https://[a-z0-9]+\.cloudfront\.net/[a-f0-9]{20,}\.(?:webp|jpg|jpeg|png)', html, _re.I)
-            # Descartar el logo
+            # 1) og:image — lo más confiable (apunta a la foto principal del producto)
+            m = _re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html, _re.I)
+            if not m:
+                m = _re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']', html, _re.I)
+            if m and LOGO_HINT not in m.group(1) and "cloudfront" in m.group(1):
+                return m.group(1)
+            # 2) Cualquier URL de CloudFront de imagen (regex flexible: cualquier path)
+            todas = _re.findall(r'https://[a-z0-9]+\.cloudfront\.net/[^\s"\'<>)]+?\.(?:webp|jpg|jpeg|png)', html, _re.I)
             candidatas = [u for u in todas if LOGO_HINT not in u]
+            # Debug: primeros 3 productos, mostrar qué encontró
+            if debug_detalle[0] < 3:
+                debug_detalle[0] += 1
+                print(f"   [debug] {url.split('/')[-1][:40]} → og:{bool(m)} cloudfront:{len(todas)} candidatas:{len(candidatas)}")
+                for u in candidatas[:2]: print(f"      → {u[:100]}")
             if candidatas:
                 return candidatas[0]
-            # Fallback: og:image aunque sea
-            m = _re.search(r'<meta\s+property=["\']og:image["\']\s+content=["\']([^"\']+)["\']', html, _re.I)
+            # 3) Fallback og:image aunque no sea cloudfront
             if m and LOGO_HINT not in m.group(1):
                 return m.group(1)
-        except Exception: pass
+        except Exception as e:
+            if debug_detalle[0] < 3:
+                debug_detalle[0] += 1
+                print(f"   [debug] error en {url[:60]}: {e}")
         return ""
 
     en_stock_items = [(n, d) for n, d in vistos.items() if d["en_stock"] and d.get("link")]
