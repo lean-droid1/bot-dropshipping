@@ -1954,8 +1954,8 @@ def _scrapear_empretienda_fotos():
 
     def _extraer_de_json(data):
         """Empretienda /v4/product devuelve {status, data:[...], message}.
-        Cada producto: p_nombre, p_link (slug), p_datos_stock, p_desactivado, etc.
-        La imagen NO viene en el listado — se saca del detalle vía p_link."""
+        Cada producto trae imagenes[] con i_link → URL en CloudFront. Sin ir al detalle."""
+        CDN = "https://d22fxaf9t8d39k.cloudfront.net/"
         out = []
         prods = None
         if isinstance(data, dict):
@@ -1971,20 +1971,32 @@ def _scrapear_empretienda_fotos():
             if not isinstance(p, dict): continue
             nombre = str(p.get("p_nombre") or p.get("nombre") or p.get("name") or "").strip()
             link = str(p.get("p_link") or p.get("link") or p.get("slug") or "").strip()
-            # Stock: p_datos_stock puede ser número, o p_desactivado marca inactivo
+            # Imágenes: vienen en el listado como imagenes[].i_link
+            lista_imgs = []
+            for im in (p.get("imagenes") or []):
+                il = im.get("i_link") if isinstance(im, dict) else None
+                if il:
+                    lista_imgs.append(il if il.startswith("http") else CDN + il)
+            # Stock real: sumar stock[].s_cantidad (o ilimitado). Fallback a p_datos_stock.
             desactivado = p.get("p_desactivado")
-            stock_raw = p.get("p_datos_stock", p.get("stock", 1))
             en_stock = True
             if desactivado in (1, "1", True, "true"): en_stock = False
-            if isinstance(stock_raw, (int, float)): en_stock = en_stock and stock_raw > 0
-            elif isinstance(stock_raw, str):
-                # p_datos_stock puede ser JSON o número en texto
-                try:
-                    n = int(_re.search(r'-?\d+', stock_raw).group()) if _re.search(r'-?\d+', stock_raw) else 1
-                    en_stock = en_stock and n > 0
-                except Exception: pass
-            if nombre and link:
-                out.append({"nombre": nombre, "link": link, "en_stock": en_stock, "imagen": ""})
+            else:
+                stock_arr = p.get("stock") or []
+                if isinstance(stock_arr, list) and stock_arr:
+                    total_cant = 0; ilimitado = False
+                    for st in stock_arr:
+                        if not isinstance(st, dict): continue
+                        if st.get("s_ilimitado") in (1, "1", True): ilimitado = True
+                        try: total_cant += int(st.get("s_cantidad") or 0)
+                        except Exception: pass
+                    en_stock = ilimitado or total_cant > 0
+                else:
+                    stock_raw = p.get("p_datos_stock", 1)
+                    if isinstance(stock_raw, (int, float)): en_stock = stock_raw > 0
+            if nombre:
+                out.append({"nombre": nombre, "link": link, "en_stock": en_stock,
+                            "imagen": lista_imgs[0] if lista_imgs else "", "imagenes": lista_imgs})
         return out
 
     def _extraer_de_html(html):
@@ -2047,53 +2059,16 @@ def _scrapear_empretienda_fotos():
         if nuevos == 0: break
         pagina += 1; time.sleep(0.4)
 
-    # 2) Para los productos EN STOCK, sacar la imagen del detalle (p_link → página del producto)
-    LOGO_HINT = "b46658fdd682a6efb760fb748395a5285f78efb5"  # el logo de la tienda (descartar)
-    debug_detalle = [0]
-    def _imagen_de_detalle(link):
-        """Abre la página del producto y saca la imagen principal (og:image o CloudFront)."""
-        url = link if link.startswith("http") else f"{TIENDA}/{link.lstrip('/')}"
-        try:
-            r = sess.get(url, headers={"Referer": f"{TIENDA}/productos"}, timeout=25)
-            if r.status_code != 200: return ""
-            html = r.text
-            # 1) og:image — lo más confiable (apunta a la foto principal del producto)
-            m = _re.search(r'<meta[^>]+property=["\']og:image["\'][^>]+content=["\']([^"\']+)["\']', html, _re.I)
-            if not m:
-                m = _re.search(r'<meta[^>]+content=["\']([^"\']+)["\'][^>]+property=["\']og:image["\']', html, _re.I)
-            if m and LOGO_HINT not in m.group(1) and "cloudfront" in m.group(1):
-                return m.group(1)
-            # 2) Cualquier URL de CloudFront de imagen (regex flexible: cualquier path)
-            todas = _re.findall(r'https://[a-z0-9]+\.cloudfront\.net/[^\s"\'<>)]+?\.(?:webp|jpg|jpeg|png)', html, _re.I)
-            candidatas = [u for u in todas if LOGO_HINT not in u]
-            # Debug: primeros 3 productos, mostrar qué encontró
-            if debug_detalle[0] < 3:
-                debug_detalle[0] += 1
-                print(f"   [debug] {url.split('/')[-1][:40]} → og:{bool(m)} cloudfront:{len(todas)} candidatas:{len(candidatas)}")
-                for u in candidatas[:2]: print(f"      → {u[:100]}")
-            if candidatas:
-                return candidatas[0]
-            # 3) Fallback og:image aunque no sea cloudfront
-            if m and LOGO_HINT not in m.group(1):
-                return m.group(1)
-        except Exception as e:
-            if debug_detalle[0] < 3:
-                debug_detalle[0] += 1
-                print(f"   [debug] error en {url[:60]}: {e}")
-        return ""
-
-    en_stock_items = [(n, d) for n, d in vistos.items() if d["en_stock"] and d.get("link")]
-    print(f"   Empretienda: {len(vistos)} únicos, {len(en_stock_items)} en stock — bajando imágenes...")
+    # 2) Las imágenes ya vienen en el listado (imagenes[].i_link) — sin ir al detalle
     fotos = []
-    for i, (n, d) in enumerate(en_stock_items):
-        img = _imagen_de_detalle(d["link"])
-        if img:
-            fotos.append({"nombre": n, "imagenes": [img]})
-        if (i + 1) % 25 == 0:
-            print(f"   ...imágenes {i+1}/{len(en_stock_items)} (con foto: {len(fotos)})")
-        time.sleep(0.2)
+    for n, d in vistos.items():
+        if not d["en_stock"]:
+            continue
+        imgs = d.get("imagenes") or ([d["imagen"]] if d.get("imagen") else [])
+        if imgs:
+            fotos.append({"nombre": n, "imagenes": imgs})
 
-    print(f"   Empretienda: {len(fotos)} en stock con foto")
+    print(f"   Empretienda: {len(vistos)} únicos, {len(fotos)} en stock con foto")
     return fotos
 
 def procesar_cmd(texto):
