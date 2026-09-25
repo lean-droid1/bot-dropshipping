@@ -2602,10 +2602,18 @@ def procesar_cmd(texto):
 def escuchar_telegram():
     if not TELEGRAM_TOKEN: return
     offset = 0; url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
+    # Borra cualquier webhook de Telegram que bloquee getUpdates (por eso el bot no recibia comandos)
+    try:
+        wr = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook?drop_pending_updates=false", timeout=10)
+        print(f"🧹 deleteWebhook: {wr.status_code} {wr.text[:80]}")
+    except Exception as e:
+        print(f"⚠️ deleteWebhook: {e}")
     print("📡 Telegram activo...")
     while True:
         try:
             r = requests.get(f"{url}?offset={offset}&timeout=10", timeout=15)
+            if r.status_code != 200:
+                print(f"⚠️ Telegram getUpdates HTTP {r.status_code}: {r.text[:150]}")
             if r.status_code == 200:
                 for u in r.json().get("result",[]):
                     offset = u["update_id"] + 1
