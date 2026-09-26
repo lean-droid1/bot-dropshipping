@@ -97,10 +97,14 @@ PROXY_PORT         = _e("PROXY_PORT")      # 823
 PROXY_USER         = _e("PROXY_USER")
 PROXY_PASS         = _e("PROXY_PASS")
 
-def _get_residential_proxy():
-    """Arma URL del proxy residencial si las credenciales están configuradas."""
+def _get_residential_proxy(sess=None):
+    """Arma URL del proxy residencial si las credenciales están configuradas.
+    sess: si se pasa, fuerza una IP nueva de ThorData (rotacion por intento)."""
     if PROXY_HOST and PROXY_PORT and PROXY_USER and PROXY_PASS:
-        return f"http://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
+        user = PROXY_USER
+        if sess and "-sessid-" not in user:
+            user = f"{user}-sessid-{sess}"
+        return f"http://{user}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
     return None
 
 PROV_PASS      = _e("PROV_PASS")
@@ -569,9 +573,13 @@ def _prov_get(url, params=None, usar_scraperapi=False):
         r = _via_scraperapi(url, params)
         return r
 
-    res_proxy = _get_residential_proxy()
+    import random as _rnd
+    tiene_proxy = bool(_get_residential_proxy())
+    MAX_INTENTOS = 5
 
-    for intento in range(3):
+    for intento in range(MAX_INTENTOS):
+        # IP nueva de ThorData en cada intento (rotacion) para esquivar el 403 de Cloudflare
+        res_proxy = _get_residential_proxy(sess=_rnd.randint(100000, 999999)) if tiene_proxy else None
         try:
             if CURL_CFFI_OK and res_proxy:
                 r = cf_requests.get(url, params=params, timeout=45,
@@ -585,12 +593,12 @@ def _prov_get(url, params=None, usar_scraperapi=False):
                                  headers={"User-Agent": USER_AGENT})
             if r.status_code == 429:
                 print("⚠️ Rate limit proveedor"); time.sleep(3); continue
-            if r.status_code == 403 and res_proxy and intento < 2:
-                print(f"⚠️ Cloudflare 403 (intento {intento+1}/3) — reintentando...")
-                time.sleep(3); continue
+            if r.status_code == 403 and tiene_proxy and intento < MAX_INTENTOS - 1:
+                print(f"⚠️ Cloudflare 403 (intento {intento+1}/{MAX_INTENTOS}) — probando otra IP...")
+                time.sleep(2); continue
             return r
         except Exception as e:
-            print(f"⚠️ Proveedor API (intento {intento+1}/3): {e}")
+            print(f"⚠️ Proveedor API (intento {intento+1}/{MAX_INTENTOS}): {e}")
             time.sleep(3)
     return None
 
