@@ -568,37 +568,65 @@ def _via_scraperapi(url, params=None):
     print("❌ Todas las keys de ScraperAPI fallaron")
     return None
 
+# Sesion curl_cffi caliente reutilizable (IP sticky + cookie cf_clearance de Cloudflare)
+_prov_cf_sess = None
+
+def _nueva_sesion_prov():
+    """Abre una sesion curl_cffi con IP sticky de ThorData y calienta la home
+    para que Cloudflare entregue la cookie cf_clearance (queda guardada en la
+    sesion). Asi el request al /wp-json va con la MISMA IP + cookie y no da 403.
+    Devuelve (session, proxy_url) o (None, None)."""
+    import random as _rnd
+    if not CURL_CFFI_OK:
+        return None, None
+    proxy = _get_residential_proxy(sess=_rnd.randint(100000, 999999))
+    try:
+        if proxy:
+            s = cf_requests.Session(impersonate="chrome124",
+                                    proxies={"http": proxy, "https": proxy})
+        else:
+            s = cf_requests.Session(impersonate="chrome124")
+        s.get("https://rxzweb.com/", timeout=20)   # calienta -> guarda cf_clearance
+        time.sleep(1)
+        return s, proxy
+    except Exception as e:
+        print(f"   ⚠️ No se pudo abrir sesion proveedor: {e}")
+        return None, None
+
 def _prov_get(url, params=None, usar_scraperapi=False):
     if usar_scraperapi:
-        r = _via_scraperapi(url, params)
-        return r
+        return _via_scraperapi(url, params)
 
-    import random as _rnd
-    tiene_proxy = bool(_get_residential_proxy())
+    global _prov_cf_sess
     MAX_INTENTOS = 5
 
-    for intento in range(MAX_INTENTOS):
-        # IP nueva de ThorData en cada intento (rotacion) para esquivar el 403 de Cloudflare
-        res_proxy = _get_residential_proxy(sess=_rnd.randint(100000, 999999)) if tiene_proxy else None
+    # Sin curl_cffi: request plano (sin bypass Cloudflare)
+    if not CURL_CFFI_OK:
         try:
-            if CURL_CFFI_OK and res_proxy:
-                r = cf_requests.get(url, params=params, timeout=45,
-                                    impersonate="chrome124",
-                                    proxy=res_proxy)
-            elif CURL_CFFI_OK:
-                r = cf_requests.get(url, params=params, timeout=20,
-                                    impersonate="chrome124")
-            else:
-                r = requests.get(url, params=params, timeout=20,
-                                 headers={"User-Agent": USER_AGENT})
+            return requests.get(url, params=params, timeout=20,
+                                headers={"User-Agent": USER_AGENT})
+        except Exception as e:
+            print(f"⚠️ Proveedor API: {e}")
+            return None
+
+    for intento in range(MAX_INTENTOS):
+        # Reusar sesion caliente; si no hay, abrir una nueva (IP sticky + calentar)
+        if _prov_cf_sess is None:
+            _prov_cf_sess, _ = _nueva_sesion_prov()
+            if _prov_cf_sess is None:
+                time.sleep(3); continue
+        try:
+            r = _prov_cf_sess.get(url, params=params, timeout=45)
             if r.status_code == 429:
                 print("⚠️ Rate limit proveedor"); time.sleep(3); continue
-            if r.status_code == 403 and tiene_proxy and intento < MAX_INTENTOS - 1:
-                print(f"⚠️ Cloudflare 403 (intento {intento+1}/{MAX_INTENTOS}) — probando otra IP...")
+            if r.status_code == 403 and intento < MAX_INTENTOS - 1:
+                print(f"⚠️ Cloudflare 403 (intento {intento+1}/{MAX_INTENTOS}) — rotando IP + recalentando...")
+                _prov_cf_sess = None   # descartar IP quemada; la proxima abre otra
                 time.sleep(2); continue
             return r
         except Exception as e:
             print(f"⚠️ Proveedor API (intento {intento+1}/{MAX_INTENTOS}): {e}")
+            _prov_cf_sess = None
             time.sleep(3)
     return None
 
@@ -624,16 +652,9 @@ def scrapear_proveedor(excluidas=None):
     productos = {}; pagina = 1; reintentos_202 = 0; via_scraperapi = False
     categorias_vistas = set()  # todas las categorías que aparecen en el proveedor este ciclo
     print("📥 API proveedor...")
-    # Calentar proxy con request liviano
-    if _get_residential_proxy() and CURL_CFFI_OK:
-        try:
-            print("   🔥 Calentando proxy...")
-            cf_requests.get("https://rxzweb.com/", impersonate="chrome124",
-                           proxy=_get_residential_proxy(), timeout=15)
-            time.sleep(1)
-            print("   ✅ Proxy calentado")
-        except Exception as e:
-            print(f"   ⚠️ Calentamiento: {e}")
+    # Sesion nueva por ciclo: se abre con IP sticky y se calienta dentro de _prov_get
+    global _prov_cf_sess
+    _prov_cf_sess = None
     while True:
         r = _prov_get(PROV_API, params={"per_page":100,"page":pagina}, usar_scraperapi=via_scraperapi)
         if not r or r.status_code not in (200, 201, 202):
