@@ -568,6 +568,68 @@ def _via_scraperapi(url, params=None):
     print("❌ Todas las keys de ScraperAPI fallaron")
     return None
 
+# ── ThorData Web Unlocker / Universal Scraping API (resuelve el challenge JS de Cloudflare) ──
+THORDATA_TOKEN = _e("THORDATA_TOKEN")
+THORDATA_URL   = "https://universalapi.thordata.com/request"
+
+class _ThorResp:
+    """Respuesta minima compatible con requests.Response (status_code/.text/.json())."""
+    def __init__(self, status_code, text):
+        self.status_code = status_code
+        self.text = text or ""
+    def json(self):
+        import json as _json
+        return _json.loads(self.text)
+
+def _extraer_json(texto):
+    """Devuelve el JSON crudo (str) de la respuesta de ThorData, que puede venir
+    limpio o envuelto en HTML (el visor de JSON del navegador con js_render)."""
+    if not texto:
+        return None
+    t = texto.strip()
+    if t[:1] in "[{":
+        return t
+    import re, html as _html
+    m = re.search(r"<pre[^>]*>(.*?)</pre>", texto, re.S | re.I)
+    if m:
+        cand = _html.unescape(m.group(1)).strip()
+        if cand[:1] in "[{":
+            return cand
+    m = re.search(r"(\[.*\]|\{.*\})", texto, re.S)
+    if m:
+        return m.group(1).strip()
+    return None
+
+def _via_thordata(url, params=None):
+    if not THORDATA_TOKEN:
+        return None
+    from urllib.parse import urlencode as _ue
+    target = url
+    if params:
+        target += ("&" if "?" in target else "?") + _ue(params)
+    headers = {
+        "Authorization": f"Bearer {THORDATA_TOKEN}",
+        "Content-Type": "application/x-www-form-urlencoded",
+    }
+    # 1) sin render (mas rapido/barato); 2) con render si vino un challenge
+    for js in ("False", "True"):
+        try:
+            r = requests.post(THORDATA_URL, headers=headers, data={
+                "url": target, "type": "html", "js_render": js, "header": "False",
+            }, timeout=90)
+        except Exception as e:
+            print(f"⚠️ ThorData ({'render' if js=='True' else 'plano'}): {e}")
+            continue
+        if r.status_code != 200:
+            print(f"⚠️ ThorData HTTP {r.status_code} (js_render={js})")
+            continue
+        crudo = _extraer_json(r.text)
+        if crudo:
+            print(f"✅ ThorData OK (js_render={js})")
+            return _ThorResp(200, crudo)
+        print(f"⚠️ ThorData sin JSON util (js_render={js})")
+    return None
+
 # Sesion curl_cffi caliente reutilizable (IP sticky + cookie cf_clearance de Cloudflare)
 _prov_cf_sess = None
 
@@ -596,6 +658,13 @@ def _nueva_sesion_prov():
 def _prov_get(url, params=None, usar_scraperapi=False):
     if usar_scraperapi:
         return _via_scraperapi(url, params)
+
+    # ThorData Web Unlocker: metodo principal (unico que pasa el challenge JS de Cloudflare)
+    if THORDATA_TOKEN:
+        r = _via_thordata(url, params)
+        if r is not None:
+            return r
+        print("⚠️ ThorData no devolvio datos — probando proxy residencial...")
 
     global _prov_cf_sess
     MAX_INTENTOS = 5
@@ -2675,6 +2744,7 @@ if __name__ == "__main__":
     print(f"   MARGEN:          {MARGEN} ({round((1-MARGEN)*100)}% ganancia)")
     print(f"   ComerciApp API:  {'SÍ (' + COMERCIAPP_API[:40] + '...)' if COMERCIAPP_API else 'NO — falta COMERCIAPP_API'}")
     print(f"   BOT_API_KEY:     {'SÍ' if COMERCIAPP_KEY else 'NO — falta BOT_API_KEY'}")
+    print(f"   ThorData Unlocker: {'SÍ (bypass Cloudflare)' if THORDATA_TOKEN else 'NO — falta THORDATA_TOKEN'}")
     rp = _get_residential_proxy()
     if rp:
         print(f"   ✅ Proxy residencial: {PROXY_HOST}:{PROXY_PORT}")
