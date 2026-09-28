@@ -570,7 +570,7 @@ def _via_scraperapi(url, params=None):
 
 # ── ThorData Web Unlocker / Universal Scraping API (resuelve el challenge JS de Cloudflare) ──
 THORDATA_TOKEN = _e("THORDATA_TOKEN")
-THORDATA_URL   = "https://universalapi.thordata.com/request"
+THORDATA_URL   = "https://webunlocker.thordata.com/request"
 
 class _ThorResp:
     """Respuesta minima compatible con requests.Response (status_code/.text/.json())."""
@@ -611,23 +611,23 @@ def _via_thordata(url, params=None):
         "Authorization": f"Bearer {THORDATA_TOKEN}",
         "Content-Type": "application/x-www-form-urlencoded",
     }
-    # 1) sin render (mas rapido/barato); 2) con render si vino un challenge
-    for js in ("False", "True"):
+    # Web Unlocker: renderiza JS y resuelve Cloudflare automaticamente (type=html => cuerpo crudo)
+    for intento in range(2):
         try:
-            r = requests.post(THORDATA_URL, headers=headers, data={
-                "url": target, "type": "html", "js_render": js, "header": "False",
-            }, timeout=90)
+            r = requests.post(THORDATA_URL, headers=headers,
+                              data={"url": target, "type": "html"}, timeout=90)
         except Exception as e:
-            print(f"⚠️ ThorData ({'render' if js=='True' else 'plano'}): {e}")
-            continue
+            print(f"⚠️ ThorData (intento {intento+1}/2): {e}")
+            time.sleep(3); continue
         if r.status_code != 200:
-            print(f"⚠️ ThorData HTTP {r.status_code} (js_render={js})")
-            continue
+            print(f"⚠️ ThorData HTTP {r.status_code}: {(r.text or '')[:120]}")
+            time.sleep(2); continue
         crudo = _extraer_json(r.text)
         if crudo:
-            print(f"✅ ThorData OK (js_render={js})")
+            print("✅ ThorData OK")
             return _ThorResp(200, crudo)
-        print(f"⚠️ ThorData sin JSON util (js_render={js})")
+        print(f"⚠️ ThorData sin JSON util: {(r.text or '')[:120]}")
+        time.sleep(2)
     return None
 
 # Sesion curl_cffi caliente reutilizable (IP sticky + cookie cf_clearance de Cloudflare)
