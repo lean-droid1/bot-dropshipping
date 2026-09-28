@@ -2358,6 +2358,22 @@ def procesar_cmd(texto):
                 tg(f"❌ Error: `{e}`")
         threading.Thread(target=_limpiar, daemon=True).start()
         return
+    elif cmd[0] == "/deduplicar":
+        if not comerciapp_ok():
+            tg("❌ ComerciApp no configurado."); return
+        tg("🧹 *Deduplicando...* (deja 1 por producto, reengancha los pedidos al que queda)")
+        def _dedup():
+            try:
+                r = requests.post(f"{COMERCIAPP_API}/api/bot/deduplicar", headers=_ca_headers(), json={}, timeout=120)
+                if r.status_code == 200:
+                    d = r.json()
+                    tg(f"✅ *Duplicados eliminados* — {d.get('borrados',0)} borrados en {d.get('grupos_afectados',0)} productos.\n\nRevisá la web: debería quedar 1 de cada uno.")
+                else:
+                    tg(f"❌ Error al deduplicar: HTTP {r.status_code}\n`{r.text[:200]}`")
+            except Exception as e:
+                tg(f"❌ Error: `{e}`")
+        threading.Thread(target=_dedup, daemon=True).start()
+        return
     elif cmd[0] == "/test_proxy":
         def _test_proxy():
             res = ["🔬 *Diagnóstico de conexión al proveedor*\n"]
