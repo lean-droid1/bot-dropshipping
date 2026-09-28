@@ -579,7 +579,7 @@ class _ThorResp:
         self.text = text or ""
     def json(self):
         import json as _json
-        return _json.loads(self.text)
+        return _json.loads((self.text or "").replace("\x00", ""), strict=False)
 
 def _extraer_json(texto):
     """Devuelve el JSON crudo (str) de productos a partir de la respuesta de ThorData,
@@ -597,7 +597,7 @@ def _extraer_json(texto):
     # (a/b) Objeto JSON: puede ser un producto suelto o un SOBRE de ThorData
     if t[:1] == "{":
         try:
-            obj = _json.loads(t)
+            obj = _json.loads(t.replace("\x00", ""), strict=False)
         except Exception:
             obj = None
         if isinstance(obj, dict):
