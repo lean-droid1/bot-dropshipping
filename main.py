@@ -261,27 +261,59 @@ def _ca_headers():
 def comerciapp_ok():
     return bool(COMERCIAPP_API and COMERCIAPP_KEY)
 
-def comerciapp_sync(lote):
-    """Manda un lote de productos a ComerciApp (/api/bot/sync). Devuelve el JSON de respuesta o None."""
-    if not comerciapp_ok():
-        print("⚠️ ComerciApp no configurado (COMERCIAPP_API / BOT_API_KEY)")
-        return None
+# Tamaño de lote para no timeout-ear el backend (463 de una vez > 60s). Configurable por env.
+SYNC_CHUNK = int(os.environ.get("SYNC_CHUNK", "40") or "40")
+
+def _comerciapp_sync_chunk(lote):
+    """Manda UN sub-lote a ComerciApp (/api/bot/sync). Devuelve el JSON de respuesta o None."""
     payload = {"productos": lote}
     if COMERCIAPP_SECCION:
         try: payload["seccion_id"] = int(COMERCIAPP_SECCION)
         except Exception: pass
     for intento in range(3):
         try:
-            r = requests.post(f"{COMERCIAPP_API}/api/bot/sync", headers=_ca_headers(), json=payload, timeout=60)
+            r = requests.post(f"{COMERCIAPP_API}/api/bot/sync", headers=_ca_headers(), json=payload, timeout=120)
             if r.status_code in (200, 201):
                 return r.json()
             print(f"⚠️ ComerciApp sync HTTP {r.status_code}: {r.text[:200]}")
             if r.status_code in (401, 503):  # auth/config error → no reintentar
                 return None
         except Exception as e:
-            print(f"❌ ComerciApp sync: {e}")
+            print(f"❌ ComerciApp sync (intento {intento+1}/3): {e}")
         time.sleep(3 * (intento + 1))
     return None
+
+def comerciapp_sync(lote):
+    """Manda los productos a ComerciApp en sub-lotes chicos (evita timeout con lotes grandes).
+    Agrega los contadores de cada sub-lote y devuelve un resumen combinado (o None si todo falló)."""
+    if not comerciapp_ok():
+        print("⚠️ ComerciApp no configurado (COMERCIAPP_API / BOT_API_KEY)")
+        return None
+    if not lote:
+        return {"insertados":0,"actualizados":0,"errores":0,"total":0,"detalles":[]}
+
+    total = {"insertados":0,"actualizados":0,"errores":0,"total":0,"detalles":[],"primer_error":""}
+    partes = [lote[i:i+SYNC_CHUNK] for i in range(0, len(lote), SYNC_CHUNK)]
+    hubo_ok = False
+    for idx, parte in enumerate(partes, 1):
+        res = _comerciapp_sync_chunk(parte)
+        if res is None:
+            # Sub-lote fallido: contarlo como errores para no perder el rastro
+            total["errores"] += len(parte)
+            total["total"]   += len(parte)
+            print(f"   ⚠️ Sub-lote {idx}/{len(partes)} falló ({len(parte)} prods)")
+            continue
+        hubo_ok = True
+        total["insertados"]   += res.get("insertados", 0)
+        total["actualizados"] += res.get("actualizados", 0)
+        total["errores"]      += res.get("errores", 0)
+        total["total"]        += res.get("total", len(parte))
+        if res.get("detalles"):
+            total["detalles"].extend(res["detalles"])
+        if not total["primer_error"] and res.get("primer_error"):
+            total["primer_error"] = res["primer_error"]
+        print(f"   ✅ Sub-lote {idx}/{len(partes)}: +{res.get('insertados',0)} nuevos, {res.get('actualizados',0)} act.")
+    return total if hubo_ok else None
 
 def comerciapp_skus_existentes():
     """Devuelve dict {sku: stock} de los productos RXZ- que ya existen en ComerciApp."""
