@@ -196,6 +196,8 @@ AYUDA = r"""📋 *Comandos disponibles:*
 /sync\_total — Sincroniza precios y stock de todos los productos
 /ciclo — Dispara un ciclo de monitoreo manualmente
 /reparar\_fotos — Sube a Cloudinary las fotos del proveedor que se ven rotas en la web
+/pendientes — Productos nuevos del proveedor esperando aprobación (Publicar / Ignorar)
+/aprobar\_nuevos on|off — Si está on, lo nuevo entra oculto hasta que lo apruebes
 /registrar\_webhooks — Registra webhooks en Tienda Nube para notificaciones instantáneas
 /ver\_webhooks — Muestra los webhooks activos
 /borrar\_webhook ID — Elimina un webhook por ID
@@ -265,9 +267,9 @@ def comerciapp_ok():
 # Tamaño de lote para no timeout-ear el backend (463 de una vez > 60s). Configurable por env.
 SYNC_CHUNK = int(os.environ.get("SYNC_CHUNK", "40") or "40")
 
-def _comerciapp_sync_chunk(lote):
+def _comerciapp_sync_chunk(lote, ocultar_nuevos=False):
     """Manda UN sub-lote a ComerciApp (/api/bot/sync). Devuelve el JSON de respuesta o None."""
-    payload = {"productos": lote}
+    payload = {"productos": lote, "ocultar_nuevos": bool(ocultar_nuevos)}
     if COMERCIAPP_SECCION:
         try: payload["seccion_id"] = int(COMERCIAPP_SECCION)
         except Exception: pass
@@ -284,7 +286,7 @@ def _comerciapp_sync_chunk(lote):
         time.sleep(3 * (intento + 1))
     return None
 
-def comerciapp_sync(lote):
+def comerciapp_sync(lote, ocultar_nuevos=False):
     """Manda los productos a ComerciApp en sub-lotes chicos (evita timeout con lotes grandes).
     Agrega los contadores de cada sub-lote y devuelve un resumen combinado (o None si todo falló)."""
     if not comerciapp_ok():
@@ -293,11 +295,11 @@ def comerciapp_sync(lote):
     if not lote:
         return {"insertados":0,"actualizados":0,"errores":0,"total":0,"detalles":[]}
 
-    total = {"insertados":0,"actualizados":0,"errores":0,"total":0,"detalles":[],"primer_error":""}
+    total = {"insertados":0,"actualizados":0,"errores":0,"total":0,"detalles":[],"primer_error":"","nuevos":[]}
     partes = [lote[i:i+SYNC_CHUNK] for i in range(0, len(lote), SYNC_CHUNK)]
     hubo_ok = False
     for idx, parte in enumerate(partes, 1):
-        res = _comerciapp_sync_chunk(parte)
+        res = _comerciapp_sync_chunk(parte, ocultar_nuevos)
         if res is None:
             # Sub-lote fallido: contarlo como errores para no perder el rastro
             total["errores"] += len(parte)
@@ -311,6 +313,8 @@ def comerciapp_sync(lote):
         total["total"]        += res.get("total", len(parte))
         if res.get("detalles"):
             total["detalles"].extend(res["detalles"])
+        if res.get("nuevos"):
+            total["nuevos"].extend(res["nuevos"])
         if not total["primer_error"] and res.get("primer_error"):
             total["primer_error"] = res["primer_error"]
         print(f"   ✅ Sub-lote {idx}/{len(partes)}: +{res.get('insertados',0)} nuevos, {res.get('actualizados',0)} act.")
@@ -337,6 +341,83 @@ def comerciapp_stock_cero(skus):
     except Exception as e:
         print(f"❌ ComerciApp stock-cero: {e}")
     return 0
+
+# ── Aprobación de productos NUEVOS del proveedor ──────────────────────────────
+# Con /aprobar_nuevos on (por defecto), lo nuevo entra OCULTO en la web y el bot pregunta por
+# Telegram si publicarlo. En la primera carga (web casi vacía) se publica directo.
+APROBAR_MAX_FICHAS = 8   # hasta esta cantidad manda una ficha por producto; más, un resumen con "Publicar todos"
+
+def _md(t):
+    """Escapa texto para Markdown de Telegram (nombres con * _ ` [ rompen el mensaje)."""
+    return re.sub(r"([_*`\[])", r"\\\1", str(t or ""))
+
+def _lim(t):
+    """Para texto DENTRO de *negrita*: Telegram no admite escapes ahí, así que se sacan esos caracteres."""
+    return re.sub(r"[_*`\[\]]", "", str(t or "")).strip()
+
+def tg_botones(texto, filas):
+    if not TELEGRAM_TOKEN or not CHAT_ID: return
+    try:
+        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
+            json={"chat_id": CHAT_ID, "text": texto, "parse_mode": "Markdown",
+                  "reply_markup": {"inline_keyboard": filas}}, timeout=15)
+    except Exception as e: print(f"❌ Telegram botones: {e}")
+
+def tg_foto_botones(url, caption, filas):
+    """Ficha con foto + botones. Si Telegram no puede bajar la foto, manda solo el texto."""
+    if not TELEGRAM_TOKEN or not CHAT_ID: return
+    if url and "cloudinary" in url:
+        try:
+            r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
+                json={"chat_id": CHAT_ID, "photo": url, "caption": caption[:1000], "parse_mode": "Markdown",
+                      "reply_markup": {"inline_keyboard": filas}}, timeout=20)
+            if r.status_code == 200: return
+        except Exception: pass
+    tg_botones(caption, filas)
+
+def comerciapp_pendientes():
+    if not comerciapp_ok(): return None
+    try:
+        r = requests.get(f"{COMERCIAPP_API}/api/bot/pendientes", headers=_ca_headers(), timeout=40)
+        if r.status_code == 200: return r.json().get("productos", [])
+        print(f"⚠️ pendientes HTTP {r.status_code}: {r.text[:150]}")
+    except Exception as e: print(f"❌ pendientes: {e}")
+    return None
+
+def comerciapp_aprobar(skus=None, todos=False, publicar=True):
+    if not comerciapp_ok(): return None
+    try:
+        body = {"publicar": bool(publicar)}
+        if todos: body["todos"] = True
+        else: body["skus"] = list(skus or [])
+        r = requests.post(f"{COMERCIAPP_API}/api/bot/aprobar", headers=_ca_headers(), json=body, timeout=40)
+        if r.status_code == 200: return r.json()
+        print(f"⚠️ aprobar HTTP {r.status_code}: {r.text[:150]}")
+    except Exception as e: print(f"❌ aprobar: {e}")
+    return None
+
+def _ficha_nuevo(p):
+    precio = int(float(p.get("precio") or 0))
+    cap = f"*{_lim(p.get('nombre'))}*\n$" + f"{precio:,}".replace(",", ".")
+    if p.get("categoria"): cap += f"\n{_md(p.get('categoria'))}"
+    cap += f"\n`{p.get('sku')}`"
+    botones = [[{"text": "Publicar", "callback_data": f"/pub {p.get('sku')}"},
+                {"text": "Ignorar", "callback_data": f"/ign {p.get('sku')}"}]]
+    tg_foto_botones(p.get("imagen") or "", cap, botones)
+
+def avisar_nuevos(nuevos):
+    """Avisa los productos nuevos que quedaron ocultos esperando aprobación."""
+    if not nuevos: return
+    if len(nuevos) <= APROBAR_MAX_FICHAS:
+        tg(f"🆕 *{_nt('Productos nuevos del proveedor')}*: {len(nuevos)}\nQuedaron *ocultos* en la web hasta que los apruebes.")
+        for p in nuevos: _ficha_nuevo(p)
+        return
+    lista = "\n".join(f"• {_md(p.get('nombre'))}" for p in nuevos[:25])
+    if len(nuevos) > 25: lista += f"\n_...y {len(nuevos) - 25} más_"
+    tg_botones(f"🆕 *{_nt('Productos nuevos del proveedor')}*: {len(nuevos)}\nQuedaron *ocultos* en la web hasta que los apruebes.\n\n{lista}",
+               [[{"text": f"Publicar todos ({len(nuevos)})", "callback_data": "/pub_todos"}],
+                [{"text": "Revisar uno por uno", "callback_data": "/pendientes"},
+                 {"text": "Ignorar todos", "callback_data": "/ign_todos"}]])
 
 # ── Fotos del proveedor → Cloudinary (vía backend) ────────────────────────────
 # rxzweb está detrás de Cloudflare: la web (Railway) y Cloudinary no pueden bajar esas
@@ -406,10 +487,14 @@ def _bajar_foto(url, estado):
         time.sleep(1.5)
     return None, motivo
 
-def _subir_foto(origen, data=None, ctype=None, nueva=None):
-    """Sube la foto (o reemplaza por una URL de Cloudinary ya subida). Devuelve el JSON del backend."""
+def _subir_foto(origen, data=None, ctype=None, nueva=None, remoto=False):
+    """Sube la foto (o reemplaza por una URL de Cloudinary ya subida, o pide que Cloudinary la baje
+    directo con remoto=True). Devuelve el JSON del backend."""
     try:
-        if nueva:
+        if remoto:
+            r = requests.post(f"{COMERCIAPP_API}/api/bot/foto", headers=_ca_headers(),
+                              json={"origen": origen, "remoto": True}, timeout=90)
+        elif nueva:
             r = requests.post(f"{COMERCIAPP_API}/api/bot/foto", headers=_ca_headers(),
                               json={"origen": origen, "nueva": nueva}, timeout=60)
         else:
@@ -458,6 +543,9 @@ def reparar_fotos(tiempo_max=None, avisar=False):
                 data, ct = _bajar_foto(u, estado)
                 if data is None:
                     r = {"error": ct}
+                    if ct != "404 en el proveedor":
+                        r2 = _subir_foto(u, remoto=True)   # último intento: que Cloudinary la baje directo
+                        if r2.get("url") and not r2.get("error"): r = r2
                 elif len(data) > FOTOS_MAX_BYTES:
                     r = {"error": "foto de más de 11 MB"}
                 else:
@@ -1626,10 +1714,13 @@ def ciclo_monitoreo():
                 flecha = "🔼" if precio_venta > pv_viejo else "🔽"
                 cambios_precio.append(f"{flecha} *{datos['nombre_real']}*: ${pv_viejo:,} → ${precio_venta:,}")
 
-    # 4) Enviar el lote a ComerciApp
+    # 4) Enviar el lote a ComerciApp. Lo NUEVO entra oculto y se pide aprobación por Telegram
+    #    (salvo en la primera carga, con la web casi vacía, que se publica directo).
+    skus_web = comerciapp_skus_existentes()
+    ocultar_nuevos = bool(db.get("aprobar_nuevos", True)) and len(skus_web) >= 20
     resumen = None
     if lote:
-        resumen = comerciapp_sync(lote)
+        resumen = comerciapp_sync(lote, ocultar_nuevos)
         if resumen:
             print(f"   ✅ ComerciApp: {resumen.get('insertados',0)} nuevos, {resumen.get('actualizados',0)} actualizados, {resumen.get('errores',0)} errores")
             # Si hubo muchos errores, mostrar el detalle (el backend manda hasta 10 ejemplos)
@@ -1646,7 +1737,6 @@ def ciclo_monitoreo():
 
     # 5) Productos que se CAYERON del proveedor → stock 0 en la web
     caidos = []
-    skus_web = comerciapp_skus_existentes()
     if skus_web:
         skus_proveedor = {f"RXZ-{d.get('woo_id')}" for d in prov_nuevo.values() if d.get("woo_id")}
         for sku, stock_web in skus_web.items():
@@ -1667,9 +1757,12 @@ def ciclo_monitoreo():
     if lineas_stock_bajo:
         for i in range(0, len(lineas_stock_bajo), 30):
             tg(f"⚠️ *{_nt('Stock bajo en proveedor:')}*\n\n" + "\n".join(lineas_stock_bajo[i:i+30]))
+    if resumen and ocultar_nuevos and resumen.get("nuevos"):
+        try: avisar_nuevos(resumen["nuevos"])
+        except Exception as e: print(f"⚠️ avisar_nuevos: {e}")
     if resumen:
         partes = []
-        if resumen.get("insertados"): partes.append(f"🆕 {resumen['insertados']} nuevos")
+        if resumen.get("insertados"): partes.append(f"🆕 {resumen['insertados']} nuevos" + (" (ocultos, esperan aprobación)" if ocultar_nuevos else ""))
         if resumen.get("actualizados"): partes.append(f"🔄 {resumen['actualizados']} actualizados")
         if caidos: partes.append(f"📉 {len(caidos)} sin stock")
         if partes:
@@ -2170,6 +2263,7 @@ def tg_menu():
              {"text": "📊 Estado", "callback_data": "/estado_scraping"}],
             [{"text": "🔬 Test Proxy", "callback_data": "/test_proxy"}],
             [{"text": "📂 Ver Categorías", "callback_data": "/ver_categorias"}],
+            [{"text": "🆕 Productos nuevos por aprobar", "callback_data": "/pendientes"}],
             [{"text": "🖼️ Reparar fotos de la web", "callback_data": "/reparar_fotos"}],
             [{"text": "📸 Migrar Fotos Empretienda", "callback_data": "/migrar_fotos"}],
             [{"text": "🧹 Limpiar DEPOSITO", "callback_data": "/limpiar_deposito"}],
@@ -2503,6 +2597,42 @@ def procesar_cmd(texto):
             except Exception as e:
                 tg(f"❌ Error: `{e}`")
         threading.Thread(target=_migrar, daemon=True).start()
+        return
+    elif cmd[0] == "/pendientes":
+        pend = comerciapp_pendientes()
+        if pend is None: tg("❌ No pude consultar la web."); return
+        if not pend: tg("✅ No hay productos nuevos esperando aprobación."); return
+        tg(f"🆕 *{len(pend)} productos esperando aprobación*" + (" — te muestro los primeros 15" if len(pend) > 15 else ""))
+        for p in pend[:15]: _ficha_nuevo(p)
+        if len(pend) > 1:
+            tg_botones("Todos los pendientes:", [[{"text": f"Publicar todos ({len(pend)})", "callback_data": "/pub_todos"},
+                                          {"text": "Ignorar todos", "callback_data": "/ign_todos"}]])
+        return
+    elif cmd[0] in ("/pub", "/ign"):
+        partes = texto.split()
+        if len(partes) < 2: tg("Usá: `/pub RXZ-123` o `/ign RXZ-123`"); return
+        sku = partes[1].strip().upper()
+        publicar = cmd[0] == "/pub"
+        r = comerciapp_aprobar([sku], publicar=publicar)
+        if not r: tg("❌ No pude actualizar la web."); return
+        if not r.get("afectados"): tg(f"ℹ️ `{sku}` no encontrado (¿ya lo aprobaste?)."); return
+        nom = (r.get("productos") or [{}])[0].get("nombre", sku)
+        tg(f"✅ *{_lim(nom)}* publicado en la web." if publicar else f"🙈 *{_lim(nom)}* queda oculto.")
+        return
+    elif cmd[0] in ("/pub_todos", "/ign_todos"):
+        publicar = cmd[0] == "/pub_todos"
+        r = comerciapp_aprobar(todos=True, publicar=publicar)
+        if not r: tg("❌ No pude actualizar la web."); return
+        tg(f"✅ {r.get('afectados', 0)} productos publicados." if publicar else f"🙈 {r.get('afectados', 0)} productos quedan ocultos.")
+        return
+    elif cmd[0] == "/aprobar_nuevos":
+        db = leer_db()
+        if len(cmd) > 1 and cmd[1] in ("on", "off", "si", "no"):
+            db["aprobar_nuevos"] = cmd[1] in ("on", "si"); escribir_db(db)
+        activo = db.get("aprobar_nuevos", True)
+        tg(("✅ *Aprobación de nuevos: ACTIVADA*\nLo nuevo del proveedor entra oculto y te pregunto antes de publicarlo."
+            if activo else "⏩ *Aprobación de nuevos: DESACTIVADA*\nLo nuevo del proveedor se publica solo.") +
+           "\n\nCambialo con `/aprobar_nuevos on` u `/aprobar_nuevos off`.")
         return
     elif cmd[0] == "/reparar_fotos":
         threading.Thread(target=reparar_fotos, kwargs={"avisar": True}, daemon=True).start()
