@@ -195,6 +195,7 @@ AYUDA = r"""📋 *Comandos disponibles:*
 *Sincronización*
 /sync\_total — Sincroniza precios y stock de todos los productos
 /ciclo — Dispara un ciclo de monitoreo manualmente
+/reparar\_fotos — Sube a Cloudinary las fotos del proveedor que se ven rotas en la web
 /registrar\_webhooks — Registra webhooks en Tienda Nube para notificaciones instantáneas
 /ver\_webhooks — Muestra los webhooks activos
 /borrar\_webhook ID — Elimina un webhook por ID
@@ -336,6 +337,156 @@ def comerciapp_stock_cero(skus):
     except Exception as e:
         print(f"❌ ComerciApp stock-cero: {e}")
     return 0
+
+# ── Fotos del proveedor → Cloudinary (vía backend) ────────────────────────────
+# rxzweb está detrás de Cloudflare: la web (Railway) y Cloudinary no pueden bajar esas
+# fotos, por eso se ven rotas. El bot las baja con su proxy residencial y las manda a
+# /api/bot/foto, que las sube a Cloudinary y reemplaza la URL en todos los productos.
+FOTOS_MAX_BYTES     = 11 * 1024 * 1024
+FOTOS_SEG_POR_CICLO = int(os.environ.get("FOTOS_SEG_POR_CICLO", "240") or "0")  # 0 = no reparar en cada ciclo
+_fotos_lock = threading.Lock()
+
+def comerciapp_fotos_externas():
+    """{total, productos, urls:[...]} con las fotos de la web que siguen apuntando al proveedor."""
+    if not comerciapp_ok(): return None
+    try:
+        r = requests.get(f"{COMERCIAPP_API}/api/bot/fotos-externas", headers=_ca_headers(), timeout=60)
+        if r.status_code == 200:
+            return r.json()
+        print(f"⚠️ fotos-externas HTTP {r.status_code}: {r.text[:150]}")
+    except Exception as e:
+        print(f"❌ fotos-externas: {e}")
+    return None
+
+def _es_imagen(r):
+    ct = (r.headers.get("content-type") or "").lower()
+    return r.status_code == 200 and ct.startswith("image/") and len(r.content or b"") > 500
+
+def _bajar_foto(url, estado):
+    """Baja una foto del proveedor. Primero directo (no gasta proxy); si Cloudflare bloquea,
+    por el proxy residencial con una sesión caliente que se reutiliza (rota IP si da 403).
+    Devuelve (bytes, content_type) o (None, motivo)."""
+    if not CURL_CFFI_OK:
+        try:
+            r = requests.get(url, timeout=30, headers={"User-Agent": USER_AGENT})
+            return (r.content, r.headers.get("content-type")) if _es_imagen(r) else (None, f"HTTP {r.status_code}")
+        except Exception as e:
+            return None, type(e).__name__
+    hdrs = {"Referer": "https://rxzweb.com/", "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8"}
+    if not estado.get("directo_bloqueado"):
+        try:
+            r = cf_requests.get(url, impersonate="chrome124", headers=hdrs, timeout=25)
+            if _es_imagen(r):
+                return r.content, r.headers.get("content-type")
+            if r.status_code == 404:
+                return None, "404 en el proveedor"
+            estado["directo_bloqueado"] = True
+        except Exception:
+            estado["directo_bloqueado"] = True
+    if not _get_residential_proxy():
+        return None, "bloqueado y sin proxy"
+    motivo = "sin respuesta"
+    for _ in range(3):
+        s = estado.get("sess")
+        if s is None:
+            s, _p = _nueva_sesion_prov()
+            if s is None:
+                motivo = "no abre sesión proxy"; time.sleep(2); continue
+            estado["sess"] = s
+        try:
+            r = s.get(url, headers=hdrs, timeout=40)
+            if _es_imagen(r):
+                return r.content, r.headers.get("content-type")
+            if r.status_code == 404:
+                return None, "404 en el proveedor"
+            motivo = f"HTTP {r.status_code}"
+        except Exception as e:
+            motivo = type(e).__name__
+        estado["sess"] = None   # IP quemada → la próxima abre otra
+        time.sleep(1.5)
+    return None, motivo
+
+def _subir_foto(origen, data=None, ctype=None, nueva=None):
+    """Sube la foto (o reemplaza por una URL de Cloudinary ya subida). Devuelve el JSON del backend."""
+    try:
+        if nueva:
+            r = requests.post(f"{COMERCIAPP_API}/api/bot/foto", headers=_ca_headers(),
+                              json={"origen": origen, "nueva": nueva}, timeout=60)
+        else:
+            nombre = origen.split("?")[0].rsplit("/", 1)[-1] or "foto.jpg"
+            r = requests.post(f"{COMERCIAPP_API}/api/bot/foto", headers={"X-Bot-Key": COMERCIAPP_KEY},
+                              data={"origen": origen},
+                              files={"imagen": (nombre, data, (ctype or "image/jpeg").split(";")[0])}, timeout=120)
+        if r.status_code == 200:
+            return r.json()
+        return {"error": f"web HTTP {r.status_code}: {r.text[:100]}"}
+    except Exception as e:
+        return {"error": f"web {type(e).__name__}"}
+
+def reparar_fotos(tiempo_max=None, avisar=False):
+    """Pasa a Cloudinary las fotos de la web que todavía apuntan a rxzweb.
+    tiempo_max: segundos máximos (None = todas). avisar: manda progreso por Telegram."""
+    if not comerciapp_ok():
+        if avisar: tg("❌ ComerciApp no configurado.")
+        return None
+    if not _fotos_lock.acquire(blocking=False):
+        if avisar: tg("ℹ️ Ya hay una reparación de fotos en curso.")
+        return None
+    try:
+        info = comerciapp_fotos_externas()
+        if info is None:
+            if avisar: tg("❌ No pude consultar las fotos de la web.")
+            return None
+        urls = info.get("urls") or []
+        res = {"ok": 0, "fallidas": 0, "saltadas": 0, "pendientes": len(urls), "productos": info.get("productos", 0), "motivos": {}}
+        if not urls:
+            if avisar: tg("✅ No hay fotos del proveedor pendientes: todas están en Cloudinary.")
+            return res
+        db = leer_db()
+        cache = db.get("fotos_cloudinary", {})   # origen → URL Cloudinary
+        fallos = db.get("fotos_fallidas", {})    # origen → intentos fallidos
+        if avisar:
+            tg(f"📸 *Reparando fotos de la web*\n{len(urls)} imágenes en {info.get('productos', '?')} productos.\nTe aviso cada 100.")
+        estado, inicio = {}, time.time()
+        for i, u in enumerate(urls, 1):
+            if tiempo_max and time.time() - inicio > tiempo_max:
+                break
+            if not avisar and fallos.get(u, 0) >= 3:   # en automático no insistir con las que fallan siempre
+                res["saltadas"] += 1; continue
+            r = _subir_foto(u, nueva=cache[u]) if u in cache else None
+            if not r or r.get("error"):
+                data, ct = _bajar_foto(u, estado)
+                if data is None:
+                    r = {"error": ct}
+                elif len(data) > FOTOS_MAX_BYTES:
+                    r = {"error": "foto de más de 11 MB"}
+                else:
+                    r = _subir_foto(u, data, ct)
+            if r.get("url") and not r.get("error"):
+                res["ok"] += 1; cache[u] = r["url"]; fallos.pop(u, None)
+            else:
+                res["fallidas"] += 1; fallos[u] = fallos.get(u, 0) + 1
+                m = str(r.get("error") or "?")[:60]
+                res["motivos"][m] = res["motivos"].get(m, 0) + 1
+            if avisar and i % 100 == 0:
+                tg(f"📸 Fotos: {i}/{len(urls)} — {res['ok']} subidas, {res['fallidas']} con error")
+            time.sleep(0.2)
+        res["pendientes"] = len(urls) - res["ok"]
+        db = leer_db(); db["fotos_cloudinary"] = cache; db["fotos_fallidas"] = fallos; escribir_db(db)
+        if avisar:
+            msg = (f"✅ *Fotos reparadas*\n\n• Subidas a Cloudinary: {res['ok']}\n"
+                   f"• Con error: {res['fallidas']}\n• Quedan del proveedor: {res['pendientes']}")
+            if res["motivos"]:
+                top = sorted(res["motivos"].items(), key=lambda x: -x[1])[:4]
+                msg += "\n\nMotivos:\n" + "\n".join(f"• {k}: {v}" for k, v in top)
+            tg(msg)
+        return res
+    except Exception as e:
+        print(f"❌ reparar_fotos: {e}")
+        if avisar: tg(f"❌ Error reparando fotos: `{e}`")
+        return None
+    finally:
+        _fotos_lock.release()
 
 # ══════════════════════════════════════════════════════════════════════════════
 # API TIENDA NEGOCIO (LEGACY — ya no se usa, apuntamos a ComerciApp)
@@ -1530,6 +1681,16 @@ def ciclo_monitoreo():
     # 7) Guardar estado
     db["productos_proveedor"] = prov_consolidado
     escribir_db(db)
+
+    # 8) Fotos nuevas (o rotas) del proveedor → Cloudinary, con tope de tiempo por ciclo
+    if FOTOS_SEG_POR_CICLO > 0:
+        try:
+            rf = reparar_fotos(tiempo_max=FOTOS_SEG_POR_CICLO)
+            if rf and rf.get("ok"):
+                print(f"   📸 {rf['ok']} fotos subidas a Cloudinary (quedan {rf['pendientes']})")
+                tg(f"📸 *{_nt('Fotos subidas a la web')}*: {rf['ok']}" + (f" (quedan {rf['pendientes']}, sigue en el próximo ciclo)" if rf['pendientes'] else ""))
+        except Exception as e:
+            print(f"⚠️ Fotos: {e}")
     print("─── ✅ Ciclo completado ───")
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -2009,6 +2170,7 @@ def tg_menu():
              {"text": "📊 Estado", "callback_data": "/estado_scraping"}],
             [{"text": "🔬 Test Proxy", "callback_data": "/test_proxy"}],
             [{"text": "📂 Ver Categorías", "callback_data": "/ver_categorias"}],
+            [{"text": "🖼️ Reparar fotos de la web", "callback_data": "/reparar_fotos"}],
             [{"text": "📸 Migrar Fotos Empretienda", "callback_data": "/migrar_fotos"}],
             [{"text": "🧹 Limpiar DEPOSITO", "callback_data": "/limpiar_deposito"}],
             [{"text": "🏷️ Ver Ofertas Proveedor", "callback_data": "/ver_ofertas_proveedor"}],
@@ -2341,6 +2503,9 @@ def procesar_cmd(texto):
             except Exception as e:
                 tg(f"❌ Error: `{e}`")
         threading.Thread(target=_migrar, daemon=True).start()
+        return
+    elif cmd[0] == "/reparar_fotos":
+        threading.Thread(target=reparar_fotos, kwargs={"avisar": True}, daemon=True).start()
         return
     elif cmd[0] == "/limpiar_deposito":
         if not comerciapp_ok():
