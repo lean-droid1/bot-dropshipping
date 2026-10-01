@@ -1700,6 +1700,7 @@ def ciclo_monitoreo():
             "ancho": datos.get("ancho", 0),
             "largo": datos.get("largo", 0),
             "envio_gratis": envio_gratis,
+            "costo": costo,   # lo que cobra rxz → precio de costo en la web (ganancia real en el dashboard)
         }
         lote.append(prod_lote)
         if stock and stock > 0:
