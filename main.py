@@ -1843,6 +1843,13 @@ def ciclo_monitoreo():
         resolver("trabado")
 
 LATIDO_MIN = 10
+HEALTHCHECK_URL = _e("HEALTHCHECK_URL")   # monitor externo (healthchecks.io): si deja de recibir el ping, avisa por Telegram
+
+def ping_externo():
+    if not HEALTHCHECK_URL: return
+    try: requests.get(HEALTHCHECK_URL, timeout=10)
+    except Exception as e: print(f"⚠️ ping externo: {e}")
+
 def hilo_latido():
     """Cada 10 min: latido a la web (si deja de llegar ~45 min, la web avisa que el bot se cayó)
     y aviso si un ciclo lleva demasiado tiempo corriendo (trabado)."""
@@ -1853,6 +1860,7 @@ def hilo_latido():
                 alerta("trabado", "Un ciclo del bot está trabado",
                        f"Lleva {_dur(time.time() - t)} corriendo (lo normal es 1 a 5 min). Si sigue así, reiniciá el bot en Railway.")
             enviar_latido()
+            ping_externo()
         except Exception as e: print(f"⚠️ latido: {e}")
         time.sleep(LATIDO_MIN * 60)
 
