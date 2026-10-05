@@ -218,6 +218,7 @@ COMANDOS_TG = [
     ("encender", "Encender la sincronización con el proveedor"),
     ("apagar", "Apagar la sincronización"),
     ("ciclo", "Correr un ciclo ahora"),
+    ("test_proxy", "Probar si se puede leer el proveedor (directo y con proxy)"),
     ("pendientes", "Productos nuevos esperando aprobación"),
     ("reparar_fotos", "Subir a la web las fotos rotas del proveedor"),
     ("ver_categorias", "Categorías del proveedor (cargadas y excluidas)"),
@@ -3095,6 +3096,9 @@ def procesar_cmd(texto):
                 if ciclo_monitoreo() is False: tg("ℹ️ Ya había un ciclo corriendo: sigue ese.")
             except Exception as e: tg(f"⚠️ Error en el ciclo: `{e}`")
         threading.Thread(target=_encender, daemon=True).start()   # no frena los botones mientras corre
+        return
+    elif cmd[0] in ("/menu", "/start"):
+        tg_menu()
         return
     elif cmd[0] in ("/estado", "/estado_scraping"):
         tg(texto_estado(), silencioso=True)
