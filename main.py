@@ -212,6 +212,27 @@ def tg_doc(data, nombre, caption=""):
 
 def _nt(txt): return f"[{NOMBRE_TIENDA}] {txt}"
 
+COMANDOS_TG = [
+    ("menu", "Panel de control con botones"),
+    ("estado", "Cómo está el bot: último ciclo, créditos y avisos"),
+    ("encender", "Encender la sincronización con el proveedor"),
+    ("apagar", "Apagar la sincronización"),
+    ("ciclo", "Correr un ciclo ahora"),
+    ("pendientes", "Productos nuevos esperando aprobación"),
+    ("reparar_fotos", "Subir a la web las fotos rotas del proveedor"),
+    ("ver_categorias", "Categorías del proveedor (cargadas y excluidas)"),
+    ("ayuda", "Todos los comandos"),
+]
+
+def registrar_comandos_tg():
+    """Carga la lista de comandos que Telegram sugiere al escribir / (reemplaza la vieja)."""
+    if not TELEGRAM_TOKEN: return
+    try:
+        r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/setMyCommands", timeout=15,
+                          json={"commands": [{"command": c, "description": d} for c, d in COMANDOS_TG]})
+        print(f"📋 Comandos de Telegram: {'OK' if r.status_code == 200 else r.text[:120]}")
+    except Exception as e: print(f"⚠️ setMyCommands: {e}")
+
 # ══════════════════════════════════════════════════════════════════════════════
 # ESTADO DEL BOT, ALERTAS Y HORARIOS
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1062,6 +1083,9 @@ def _extraer_json(texto):
             # Producto suelto de WooCommerce (endpoint /products/{id})
             if "id" in obj and ("name" in obj or "prices" in obj):
                 return t
+            # Sobre con código de error (ej. {"code":401,"data":"User balance is insufficient!"}): no son datos
+            if "code" in obj and str(obj.get("code")) not in ("0", "200", "None"):
+                return None
             # Sobre de ThorData: el contenido real esta en algun campo
             for campo in ("data", "body", "html", "content", "result", "response", "text", "page"):
                 v = obj.get(campo)
@@ -1089,6 +1113,8 @@ def _extraer_json(texto):
 def _via_thordata(url, params=None):
     if not THORDATA_TOKEN:
         return None
+    if _diag.get("thordata", {}).get("credito"):
+        return None   # ya avisó que no tiene saldo en este ciclo: no gastar tiempo reintentando
     from urllib.parse import urlencode as _ue
     target = url
     if params:
@@ -1119,6 +1145,7 @@ def _via_thordata(url, params=None):
         print(f"⚠️ ThorData sin JSON util: {(r.text or '')[:120]}")
         # Algunos errores de saldo vienen con HTTP 200 y un JSON de error
         _diag_falla("thordata", None, "respuesta sin datos: " + (r.text or "")[:150])
+        if _diag["thordata"].get("credito"): break
         time.sleep(2)
     return None
 
@@ -1215,7 +1242,7 @@ def _categoria_excluida(cat_nombre, excluidas):
 def scrapear_proveedor(excluidas=None):
     if excluidas is None:
         excluidas = leer_db().get("categorias_excluidas", CATEGORIAS_EXCLUIDAS_DEFAULT)
-    productos = {}; pagina = 1; reintentos_202 = 0; via_scraperapi = False; vacias = 0; faltan_variantes = False
+    productos = {}; pagina = 1; reintentos_202 = 0; via_scraperapi = False; vacias = 0; faltan_variantes = False; reintentos_pag = 0
     categorias_vistas = set()  # todas las categorías que aparecen en el proveedor este ciclo
     completo = False           # True solo si se leyeron TODAS las páginas
     _diag.clear()
@@ -1229,7 +1256,14 @@ def scrapear_proveedor(excluidas=None):
         if not r or r.status_code not in (200, 201, 202):
             codigo = r.status_code if r is not None else 'None'
             print(f"❌ Proveedor HTTP {codigo}")
-            if codigo == 403 and not via_scraperapi and (SCRAPERAPI_KEY or SCRAPERAPI_KEY2):
+            if not via_scraperapi and reintentos_pag < 2:
+                reintentos_pag += 1
+                print(f"🔁 Reintentando la página {pagina} ({reintentos_pag}/2) en {10 * reintentos_pag}s...")
+                _prov_cf_sess = None
+                time.sleep(10 * reintentos_pag)
+                continue
+            scraper_ok = (SCRAPERAPI_KEY or SCRAPERAPI_KEY2) and not _diag.get("scraperapi", {}).get("credito")
+            if codigo == 403 and not via_scraperapi and scraper_ok:
                 print("🔄 HTTP 403 — activando ScraperAPI como fallback...")
                 via_scraperapi = True
                 continue
@@ -1369,6 +1403,7 @@ def scrapear_proveedor(excluidas=None):
                     "largo":                 _fdim(dims.get("length")),
                 }
 
+        reintentos_pag = 0
         print(f"   Pág {pagina}: {len(lote)} prods (total entradas: {len(productos)})")
         if len(lote) < 100:
             completo = True; break
@@ -1909,8 +1944,11 @@ def revisar_servicios_proveedor(hubo_datos):
         resolver("proxy")
     elif hubo_datos and not px:
         resolver("proxy", avisar=False)   # no hizo falta usarlo: si sigue mal, avisa la próxima vez que se use
-    if sc.get("credito") and not sc.get("ok"):
+    ya_avisado = any(k.startswith("scraperapi_") for k in leer_estado().get("alertas", {}))
+    if sc.get("credito") and not sc.get("ok") and not ya_avisado:
         alerta("scraperapi", "ScraperAPI sin créditos", "Es el último respaldo para leer el proveedor.", grave=False)
+    elif ya_avisado:
+        resolver("scraperapi", avisar=False)
     elif sc.get("ok"):
         resolver("scraperapi")
     elif hubo_datos and not sc:
@@ -2199,7 +2237,7 @@ def _ciclo_monitoreo():
                sin_stock=len(resumen.get("sin_stock", [])) + afectados, con_stock=len(resumen.get("con_stock", [])),
                ofertas=len(ofertas_nuevas), fotos=n_fotos,
                sin_stock_vendidos=[x.get("nombre") for x in sin_stock_vend][:20])
-    _registrar_ciclo(inicio, True, "" if completo else "lectura incompleta del proveedor", productos=len(prov_nuevo),
+    _registrar_ciclo(inicio, True, "" if completo else "lectura incompleta del proveedor", productos=len(prov_nuevo), referencia=n_ref,
                      enviados=len(lote_envio), cambios=n_cambios, nuevos=resumen.get("insertados", 0) or 0)
     print("─── ✅ Ciclo completado ───")
 
@@ -2278,7 +2316,7 @@ def resumen_diario():
     if dia.get("ofertas"): lineas.append(f"• Ofertas nuevas del proveedor: {dia['ofertas']}")
     if dia.get("fotos"): lineas.append(f"• Fotos subidas a la web: {dia['fotos']}")
     estado = (f"Scraping {'encendido' if activo else 'APAGADO (mandá /encender)'}"
-              + (f" · último ciclo {_hora_ar(uc['at'])} {'bien' if uc.get('ok') else 'con problemas'}" if uc.get("at") else ""))
+              + (f" · último ciclo {_hora_ar(uc['at'])} {('incompleto' if uc.get('motivo') else 'bien') if uc.get('ok') else 'con problemas'}" if uc.get("at") else ""))
     tg(f"☀️ *{_nt('Resumen del día')}*\n\n" + "\n".join(lineas) +
        f"\n\n*Estado*\n{estado}\n{_linea_creditos(cl)}\n\n*Para revisar*\n{_lineas_alertas(est)}", silencioso=False)
     _mod_estado(lambda e: e.update({"resumen_fecha": hoy, "dia": {}}))
@@ -2314,8 +2352,11 @@ def texto_estado():
     lin = [f"*{_nt('Estado del bot')}*", "",
            f"• Scraping: {'▶️ encendido, cada ' + str(CICLO_MINUTOS) + ' min' if activo else '⏸️ APAGADO (mandá /encender)'}"]
     if uc.get("at"):
-        lin.append(f"• Último ciclo: {_hora_ar(uc['at'])} (hace {_dur(time.time() - uc['at'])}) · "
-                   f"{'bien' if uc.get('ok') else 'con problemas: ' + _md(uc.get('motivo', ''))} · tardó {_dur(uc.get('dur', 0)) if uc.get('dur', 0) >= 60 else str(uc.get('dur', 0)) + ' s'}")
+        if not uc.get("ok"): res = "con problemas: " + _md(uc.get("motivo", ""))
+        elif uc.get("motivo"): res = "⚠️ INCOMPLETO" + (f" ({uc.get('productos', 0)} de unos {uc['referencia']} productos)" if uc.get("referencia") else "") + ": no se marcó nada sin stock"
+        else: res = "bien"
+        lin.append(f"• Último ciclo: {_hora_ar(uc['at'])} (hace {_dur(time.time() - uc['at'])}) · {res} · "
+                   f"tardó {_dur(uc.get('dur', 0)) if uc.get('dur', 0) >= 60 else str(uc.get('dur', 0)) + ' s'}")
         if uc.get("productos"):
             lin.append(f"• Proveedor: {uc['productos']} productos" + (f" vía {FUENTES.get(uc['fuente'], uc['fuente'])}" if uc.get("fuente") else "")
                        + f" · a la web: {uc.get('enviados', 0)} enviados, {uc.get('cambios', 0)} con cambios")
@@ -3676,6 +3717,7 @@ if __name__ == "__main__":
        f"Mandá /encender para arrancar la sincronización.\n"
        f"Mandá /menu para el panel de botones.")
 
+    registrar_comandos_tg()
     threading.Thread(target=escuchar_telegram, daemon=True).start()
     if FLASK_OK:
         threading.Thread(target=run_flask, daemon=True).start()
