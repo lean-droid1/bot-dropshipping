@@ -19,7 +19,7 @@ except ImportError:
     CURL_CFFI_OK = False
     print('⚠️ curl-cffi no instalado — usando requests normal')
 from email.header import decode_header
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import requests
 urllib3_imported = False
 try:
@@ -138,7 +138,8 @@ def guardar_token(token, store_id):
 # BASE DE DATOS
 # ══════════════════════════════════════════════════════════════════════════════
 def leer_db():
-    if os.path.exists(DB_FILE):
+    for intento in range(3):
+        if not os.path.exists(DB_FILE): break
         try:
             with open(DB_FILE, "r", encoding="utf-8") as f:
                 d = json.load(f)
@@ -154,24 +155,50 @@ def leer_db():
                 d.setdefault("categorias_excluidas", CATEGORIAS_EXCLUIDAS_DEFAULT)
                 d.setdefault("categorias_conocidas", [])  # para detectar categorías nuevas del proveedor
                 return d
-        except Exception: pass
+        except Exception:
+            time.sleep(0.3)   # otro hilo la estaba escribiendo: reintentar antes de devolver una DB vacía
     return {"productos_proveedor":{}, "sincronizados":{}, "pedidos_procesados":[], "ofertas_pendientes":{}, "ordenes":{}}
 
 def escribir_db(d):
+    """Escritura atómica (archivo temporal + reemplazo): otro hilo nunca lee una DB a medio escribir."""
     try:
-        with open(DB_FILE, "w", encoding="utf-8") as f:
+        tmp = f"{DB_FILE}.{threading.get_ident()}.tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
             json.dump(d, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, DB_FILE)
     except Exception as e: print(f"❌ DB: {e}")
 
 # ══════════════════════════════════════════════════════════════════════════════
 # TELEGRAM
 # ══════════════════════════════════════════════════════════════════════════════
-def tg(msg):
+def _partir(msg, n=3900):
+    """Telegram corta en 4096 caracteres: parte el texto por líneas."""
+    if len(msg) <= n: return [msg]
+    partes, actual = [], ""
+    for linea in msg.split("\n"):
+        while len(linea) > n:
+            if actual: partes.append(actual); actual = ""
+            partes.append(linea[:n]); linea = linea[n:]
+        if actual and len(actual) + len(linea) + 1 > n:
+            partes.append(actual); actual = linea
+        else:
+            actual = f"{actual}\n{linea}" if actual else linea
+    if actual: partes.append(actual)
+    return partes
+
+def tg(msg, silencioso=None):
+    """Manda un mensaje. De noche (SILENCIO_DESDE a SILENCIO_HASTA) llega sin sonido.
+    Si el formato rompe (un nombre con * o _), lo reenvía como texto plano en vez de perderlo."""
     if not msg or not TELEGRAM_TOKEN or not CHAT_ID: return
-    try:
-        requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": msg, "parse_mode": "Markdown"}, timeout=15)
-    except Exception as e: print(f"❌ Telegram: {e}")
+    if silencioso is None: silencioso = _es_silencio()
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    for parte in _partir(msg):
+        try:
+            r = requests.post(url, json={"chat_id": CHAT_ID, "text": parte, "parse_mode": "Markdown",
+                                         "disable_notification": bool(silencioso)}, timeout=15)
+            if r.status_code == 400 and "parse" in (r.text or "").lower():
+                requests.post(url, json={"chat_id": CHAT_ID, "text": parte, "disable_notification": bool(silencioso)}, timeout=15)
+        except Exception as e: print(f"❌ Telegram: {e}")
 
 def tg_doc(data, nombre, caption=""):
     if not TELEGRAM_TOKEN or not CHAT_ID: return False
@@ -186,11 +213,88 @@ def tg_doc(data, nombre, caption=""):
 def _nt(txt): return f"[{NOMBRE_TIENDA}] {txt}"
 
 # ══════════════════════════════════════════════════════════════════════════════
+# ESTADO DEL BOT, ALERTAS Y HORARIOS
+# ══════════════════════════════════════════════════════════════════════════════
+# El estado va en un archivo aparte de la DB: el ciclo reescribe la DB entera al terminar
+# y se pisarían las alertas que se registran mientras corre.
+ESTADO_FILE      = "estado_bot.json"
+_estado_lock     = threading.RLock()
+ALERTA_REPETIR_H = float(os.environ.get("ALERTA_REPETIR_H", "6") or 6)   # si una falla sigue, se repite el aviso cada X horas
+SILENCIO_DESDE   = int(os.environ.get("SILENCIO_DESDE", "0") or 0)       # hora AR: de noche los avisos llegan sin sonido
+SILENCIO_HASTA   = int(os.environ.get("SILENCIO_HASTA", "8") or 8)
+RESUMEN_HORA     = int(os.environ.get("RESUMEN_HORA", "9") or 9)         # hora AR del resumen diario
+SUBA_ALERTA_PCT  = float(os.environ.get("SUBA_ALERTA_PCT", "15") or 15)  # subas del proveedor desde este % se avisan aparte
+APAGADO_AVISO_H  = float(os.environ.get("APAGADO_AVISO_H", "2") or 2)    # recordar si el scraping quedó apagado más de X horas
+
+def _ahora_ar():
+    return datetime.now(timezone.utc).replace(tzinfo=None) - timedelta(hours=3)
+
+def _es_silencio(h=None):
+    h = _ahora_ar().hour if h is None else h
+    a, b = SILENCIO_DESDE, SILENCIO_HASTA
+    if a == b: return False
+    return a <= h < b if a < b else (h >= a or h < b)
+
+def _dur(seg):
+    m = int(max(0, seg) // 60)
+    if m < 60: return f"{max(m, 1)} min"
+    if m < 1440: return f"{m // 60} h {m % 60} min" if m % 60 else f"{m // 60} h"
+    return f"{m // 1440} d {(m % 1440) // 60} h"
+
+def _hora_ar(ts):
+    return (datetime.fromtimestamp(ts, timezone.utc).replace(tzinfo=None) - timedelta(hours=3)).strftime("%H:%M")
+
+def leer_estado():
+    with _estado_lock:
+        try:
+            with open(ESTADO_FILE, "r", encoding="utf-8") as f: d = json.load(f)
+        except Exception: d = {}
+        d.setdefault("alertas", {}); d.setdefault("dia", {}); d.setdefault("ultimo_ciclo", {})
+        return d
+
+def _mod_estado(fn):
+    """Lee, modifica y guarda el estado de una vez (lo tocan varios hilos). Devuelve lo que devuelva fn."""
+    with _estado_lock:
+        d = leer_estado()
+        r = fn(d)
+        try:
+            with open(ESTADO_FILE + ".tmp", "w", encoding="utf-8") as f: json.dump(d, f, ensure_ascii=False, indent=1)
+            os.replace(ESTADO_FILE + ".tmp", ESTADO_FILE)
+        except Exception as e: print(f"❌ estado: {e}")
+        return r
+
+def alerta(clave, titulo, detalle="", grave=True):
+    """Avisa una falla UNA vez. Si sigue, la repite cada ALERTA_REPETIR_H horas (no cada ciclo).
+    Cuando se arregla, resolver(clave) avisa que volvió a andar."""
+    ahora = time.time()
+    def _f(d):
+        a = d["alertas"].get(clave)
+        if a and ahora - a.get("aviso", 0) < ALERTA_REPETIR_H * 3600:
+            a["detalle"] = detalle; return None
+        desde = a["desde"] if a else ahora
+        d["alertas"][clave] = {"titulo": titulo, "detalle": detalle, "desde": desde, "aviso": ahora, "grave": grave}
+        return desde
+    desde = _mod_estado(_f)
+    if desde is None: return
+    print(f"🚨 Alerta {clave}: {titulo}")
+    sigue = f"\nSigue pasando desde hace {_dur(ahora - desde)}." if ahora - desde > 120 else ""
+    tg(f"{'🚨' if grave else '⚠️'} *{_nt(titulo)}*" + (f"\n{detalle}" if detalle else "") + sigue)
+
+def resolver(clave, avisar=True):
+    a = _mod_estado(lambda d: d["alertas"].pop(clave, None))
+    if a and avisar:
+        tg(f"✅ *{_nt('Solucionado')}*: {a.get('titulo', '')}\nVolvió a andar (estuvo {_dur(time.time() - a.get('desde', time.time()))} con problemas).")
+
+# ══════════════════════════════════════════════════════════════════════════════
 # TEXTO DE AYUDA
 # ══════════════════════════════════════════════════════════════════════════════
 AYUDA = r"""📋 *Comandos disponibles:*
 
 /menu — Abre el panel de control con botones
+
+*Estado y avisos*
+/estado — Cómo está el bot: último ciclo, créditos y avisos pendientes
+_Los avisos de noche (00 a 08 hs) llegan sin sonido. A las 9 hs llega el resumen del día._
 
 *Sincronización*
 /sync\_total — Sincroniza precios y stock de todos los productos
@@ -295,7 +399,8 @@ def comerciapp_sync(lote, ocultar_nuevos=False):
     if not lote:
         return {"insertados":0,"actualizados":0,"errores":0,"total":0,"detalles":[]}
 
-    total = {"insertados":0,"actualizados":0,"errores":0,"total":0,"detalles":[],"primer_error":"","nuevos":[]}
+    total = {"insertados":0,"actualizados":0,"errores":0,"total":0,"detalles":[],"primer_error":"","nuevos":[],
+             "cambios_precio":0,"cambios_stock":0,"cambios_costo":0,"sin_stock":[],"con_stock":[],"ok_skus":[],"lotes_fallidos":0}
     partes = [lote[i:i+SYNC_CHUNK] for i in range(0, len(lote), SYNC_CHUNK)]
     hubo_ok = False
     for idx, parte in enumerate(partes, 1):
@@ -304,6 +409,7 @@ def comerciapp_sync(lote, ocultar_nuevos=False):
             # Sub-lote fallido: contarlo como errores para no perder el rastro
             total["errores"] += len(parte)
             total["total"]   += len(parte)
+            total["lotes_fallidos"] += 1
             print(f"   ⚠️ Sub-lote {idx}/{len(partes)} falló ({len(parte)} prods)")
             continue
         hubo_ok = True
@@ -311,6 +417,14 @@ def comerciapp_sync(lote, ocultar_nuevos=False):
         total["actualizados"] += res.get("actualizados", 0)
         total["errores"]      += res.get("errores", 0)
         total["total"]        += res.get("total", len(parte))
+        for k in ("cambios_precio", "cambios_stock", "cambios_costo"):
+            total[k] += res.get(k, 0) or 0
+        total["sin_stock"].extend(res.get("sin_stock") or [])
+        total["con_stock"].extend(res.get("con_stock") or [])
+        # SKU que quedaron bien en la web (para no reenviarlos si no cambian)
+        fallaron = {d.get("sku") for d in (res.get("detalles") or [])}
+        if (res.get("errores", 0) or 0) <= len(fallaron):
+            total["ok_skus"].extend(p["sku"] for p in parte if p.get("sku") not in fallaron)
         if res.get("detalles"):
             total["detalles"].extend(res["detalles"])
         if res.get("nuevos"):
@@ -321,15 +435,53 @@ def comerciapp_sync(lote, ocultar_nuevos=False):
     return total if hubo_ok else None
 
 def comerciapp_skus_existentes():
-    """Devuelve dict {sku: stock} de los productos RXZ- que ya existen en ComerciApp."""
-    if not comerciapp_ok(): return {}
+    """Devuelve dict {sku: stock} de los productos RXZ- que ya existen en ComerciApp (None si la web no respondió)."""
+    if not comerciapp_ok(): return None
     try:
         r = requests.get(f"{COMERCIAPP_API}/api/bot/skus", headers=_ca_headers(), timeout=40)
         if r.status_code == 200:
             return {row["sku"]: row.get("stock", 0) for row in r.json().get("skus", [])}
+        print(f"⚠️ ComerciApp skus HTTP {r.status_code}: {r.text[:150]}")
+        comerciapp_skus_existentes.error = f"HTTP {r.status_code}"
     except Exception as e:
         print(f"❌ ComerciApp skus: {e}")
-    return {}
+        comerciapp_skus_existentes.error = type(e).__name__
+    return None
+
+def salud_web():
+    """Créditos de los servicios de la web (Cloudinary). None si no responde."""
+    if not comerciapp_ok(): return None
+    try:
+        r = requests.get(f"{COMERCIAPP_API}/api/bot/salud", headers=_ca_headers(), timeout=30)
+        if r.status_code == 200: return r.json()
+    except Exception as e: print(f"❌ salud web: {e}")
+    return None
+
+_vendidos_cache = {"t": 0, "data": {}}
+def vendidos_30d():
+    """{sku: {nombre, unidades}} de los productos del proveedor vendidos en la web en 30 días (cache 1 h)."""
+    if not comerciapp_ok(): return {}
+    if time.time() - _vendidos_cache["t"] < 3600: return _vendidos_cache["data"]
+    try:
+        r = requests.get(f"{COMERCIAPP_API}/api/bot/vendidos", headers=_ca_headers(), params={"dias": 30}, timeout=30)
+        if r.status_code == 200:
+            _vendidos_cache["data"] = {p["sku"]: p for p in r.json().get("productos", []) if p.get("sku")}
+            _vendidos_cache["t"] = time.time()
+    except Exception as e: print(f"❌ vendidos: {e}")
+    return _vendidos_cache["data"]
+
+def enviar_latido():
+    """Le cuenta a la web que el bot sigue vivo. Si deja de llegar, la web avisa por Telegram
+    (el bot no puede avisar si está caído o si Railway lo frenó por falta de crédito)."""
+    if not comerciapp_ok(): return
+    try:
+        est = leer_estado()
+        datos = {"ultimo_ciclo": est.get("ultimo_ciclo", {}),
+                 "alertas": [a.get("titulo") for a in est.get("alertas", {}).values()]}
+        requests.post(f"{COMERCIAPP_API}/api/bot/latido", headers=_ca_headers(), timeout=20, json={
+            "scraping_activo": bool(leer_db().get("scraping_activo", False)), "ciclo_min": LATIDO_MIN,
+            "nombre": NOMBRE_TIENDA, "tg_token": TELEGRAM_TOKEN or "", "tg_chat": CHAT_ID or "", "datos": datos})
+    except Exception as e: print(f"⚠️ latido: {e}")
 
 def comerciapp_stock_cero(skus):
     """Pone stock 0 a una lista de SKU en ComerciApp (los que se cayeron del proveedor)."""
@@ -359,7 +511,7 @@ def tg_botones(texto, filas):
     if not TELEGRAM_TOKEN or not CHAT_ID: return
     try:
         requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage",
-            json={"chat_id": CHAT_ID, "text": texto, "parse_mode": "Markdown",
+            json={"chat_id": CHAT_ID, "text": texto, "parse_mode": "Markdown", "disable_notification": _es_silencio(),
                   "reply_markup": {"inline_keyboard": filas}}, timeout=15)
     except Exception as e: print(f"❌ Telegram botones: {e}")
 
@@ -370,7 +522,7 @@ def tg_foto_botones(url, caption, filas):
         try:
             r = requests.post(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendPhoto",
                 json={"chat_id": CHAT_ID, "photo": url, "caption": caption[:1000], "parse_mode": "Markdown",
-                      "reply_markup": {"inline_keyboard": filas}}, timeout=20)
+                      "disable_notification": _es_silencio(), "reply_markup": {"inline_keyboard": filas}}, timeout=20)
             if r.status_code == 200: return
         except Exception: pass
     tg_botones(caption, filas)
@@ -814,6 +966,37 @@ SCRAPERAPI_KEY  = _e("SCRAPERAPI_KEY")
 SCRAPERAPI_KEY2 = _e("SCRAPERAPI_KEY2")
 SCRAPERAPI_URL = "http://api.scraperapi.com"
 
+# Diagnóstico de cada ciclo: qué servicio falló y si parece falta de crédito (para avisar por Telegram).
+_diag = {}
+_RE_CREDITO = re.compile(r"balance|insufficient|credit|quota|traffic|saldo|余额|payment|expired|suspend", re.I)
+
+def _diag_falla(servicio, codigo=None, texto=""):
+    d = _diag.setdefault(servicio, {"fallas": 0})
+    d["fallas"] += 1
+    d["ultimo"] = ((f"HTTP {codigo}: " if codigo else "") + re.sub(r"\s+", " ", str(texto or "")))[:160].replace("`", "")
+    if codigo in (401, 402, 407) or _RE_CREDITO.search(f"{codigo or ''} {texto or ''}"):
+        d["credito"] = True
+
+def _diag_ok(servicio):
+    _diag.setdefault(servicio, {"fallas": 0})["ok"] = True
+    _diag["fuente"] = servicio
+
+def creditos_scraperapi():
+    """Uso de cada clave de ScraperAPI (es el último respaldo para leer el proveedor)."""
+    out = []
+    for i, k in enumerate([SCRAPERAPI_KEY, SCRAPERAPI_KEY2], 1):
+        if not k: continue
+        try:
+            r = requests.get(f"{SCRAPERAPI_URL}/account", params={"api_key": k}, timeout=20)
+            if r.status_code == 200:
+                j = r.json(); usado = int(j.get("requestCount") or 0); lim = int(j.get("requestLimit") or 0)
+                out.append({"key": i, "usado": usado, "limite": lim, "pct": round(usado * 100 / lim) if lim else None})
+            else:
+                out.append({"key": i, "error": f"HTTP {r.status_code}"})
+        except Exception as e:
+            out.append({"key": i, "error": type(e).__name__})
+    return out
+
 def _via_scraperapi(url, params=None):
     keys = [k for k in [SCRAPERAPI_KEY, SCRAPERAPI_KEY2] if k]
     if not keys:
@@ -830,11 +1013,15 @@ def _via_scraperapi(url, params=None):
             }, timeout=60)
             if r.status_code == 403 or (r.status_code == 200 and not r.text.strip()):
                 print(f"⚠️ ScraperAPI key {i} sin créditos o bloqueada, probando siguiente...")
+                _diag_falla("scraperapi", 403 if r.status_code == 403 else None, f"clave {i}: sin créditos o bloqueada " + (r.text or "")[:80])
+                if r.status_code == 403: _diag["scraperapi"]["credito"] = True
                 continue
             print(f"✅ ScraperAPI key {i} respondió HTTP {r.status_code}")
+            if r.status_code == 200: _diag_ok("scraperapi")
             return r
         except Exception as e:
             print(f"⚠️ ScraperAPI key {i}: {e}")
+            _diag_falla("scraperapi", None, f"clave {i}: {type(e).__name__}")
             continue
     print("❌ Todas las keys de ScraperAPI fallaron")
     return None
@@ -917,15 +1104,21 @@ def _via_thordata(url, params=None):
                               data={"url": target, "type": "html"}, timeout=90)
         except Exception as e:
             print(f"⚠️ ThorData (intento {intento+1}/2): {e}")
+            _diag_falla("thordata", None, type(e).__name__)
             time.sleep(3); continue
         if r.status_code != 200:
             print(f"⚠️ ThorData HTTP {r.status_code}: {(r.text or '')[:120]}")
+            _diag_falla("thordata", r.status_code, (r.text or "")[:200])
+            if r.status_code in (401, 402): break   # sin crédito o token inválido: no insistir
             time.sleep(2); continue
         crudo = _extraer_json(r.text)
         if crudo:
             print("✅ ThorData OK")
+            _diag_ok("thordata")
             return _ThorResp(200, crudo)
         print(f"⚠️ ThorData sin JSON util: {(r.text or '')[:120]}")
+        # Algunos errores de saldo vienen con HTTP 200 y un JSON de error
+        _diag_falla("thordata", None, "respuesta sin datos: " + (r.text or "")[:150])
         time.sleep(2)
     return None
 
@@ -952,6 +1145,7 @@ def _nueva_sesion_prov():
         return s, proxy
     except Exception as e:
         print(f"   ⚠️ No se pudo abrir sesion proveedor: {e}")
+        if proxy: _diag_falla("proxy", 407 if "407" in str(e) else (402 if "402" in str(e) else None), str(e))
         return None, None
 
 def _prov_get(url, params=None, usar_scraperapi=False):
@@ -989,11 +1183,15 @@ def _prov_get(url, params=None, usar_scraperapi=False):
                 print("⚠️ Rate limit proveedor"); time.sleep(3); continue
             if r.status_code == 403 and intento < MAX_INTENTOS - 1:
                 print(f"⚠️ Cloudflare 403 (intento {intento+1}/{MAX_INTENTOS}) — rotando IP + recalentando...")
+                _diag_falla("proxy", None, "Cloudflare 403")
                 _prov_cf_sess = None   # descartar IP quemada; la proxima abre otra
                 time.sleep(2); continue
+            if r.status_code in (200, 201): _diag_ok("proxy")
+            else: _diag_falla("proxy", r.status_code, "respuesta del proveedor")
             return r
         except Exception as e:
             print(f"⚠️ Proveedor API (intento {intento+1}/{MAX_INTENTOS}): {e}")
+            _diag_falla("proxy", 407 if "407" in str(e) else (402 if "402" in str(e) else None), str(e))
             _prov_cf_sess = None
             time.sleep(3)
     return None
@@ -1017,8 +1215,11 @@ def _categoria_excluida(cat_nombre, excluidas):
 def scrapear_proveedor(excluidas=None):
     if excluidas is None:
         excluidas = leer_db().get("categorias_excluidas", CATEGORIAS_EXCLUIDAS_DEFAULT)
-    productos = {}; pagina = 1; reintentos_202 = 0; via_scraperapi = False
+    productos = {}; pagina = 1; reintentos_202 = 0; via_scraperapi = False; vacias = 0; faltan_variantes = False
     categorias_vistas = set()  # todas las categorías que aparecen en el proveedor este ciclo
+    completo = False           # True solo si se leyeron TODAS las páginas
+    _diag.clear()
+    scrapear_proveedor.completo = False
     print("📥 API proveedor...")
     # Sesion nueva por ciclo: se abre con IP sticky y se calienta dentro de _prov_get
     global _prov_cf_sess
@@ -1041,13 +1242,18 @@ def scrapear_proveedor(excluidas=None):
                 continue
             if reintentos_202 >= 5:
                 print(f"❌ Proveedor HTTP 202 x{reintentos_202} - abortando scrape")
-                tg(f"⚠️ *{NOMBRE_TIENDA}* — Proveedor no responde (HTTP 202 x5{' incluso via ScraperAPI' if via_scraperapi else ''}). Reintentará en el próximo ciclo.")
+                _diag_falla("proveedor", 202, f"no responde (HTTP 202 x5{' incluso vía ScraperAPI' if via_scraperapi else ''})")
                 break
             espera = 30 if reintentos_202 <= 2 else 60
             print(f"⚠️ Proveedor HTTP 202 ({reintentos_202}/5) - reintentando en {espera}s...")
             time.sleep(espera)
             continue
         if not r.text or not r.text.strip():
+            vacias += 1
+            if vacias >= 3:   # antes reintentaba para siempre y trababa el bot
+                print(f"❌ Proveedor: {vacias} respuestas vacías en pág {pagina} — se corta (lectura incompleta)")
+                _diag_falla("proveedor", None, f"respuestas vacías en la página {pagina}")
+                break
             print(f"⚠️ Proveedor respuesta vacía en pág {pagina}, reintentando...")
             time.sleep(5)
             continue
@@ -1055,8 +1261,15 @@ def scrapear_proveedor(excluidas=None):
             lote = r.json()
         except Exception as e:
             print(f"⚠️ Proveedor JSON inválido pág {pagina}: {e}")
+            _diag_falla("proveedor", None, f"respuesta inválida en la página {pagina}")
             break
-        if not lote: break
+        if not isinstance(lote, list):
+            # Un sobre de error (ej. {"code":402,"data":[]}) no es "fin del catálogo"
+            print(f"⚠️ Proveedor: respuesta inesperada en pág {pagina} — se corta (lectura incompleta)")
+            _diag_falla("proveedor", None, f"respuesta inesperada en la página {pagina}: " + str(lote)[:100])
+            break
+        if not lote:
+            completo = True; break
 
         for p in lote:
             nombre_orig = p.get("name","").strip()
@@ -1092,12 +1305,12 @@ def scrapear_proveedor(excluidas=None):
                     vid = var_info.get("id")
                     if not vid: continue
                     rv = _prov_get(f"{PROV_API}/{vid}", usar_scraperapi=via_scraperapi)
-                    if not rv or rv.status_code != 200: continue
-                    if not rv.text or not rv.text.strip(): continue
+                    if not rv or rv.status_code != 200 or not rv.text or not rv.text.strip():
+                        faltan_variantes = True; continue
                     try:
                         vd = rv.json()
                     except Exception:
-                        continue
+                        faltan_variantes = True; continue
                     v_var_str   = vd.get("variation","")
                     v_nombre    = v_var_str.split(":",1)[1].strip() if ":" in v_var_str else v_var_str
                     v_precio    = _precio_real(vd)
@@ -1157,11 +1370,16 @@ def scrapear_proveedor(excluidas=None):
                 }
 
         print(f"   Pág {pagina}: {len(lote)} prods (total entradas: {len(productos)})")
-        if len(lote) < 100: break
+        if len(lote) < 100:
+            completo = True; break
         pagina += 1; time.sleep(0.5)
 
-    print(f"   ✅ {len(productos)} entradas del proveedor")
+    print(f"   ✅ {len(productos)} entradas del proveedor{'' if completo else ' (lectura INCOMPLETA)'}")
     scrapear_proveedor.ultimas_categorias = sorted(categorias_vistas)
+    if faltan_variantes and completo:
+        print("   ⚠️ Faltaron variantes: se toma como lectura incompleta (no se marca nada sin stock por faltante)")
+        completo = False
+    scrapear_proveedor.completo = completo
     return productos
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1601,8 +1819,119 @@ def notificar_orden_nueva(orden):
             msg += f"• *{item.get('name','?')}* x{item.get('quantity',1)}\n"
     tg(msg)
 
+_ciclo_lock = threading.Lock()
+RECONCILIAR_H = 6   # cada X horas se manda el catálogo completo a la web (por si algo quedó distinto); el resto, solo lo que cambió
+
+def _firma(p):
+    """Lo que importa comparar de un producto para saber si hay que mandarlo a la web."""
+    return f"{p.get('precio_base')}|{p.get('precio_oferta')}|{p.get('stock')}|{p.get('costo')}"
+
+_ciclo_desde = {"t": 0}
+
 def ciclo_monitoreo():
-    print(f"\n─── 🔄 Ciclo {datetime.now().strftime('%H:%M')} ───")
+    """Un ciclo completo. Devuelve False si ya había otro corriendo (no se pisan)."""
+    if not _ciclo_lock.acquire(blocking=False):
+        print("⏳ Ya hay un ciclo corriendo — se saltea.")
+        return False
+    _ciclo_desde["t"] = time.time()
+    try:
+        _ciclo_monitoreo()
+        return True
+    finally:
+        _ciclo_desde["t"] = 0
+        _ciclo_lock.release()
+        resolver("trabado")
+
+LATIDO_MIN = 10
+def hilo_latido():
+    """Cada 10 min: latido a la web (si deja de llegar ~45 min, la web avisa que el bot se cayó)
+    y aviso si un ciclo lleva demasiado tiempo corriendo (trabado)."""
+    while True:
+        try:
+            t = _ciclo_desde["t"]
+            if t and time.time() - t > 45 * 60:
+                alerta("trabado", "Un ciclo del bot está trabado",
+                       f"Lleva {_dur(time.time() - t)} corriendo (lo normal es 1 a 5 min). Si sigue así, reiniciá el bot en Railway.")
+            enviar_latido()
+        except Exception as e: print(f"⚠️ latido: {e}")
+        time.sleep(LATIDO_MIN * 60)
+
+def _registrar_ciclo(inicio, ok, motivo="", **extra):
+    def _f(e):
+        e["ultimo_ciclo"] = {"at": time.time(), "dur": round(time.time() - inicio), "ok": ok, "motivo": motivo,
+                             "fuente": _diag.get("fuente", ""), **extra}
+        dia = e["dia"]
+        dia["ciclos_ok" if ok else "ciclos_fallidos"] = dia.get("ciclos_ok" if ok else "ciclos_fallidos", 0) + 1
+    _mod_estado(_f)
+
+def _sumar_dia(**kw):
+    """Acumula números para el resumen diario."""
+    def _f(e):
+        dia = e["dia"]
+        for k, v in kw.items():
+            if isinstance(v, list): dia[k] = (dia.get(k) or []) + v
+            else: dia[k] = dia.get(k, 0) + v
+    _mod_estado(_f)
+
+def revisar_servicios_proveedor(hubo_datos):
+    """Después de leer el proveedor: avisa si ThorData / el proxy / ScraperAPI se quedaron sin crédito,
+    o si hace varios ciclos que no se puede leer el catálogo. Y avisa cuando vuelve a andar."""
+    d = {k: dict(v) for k, v in list(_diag.items()) if isinstance(v, dict)}
+    th, px, sc = d.get("thordata", {}), d.get("proxy", {}), d.get("scraperapi", {})
+    if THORDATA_TOKEN:
+        if th.get("credito") and not th.get("ok"):
+            alerta("thordata", "ThorData sin crédito o con la clave vencida",
+                   "Es el servicio que lee el catálogo del proveedor." +
+                   (" El bot siguió con el proxy residencial, que gasta más." if hubo_datos else "") +
+                   f"\nÚltimo error: {_md(th.get('ultimo', ''))}\nCargá saldo en ThorData o revisá `THORDATA_TOKEN` en Railway.")
+        elif th.get("ok"):
+            resolver("thordata")
+        # Falla por otro motivo varios ciclos seguidos (el bot sigue con el proxy, pero conviene saberlo)
+        n_th = _mod_estado(lambda e: e.__setitem__("fallos_thordata", 0 if th.get("ok") else e.get("fallos_thordata", 0) + (1 if th.get("fallas") else 0)) or e["fallos_thordata"])
+        if n_th >= 4 and not th.get("credito"):
+            alerta("thordata_falla", "ThorData viene fallando",
+                   f"Hace {n_th} ciclos que no responde bien" + (" y el bot usa el proxy residencial." if hubo_datos else ".") +
+                   f"\nÚltimo error: {_md(th.get('ultimo', ''))}", grave=False)
+        elif th.get("ok"):
+            resolver("thordata_falla")
+    if px.get("credito") and not px.get("ok"):
+        alerta("proxy", "Proxy residencial sin saldo o con datos inválidos",
+               f"Último error: {_md(px.get('ultimo', ''))}\nRevisá el saldo del proxy y `PROXY_USER` / `PROXY_PASS` en Railway.")
+    elif px.get("ok"):
+        resolver("proxy")
+    elif hubo_datos and not px:
+        resolver("proxy", avisar=False)   # no hizo falta usarlo: si sigue mal, avisa la próxima vez que se use
+    if sc.get("credito") and not sc.get("ok"):
+        alerta("scraperapi", "ScraperAPI sin créditos", "Es el último respaldo para leer el proveedor.", grave=False)
+    elif sc.get("ok"):
+        resolver("scraperapi")
+    elif hubo_datos and not sc:
+        resolver("scraperapi", avisar=False)
+    n = _mod_estado(lambda e: e.__setitem__("fallos_proveedor", 0 if hubo_datos else e.get("fallos_proveedor", 0) + 1) or e["fallos_proveedor"])
+    if hubo_datos:
+        resolver("proveedor")
+    elif n >= 2:
+        motivos = "\n".join(f"• {s}: {_md(v.get('ultimo', ''))}" for s, v in d.items() if v.get("ultimo"))
+        alerta("proveedor", "No puedo leer el catálogo del proveedor",
+               f"Van {n} ciclos seguidos sin datos (unos {n * CICLO_MINUTOS} min). La web queda con los últimos precios y stock."
+               + (f"\n{motivos}" if motivos else ""))
+
+def _bloque(titulo, lineas, max_lineas=15):
+    if not lineas: return ""
+    extra = f"\n_...y {len(lineas) - max_lineas} más_" if len(lineas) > max_lineas else ""
+    return f"\n\n*{titulo}*\n" + "\n".join(lineas[:max_lineas]) + extra
+
+def _pesos(n):
+    return "$" + f"{int(n):,}".replace(",", ".")
+
+def _pl(n, uno, varios):
+    return f"{n} {uno if n == 1 else varios}"
+
+FUENTES = {"thordata": "ThorData", "proxy": "proxy residencial", "scraperapi": "ScraperAPI"}
+
+def _ciclo_monitoreo():
+    inicio = time.time()
+    print(f"\n─── 🔄 Ciclo {_ahora_ar().strftime('%H:%M')} ───")
     db = leer_db()
 
     # ── Botón ON/OFF: si el scraping está apagado, no salir a RXZ ──
@@ -1615,54 +1944,59 @@ def ciclo_monitoreo():
 
     # 1) Traer catálogo del proveedor (fuente de verdad), filtrando categorías excluidas
     prov_nuevo = scrapear_proveedor(excluidas)
+    completo = bool(getattr(scrapear_proveedor, "completo", False)) and bool(prov_nuevo)
+    revisar_servicios_proveedor(bool(prov_nuevo))
     if not prov_nuevo:
-        if prov_ant:
-            print("⚠️ Proveedor sin datos — usando cache del último ciclo exitoso")
-            prov_nuevo = prov_ant
-        else:
-            print("⚠️ Proveedor 0 productos y sin cache. Abortando.")
-            tg(f"⚠️ *{_nt('Proveedor sin datos')}* — sin cache disponible. Se reintentará en el próximo ciclo.")
-            return
+        # Sin datos: no se toca la web (queda con lo último) y se reintenta el próximo ciclo
+        print("⚠️ Proveedor sin datos — la web queda con el último estado.")
+        _registrar_ciclo(inicio, False, "no se pudo leer el proveedor")
+        return
+    n_ref = db.get("ultimo_completo_n", 0)
+    if completo and n_ref and len(prov_nuevo) < n_ref * 0.7:
+        print(f"⚠️ El proveedor trajo {len(prov_nuevo)} productos (la última lectura completa trajo {n_ref}): se toma como incompleta.")
+        completo = False
+    n_inc = _mod_estado(lambda e: e.__setitem__("lecturas_incompletas", 0 if completo else e.get("lecturas_incompletas", 0) + 1) or e["lecturas_incompletas"])
+    if n_inc >= 4:
+        alerta("incompleta", "El catálogo del proveedor llega incompleto",
+               f"Hace {n_inc} ciclos que no llega entero ({len(prov_nuevo)} productos; la última lectura completa trajo {n_ref or '?'}). "
+               "Mientras tanto no se marca nada sin stock por faltante.", grave=False)
+    elif completo:
+        resolver("incompleta")
 
-    # Detección de CATEGORÍAS NUEVAS del proveedor
+    vendidos = vendidos_30d()   # {sku: {nombre, unidades}} — para avisar solo lo que importa
+    bloques = ""
+
+    # Categorías nuevas del proveedor
     cats_ahora = getattr(scrapear_proveedor, "ultimas_categorias", [])
     cats_conocidas = db.get("categorias_conocidas", [])
+    cats_guardar = sorted(set(cats_conocidas) | set(cats_ahora)) if cats_ahora else cats_conocidas
     if cats_conocidas:  # no avisar en el primer ciclo (todo sería "nuevo")
         cats_nuevas = [c for c in cats_ahora if c not in cats_conocidas]
         if cats_nuevas:
-            excl_txt = ""
-            nuevas_excluidas = [c for c in cats_nuevas if _categoria_excluida(c, excluidas)]
-            nuevas_incluidas = [c for c in cats_nuevas if not _categoria_excluida(c, excluidas)]
-            msg = f"🆕 *{_nt('Categorías nuevas en el proveedor')}*\n\n"
-            if nuevas_incluidas:
-                msg += "✅ Se van a cargar:\n" + "\n".join(f"• {c}" for c in nuevas_incluidas) + "\n"
-            if nuevas_excluidas:
-                msg += "\n🚫 Excluidas (no se cargan):\n" + "\n".join(f"• {c}" for c in nuevas_excluidas)
-            tg(msg)
-    if cats_ahora:
-        db["categorias_conocidas"] = sorted(set(cats_conocidas) | set(cats_ahora))
+            lin = [f"• {_md(c)}" + (" (excluida, no se carga)" if _categoria_excluida(c, excluidas) else "") for c in cats_nuevas]
+            bloques += _bloque("🆕 Categorías nuevas en el proveedor", lin)
 
     prov_consolidado = {**prov_ant, **prov_nuevo}
 
-    # 2) Detectar OFERTAS nuevas y VARIACIONES (comparando proveedor vs proveedor) → alertas Telegram
+    # 2) Ofertas nuevas, stock bajo y cambios de precio (comparando con el ciclo anterior del proveedor)
     ofertas_nuevas = {}
     lineas_stock_bajo = []
     for clave, datos in prov_nuevo.items():
         viejo = prov_ant.get(clave, {})
-        # Oferta nueva
-        if datos.get("en_oferta") and datos.get("precio_anterior", 0) > datos["precio"] and not viejo.get("en_oferta", False):
+        if datos.get("en_oferta") and datos.get("precio_anterior", 0) > datos["precio"] and viejo and not viejo.get("en_oferta", False):
             base = datos.get("nombre_base_proveedor", clave)
             if base not in ofertas_nuevas:
                 ofertas_nuevas[base] = datos
-        # Stock bajo en proveedor
-        stock = datos.get("stock", 0)
-        if isinstance(stock, (int, float)) and 0 < stock <= ALERTA_STOCK and stock < 9999:
-            lineas_stock_bajo.append(f"• *{datos['nombre_real']}*: {int(stock)} unidad{'es' if stock > 1 else ''}")
+        # Stock bajo: solo cuando RECIÉN baja (no cada ciclo) y solo de lo que se vende
+        sku = f"RXZ-{datos.get('woo_id')}"
+        stock, stock_ant = datos.get("stock", 0) or 0, viejo.get("stock", 0) or 0
+        if viejo and sku in vendidos and 0 < stock <= ALERTA_STOCK < stock_ant and stock < 9999:
+            lineas_stock_bajo.append(f"• {_md(datos['nombre_real'])}: quedan {int(stock)} (vendiste {vendidos[sku].get('unidades', 0)} en 30 días)")
 
     # 3) Armar el LOTE para ComerciApp (upsert por SKU = RXZ-{woo_id})
     lote = []
-    skus_con_stock = set()
-    cambios_precio = []   # para alerta Telegram
+    cambios_precio, subas_fuertes = [], []
+    n_subas = n_bajas = 0
     for clave, datos in prov_nuevo.items():
         woo_id = datos.get("woo_id")
         if not woo_id:
@@ -1685,7 +2019,7 @@ def ciclo_monitoreo():
 
         envio_gratis = precio_venta >= ENVIO_GRATIS_MIN and int(woo_id) not in PRODUCTOS_PESADOS_IDS
 
-        prod_lote = {
+        lote.append({
             "sku": sku,
             "nombre": datos.get("nombre_real", ""),
             "precio_base": precio_base,
@@ -1701,91 +2035,292 @@ def ciclo_monitoreo():
             "largo": datos.get("largo", 0),
             "envio_gratis": envio_gratis,
             "costo": costo,   # lo que cobra rxz → precio de costo en la web (ganancia real en el dashboard)
-        }
-        lote.append(prod_lote)
-        if stock and stock > 0:
-            skus_con_stock.add(sku)
+        })
 
-        # Alerta de cambio de precio (comparando con el ciclo anterior del proveedor)
-        viejo = prov_ant.get(clave, {})
-        costo_viejo = viejo.get("precio", 0)
+        # Cambio de precio del proveedor (comparando con el ciclo anterior)
+        costo_viejo = prov_ant.get(clave, {}).get("precio", 0)
         if costo_viejo and costo_viejo != costo:
             pv_viejo = precio_obj(costo_viejo)
-            if pv_viejo != precio_venta:
-                flecha = "🔼" if precio_venta > pv_viejo else "🔽"
-                cambios_precio.append(f"{flecha} *{datos['nombre_real']}*: ${pv_viejo:,} → ${precio_venta:,}")
+            if pv_viejo != precio_venta and pv_viejo > 0:
+                pct = (precio_venta - pv_viejo) * 100 / pv_viejo
+                linea = f"{'🔼' if pct > 0 else '🔽'} {_md(datos['nombre_real'])}: {_pesos(pv_viejo)} → {_pesos(precio_venta)} ({pct:+.0f}%)"
+                if pct > 0: n_subas += 1
+                else: n_bajas += 1
+                if datos.get("nombre_base_proveedor", clave) in ofertas_nuevas:
+                    pass   # ya sale en "Ofertas nuevas"
+                elif pct >= SUBA_ALERTA_PCT:
+                    vend = vendidos.get(sku)
+                    subas_fuertes.append(linea + (f" · vendiste {vend.get('unidades', 0)} en 30 días" if vend else ""))
+                else:
+                    cambios_precio.append(linea)
 
-    # 4) Enviar el lote a ComerciApp. Lo NUEVO entra oculto y se pide aprobación por Telegram
-    #    (salvo en la primera carga, con la web casi vacía, que se publica directo).
+    # 4) Mandar a la web SOLO lo que cambió (y cada RECONCILIAR_H horas, todo)
     skus_web = comerciapp_skus_existentes()
+    if skus_web is None:
+        n = _mod_estado(lambda e: e.__setitem__("fallos_web", e.get("fallos_web", 0) + 1) or e["fallos_web"])
+        if n >= 2:
+            alerta("web", "No puedo conectarme con la web",
+                   f"Van {n} ciclos sin poder actualizar la web ({_md(getattr(comerciapp_skus_existentes, 'error', '') or 'sin respuesta')}). "
+                   "Revisá el servicio de la API en Railway.")
+        _registrar_ciclo(inicio, False, "la web no responde", productos=len(prov_nuevo))
+        return   # no se guarda el proveedor: los cambios se avisan cuando la web vuelva
+    enviado = db.get("enviado_web", {})
+    reconciliar = (time.time() - db.get("reconciliado_at", 0) > RECONCILIAR_H * 3600) or not enviado
+    lote_envio = [p for p in lote if reconciliar or p["sku"] not in skus_web or enviado.get(p["sku"]) != _firma(p)
+                  or (skus_web.get(p["sku"]) or 0) != p["stock"]]   # ej. la web descontó una venta: vuelve al stock del proveedor
     ocultar_nuevos = bool(db.get("aprobar_nuevos", True)) and len(skus_web) >= 20
-    resumen = None
-    if lote:
-        resumen = comerciapp_sync(lote, ocultar_nuevos)
-        if resumen:
-            print(f"   ✅ ComerciApp: {resumen.get('insertados',0)} nuevos, {resumen.get('actualizados',0)} actualizados, {resumen.get('errores',0)} errores")
-            # Si hubo muchos errores, mostrar el detalle (el backend manda hasta 10 ejemplos)
-            if resumen.get('errores', 0) > 0:
-                pe = resumen.get('primer_error', '')
-                ejemplos = (resumen.get('detalles') or [])[:3]
-                txt = "\n".join([f"• `{d.get('sku','?')}`: {d.get('error','?')}" for d in ejemplos])
-                msg = f"⚠️ *{_nt('Errores al cargar en la web')}* ({resumen.get('errores')} de {resumen.get('total')})\n"
-                if pe: msg += f"\nError principal:\n`{pe}`\n"
-                if txt: msg += f"\nEjemplos:\n{txt}"
-                tg(msg)
+    resumen = {"insertados": 0, "actualizados": 0, "errores": 0, "ok_skus": [], "sin_stock": [], "con_stock": [], "nuevos": []}
+    web_ok = True
+    if lote_envio:
+        print(f"   📤 A la web: {len(lote_envio)} de {len(lote)} productos{' (reconciliación completa)' if reconciliar else ' (solo los que cambiaron)'}")
+        r = comerciapp_sync(lote_envio, ocultar_nuevos)
+        if r is None:
+            web_ok = False
+            n = _mod_estado(lambda e: e.__setitem__("fallos_web", e.get("fallos_web", 0) + 1) or e["fallos_web"])
+            if n >= 2:
+                alerta("web", "No puedo actualizar la web", f"Van {n} ciclos en que la web no acepta los cambios. Revisá el servicio de la API en Railway.")
         else:
-            tg(f"⚠️ *{_nt('Error sincronizando con la web')}* — el lote no se pudo enviar. Reintentará en el próximo ciclo.")
+            resumen = r
+            print(f"   ✅ ComerciApp: {r.get('insertados',0)} nuevos, {r.get('actualizados',0)} con cambios, {r.get('errores',0)} errores")
+            if r.get("errores", 0) > 0:
+                pe = r.get("primer_error", "")
+                ejemplos = "\n".join(f"• {_md(d.get('sku','?'))}: {_md(d.get('error','?'))}" for d in (r.get("detalles") or [])[:3])
+                alerta("web_errores", f"La web rechazó {r.get('errores')} productos",
+                       (f"Error principal: {_md(pe)}\n" if pe else "") + ejemplos, grave=False)
+            else:
+                resolver("web_errores")
+    else:
+        print(f"   ✅ Sin cambios para la web ({len(lote)} productos iguales)")
+    if web_ok:
+        _mod_estado(lambda e: e.__setitem__("fallos_web", 0))
+        resolver("web")
+    for sku in resumen.get("ok_skus", []):
+        p = next((x for x in lote_envio if x["sku"] == sku), None)
+        if p: enviado[sku] = _firma(p)
 
-    # 5) Productos que se CAYERON del proveedor → stock 0 en la web
-    caidos = []
-    if skus_web:
+    # 5) Productos que se CAYERON del proveedor → stock 0 en la web (solo si la lectura fue completa)
+    caidos, afectados = [], 0
+    if completo and skus_web:
         skus_proveedor = {f"RXZ-{d.get('woo_id')}" for d in prov_nuevo.values() if d.get("woo_id")}
-        for sku, stock_web in skus_web.items():
-            if sku not in skus_proveedor and (stock_web or 0) > 0:
-                caidos.append(sku)
+        caidos = [sku for sku, stock_web in skus_web.items() if sku not in skus_proveedor and (stock_web or 0) > 0]
+        con_stock_web = sum(1 for v in skus_web.values() if (v or 0) > 0)
+        forzar = bool(db.get("forzar_caidos"))
+        if len(caidos) > max(20, con_stock_web * 0.15) and not forzar:
+            # Demasiados faltantes de golpe: más probable una lectura rara que un cambio real. No se toca nada.
+            alerta("caidos", "Muchos productos desaparecieron del proveedor de golpe",
+                   f"Faltan {len(caidos)} de {con_stock_web} con stock. Por seguridad NO los marqué sin stock. "
+                   "Si es real (el proveedor los sacó), mandá /forzar\\_caidos y en el próximo ciclo se marcan.", grave=False)
+            caidos = []
+        elif caidos or completo:
+            resolver("caidos", avisar=False)
         if caidos:
             afectados = comerciapp_stock_cero(caidos)
+            for sku in caidos: enviado.pop(sku, None)
             print(f"   📉 {afectados} productos caídos del proveedor → stock 0")
+    elif not completo:
+        print("   ⚠️ Lectura incompleta del proveedor: no se marca nada sin stock por faltante.")
 
-    # 6) Notificaciones Telegram
+    # 6) Un solo mensaje por ciclo, y solo si hay algo que contar
+    partes = []
+    n_cambios = resumen.get("actualizados", 0) or 0
+    if n_cambios:
+        det = [f"{resumen[k]} de {t}" for k, t in (("cambios_stock", "stock"), ("cambios_precio", "precio"), ("cambios_costo", "costo")) if resumen.get(k)]
+        partes.append(f"🔄 {n_cambios} {'producto actualizado' if n_cambios == 1 else 'productos actualizados'}" + (f" ({', '.join(det)})" if det else ""))
+    if resumen.get("insertados"):
+        partes.append(f"🆕 {resumen['insertados']} nuevos" + (" (ocultos, esperan tu aprobación)" if ocultar_nuevos else ""))
+    if afectados:
+        partes.append(f"📉 {afectados} sin stock (ya no están en el proveedor)")
+
+    # Lo que se vende y se quedó sin stock / volvió (lo demás va al resumen diario)
+    sin_stock_vend = [x for x in resumen.get("sin_stock", []) if x.get("sku") in vendidos]
+    sin_stock_vend += [{"sku": s, "nombre": vendidos[s].get("nombre", s)} for s in caidos if s in vendidos]
+    con_stock_vend = [x for x in resumen.get("con_stock", []) if x.get("sku") in vendidos]
+    bloques += _bloque(f"🚨 Subas fuertes del proveedor ({SUBA_ALERTA_PCT:.0f}% o más)", subas_fuertes)
+    bloques += _bloque("⛔ Sin stock en el proveedor (los vendiste en los últimos 30 días)",
+                       [f"• {_md(x.get('nombre'))} (vendiste {vendidos.get(x['sku'], {}).get('unidades', 0)})" for x in sin_stock_vend])
+    bloques += _bloque("📦 Quedan pocas unidades en el proveedor", lineas_stock_bajo)
+    bloques += _bloque("✅ Volvieron a tener stock", [f"• {_md(x.get('nombre'))}" for x in con_stock_vend])
+    bloques += _bloque("💲 Cambios de precio", cambios_precio)
     if ofertas_nuevas:
-        db["ofertas_pendientes"] = ofertas_nuevas
-        nums = [f"{i+1}. *{d['nombre_real']}*\n   Reg: ${d.get('precio_anterior',0):,} → 🔥 ${d['precio']:,}"
-                for i, (k, d) in enumerate(ofertas_nuevas.items())]
-        tg(f"🏷️ *{_nt('Ofertas nuevas del Proveedor')}*\n\n" + "\n".join(nums))
-    for i in range(0, len(cambios_precio), 20):
-        tg(f"💲 *{_nt('Precios actualizados:')}*\n\n" + "\n".join(cambios_precio[i:i+20]))
-    if lineas_stock_bajo:
-        for i in range(0, len(lineas_stock_bajo), 30):
-            tg(f"⚠️ *{_nt('Stock bajo en proveedor:')}*\n\n" + "\n".join(lineas_stock_bajo[i:i+30]))
-    if resumen and ocultar_nuevos and resumen.get("nuevos"):
-        try: avisar_nuevos(resumen["nuevos"])
-        except Exception as e: print(f"⚠️ avisar_nuevos: {e}")
-    if resumen:
-        partes = []
-        if resumen.get("insertados"): partes.append(f"🆕 {resumen['insertados']} nuevos" + (" (ocultos, esperan aprobación)" if ocultar_nuevos else ""))
-        if resumen.get("actualizados"): partes.append(f"🔄 {resumen['actualizados']} actualizados")
-        if caidos: partes.append(f"📉 {len(caidos)} sin stock")
-        if partes:
-            tg(f"✅ *{_nt('Sync web')}*\n" + " | ".join(partes))
+        bloques += _bloque("🏷️ Ofertas nuevas del proveedor",
+                           [f"{i+1}. {_md(d['nombre_real'])}: {_pesos(precio_obj(d.get('precio_anterior', 0)))} → {_pesos(precio_obj(d['precio']))}"
+                            for i, d in enumerate(ofertas_nuevas.values())])
 
-    if not any([ofertas_nuevas, cambios_precio, lineas_stock_bajo, caidos]):
-        print("✅ Sin cambios relevantes.")
-
-    # 7) Guardar estado
-    db["productos_proveedor"] = prov_consolidado
-    escribir_db(db)
-
-    # 8) Fotos nuevas (o rotas) del proveedor → Cloudinary, con tope de tiempo por ciclo
+    # Fotos nuevas (o rotas) del proveedor → Cloudinary, con tope de tiempo por ciclo
+    n_fotos = 0
     if FOTOS_SEG_POR_CICLO > 0:
         try:
             rf = reparar_fotos(tiempo_max=FOTOS_SEG_POR_CICLO)
             if rf and rf.get("ok"):
+                n_fotos = rf["ok"]
                 print(f"   📸 {rf['ok']} fotos subidas a Cloudinary (quedan {rf['pendientes']})")
-                tg(f"📸 *{_nt('Fotos subidas a la web')}*: {rf['ok']}" + (f" (quedan {rf['pendientes']}, sigue en el próximo ciclo)" if rf['pendientes'] else ""))
+                partes.append(f"📸 {rf['ok']} fotos subidas" + (f" (quedan {rf['pendientes']})" if rf['pendientes'] else ""))
+                resolver("fotos")
+            elif rf and rf.get("fallidas", 0) >= 10:
+                top = sorted(rf.get("motivos", {}).items(), key=lambda x: -x[1])[:3]
+                alerta("fotos", "No se pueden subir las fotos del proveedor a la web",
+                       f"{rf['fallidas']} fallaron este ciclo.\n" + "\n".join(f"• {_md(k)}: {v}" for k, v in top), grave=False)
         except Exception as e:
             print(f"⚠️ Fotos: {e}")
+
+    if bloques or resumen.get("insertados"):
+        tg(f"🔄 *{_nt('Novedades ' + _ahora_ar().strftime('%H:%M'))}*\n" + " | ".join(partes) + bloques)
+    else:
+        print(f"✅ Sin novedades para avisar ({' | '.join(partes) or 'sin cambios'}).")
+    if resumen.get("nuevos") and ocultar_nuevos:
+        try: avisar_nuevos(resumen["nuevos"])
+        except Exception as e: print(f"⚠️ avisar_nuevos: {e}")
+
+    # 7) Guardar estado. Se relee la DB para no pisar lo que cambió mientras corría el ciclo (ej. /apagar).
+    db2 = leer_db()
+    db2["productos_proveedor"] = prov_nuevo if completo else prov_consolidado
+    db2["categorias_conocidas"] = cats_guardar
+    db2["enviado_web"] = enviado
+    if reconciliar and lote_envio and web_ok and not resumen.get("lotes_fallidos"):
+        db2["reconciliado_at"] = time.time()
+    if completo:
+        db2["ultimo_completo_n"] = len(prov_nuevo)
+    if caidos:
+        db2.pop("forzar_caidos", None)
+    if ofertas_nuevas:
+        db2["ofertas_pendientes"] = ofertas_nuevas
+    escribir_db(db2)
+
+    _sumar_dia(cambios_stock=resumen.get("cambios_stock", 0) or 0, cambios_precio=resumen.get("cambios_precio", 0) or 0,
+               subas=n_subas, bajas=n_bajas, subas_fuertes=len(subas_fuertes), nuevos=resumen.get("insertados", 0) or 0,
+               sin_stock=len(resumen.get("sin_stock", [])) + afectados, con_stock=len(resumen.get("con_stock", [])),
+               ofertas=len(ofertas_nuevas), fotos=n_fotos,
+               sin_stock_vendidos=[x.get("nombre") for x in sin_stock_vend][:20])
+    _registrar_ciclo(inicio, True, "" if completo else "lectura incompleta del proveedor", productos=len(prov_nuevo),
+                     enviados=len(lote_envio), cambios=n_cambios, nuevos=resumen.get("insertados", 0) or 0)
     print("─── ✅ Ciclo completado ───")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# TAREAS PERIÓDICAS: créditos, resumen diario, recordatorio de scraping apagado
+# ══════════════════════════════════════════════════════════════════════════════
+CREDITOS_CADA_H = 6
+
+def chequear_creditos():
+    """Créditos de los servicios pagos. Avisa antes de que se terminen (Cloudinary 75% y 90%, ScraperAPI 90%)."""
+    s = salud_web()
+    cl = (s or {}).get("cloudinary") or {}
+    if cl.get("error"):
+        alerta("cloudinary_error", "No pude consultar el crédito de Cloudinary", _md(cl["error"]), grave=False)
+    elif cl.get("limite"):
+        resolver("cloudinary_error", avisar=False)
+        pct = float(cl.get("pct") or 0)
+        txt = f"Va {pct:.0f}% del plan del mes ({cl.get('usado', 0):.1f} de {cl.get('limite', 0):.0f} créditos)."
+        if pct >= 90:
+            resolver("cloudinary_medio", avisar=False)
+            alerta("cloudinary_alto", f"Cloudinary casi sin crédito ({pct:.0f}%)",
+                   txt + " Si se termina, las fotos nuevas no se suben y las de la web pueden dejar de verse.")
+        elif pct >= 75:
+            resolver("cloudinary_alto", avisar=False)
+            alerta("cloudinary_medio", f"Cloudinary al {pct:.0f}% del plan", txt, grave=False)
+        else:
+            resolver("cloudinary_alto"); resolver("cloudinary_medio")
+    sc = creditos_scraperapi()
+    for k in sc:
+        clave = f"scraperapi_{k['key']}"
+        if k.get("pct") is not None and k["pct"] >= 90:
+            alerta(clave, f"ScraperAPI (clave {k['key']}) casi sin créditos",
+                   f"Usó {k['usado']} de {k['limite']} pedidos del mes. Es el último respaldo para leer el proveedor.", grave=False)
+        elif k.get("pct") is not None:
+            resolver(clave)
+    _mod_estado(lambda e: e.update({"creditos_at": time.time(), "creditos": {"cloudinary": cl, "scraperapi": sc}}))
+    return cl, sc
+
+def _linea_creditos(cl):
+    if not cl: return "Cloudinary: sin datos"
+    if cl.get("error"): return f"Cloudinary: no se pudo consultar ({_md(cl['error'])})"
+    if not cl.get("limite"): return "Cloudinary: sin datos"
+    return f"Cloudinary: {float(cl.get('pct') or 0):.0f}% del plan del mes"
+
+def _lineas_alertas(est):
+    al = est.get("alertas", {})
+    if not al: return "Nada pendiente de revisar."
+    return "\n".join(f"{'🚨' if a.get('grave') else '⚠️'} {a.get('titulo')} (desde las {_hora_ar(a.get('desde', time.time()))})"
+                     for a in sorted(al.values(), key=lambda a: a.get("desde", 0)))
+
+def resumen_diario():
+    """A las RESUMEN_HORA (hora AR) manda lo que pasó desde el resumen anterior. Sirve también de 'el bot está vivo'."""
+    est = leer_estado()
+    hoy = _ahora_ar().strftime("%Y-%m-%d")
+    if not est.get("resumen_fecha"):
+        # Recién arrancado (deploy): el próximo resumen sale mañana con datos de verdad
+        _mod_estado(lambda e: e.update({"resumen_fecha": hoy if _ahora_ar().hour >= RESUMEN_HORA else (_ahora_ar() - timedelta(days=1)).strftime("%Y-%m-%d")}))
+        return
+    if _ahora_ar().hour < RESUMEN_HORA or est.get("resumen_fecha") == hoy:
+        return
+    dia = est.get("dia", {})
+    pend = comerciapp_pendientes()
+    cl, _sc = chequear_creditos()
+    est = leer_estado()
+    activo = leer_db().get("scraping_activo", False)
+    uc = est.get("ultimo_ciclo", {})
+    sv = [n for n in (dia.get("sin_stock_vendidos") or []) if n]
+    lineas = [
+        f"• Ciclos: {dia.get('ciclos_ok', 0)} bien" + (f", {dia['ciclos_fallidos']} con problemas" if dia.get("ciclos_fallidos") else ""),
+        f"• Cambios en la web: {dia.get('cambios_stock', 0)} de stock, {dia.get('cambios_precio', 0)} de precio",
+        f"• Precios del proveedor: {_pl(dia.get('subas', 0), 'suba', 'subas')}" + (f" ({_pl(dia['subas_fuertes'], 'fuerte', 'fuertes')})" if dia.get("subas_fuertes") else "") + f", {_pl(dia.get('bajas', 0), 'baja', 'bajas')}",
+        f"• Productos nuevos: {dia.get('nuevos', 0)}" + (f" · {len(pend)} esperan tu aprobación (/pendientes)" if pend else ""),
+        f"• Se quedaron sin stock: {dia.get('sin_stock', 0)}" + (f" — de los que vendés: {', '.join(_md(n) for n in sv[:8])}" if sv else ""),
+        f"• Volvieron a tener stock: {dia.get('con_stock', 0)}",
+    ]
+    if dia.get("ofertas"): lineas.append(f"• Ofertas nuevas del proveedor: {dia['ofertas']}")
+    if dia.get("fotos"): lineas.append(f"• Fotos subidas a la web: {dia['fotos']}")
+    estado = (f"Scraping {'encendido' if activo else 'APAGADO (mandá /encender)'}"
+              + (f" · último ciclo {_hora_ar(uc['at'])} {'bien' if uc.get('ok') else 'con problemas'}" if uc.get("at") else ""))
+    tg(f"☀️ *{_nt('Resumen del día')}*\n\n" + "\n".join(lineas) +
+       f"\n\n*Estado*\n{estado}\n{_linea_creditos(cl)}\n\n*Para revisar*\n{_lineas_alertas(est)}", silencioso=False)
+    _mod_estado(lambda e: e.update({"resumen_fecha": hoy, "dia": {}}))
+
+def recordar_scraping_apagado():
+    activo = leer_db().get("scraping_activo", False)
+    if activo:
+        _mod_estado(lambda e: e.pop("apagado_desde", None))
+        resolver("apagado", avisar=False)
+        return
+    desde = _mod_estado(lambda e: e.setdefault("apagado_desde", time.time()))
+    if time.time() - desde > APAGADO_AVISO_H * 3600:
+        alerta("apagado", "El scraping está apagado",
+               f"Hace {_dur(time.time() - desde)} que el bot no sincroniza con el proveedor (después de cada deploy arranca apagado). "
+               "Mandá /encender. Si lo apagaste a propósito, ignorá este aviso.", grave=False)
+
+def tareas_periodicas():
+    for f in (recordar_scraping_apagado, resumen_diario):
+        try: f()
+        except Exception as e: print(f"⚠️ {f.__name__}: {e}")
+    try:
+        if time.time() - leer_estado().get("creditos_at", 0) > CREDITOS_CADA_H * 3600:
+            chequear_creditos()
+    except Exception as e: print(f"⚠️ créditos: {e}")
+
+def texto_estado():
+    est = leer_estado()
+    db = leer_db()
+    activo = db.get("scraping_activo", False)
+    uc = est.get("ultimo_ciclo", {})
+    cl, sc = chequear_creditos()
+    est = leer_estado()
+    lin = [f"*{_nt('Estado del bot')}*", "",
+           f"• Scraping: {'▶️ encendido, cada ' + str(CICLO_MINUTOS) + ' min' if activo else '⏸️ APAGADO (mandá /encender)'}"]
+    if uc.get("at"):
+        lin.append(f"• Último ciclo: {_hora_ar(uc['at'])} (hace {_dur(time.time() - uc['at'])}) · "
+                   f"{'bien' if uc.get('ok') else 'con problemas: ' + _md(uc.get('motivo', ''))} · tardó {_dur(uc.get('dur', 0)) if uc.get('dur', 0) >= 60 else str(uc.get('dur', 0)) + ' s'}")
+        if uc.get("productos"):
+            lin.append(f"• Proveedor: {uc['productos']} productos" + (f" vía {FUENTES.get(uc['fuente'], uc['fuente'])}" if uc.get("fuente") else "")
+                       + f" · a la web: {uc.get('enviados', 0)} enviados, {uc.get('cambios', 0)} con cambios")
+    else:
+        lin.append("• Último ciclo: todavía no corrió desde que arrancó el bot")
+    lin.append(f"• Web: {'✅ conectada' if comerciapp_ok() else '❌ falta `COMERCIAPP_API` / `BOT_API_KEY`'}")
+    lin.append(f"• Proveedor en memoria: {len(db.get('productos_proveedor', {}))} productos")
+    lin.append(f"• {_linea_creditos(cl)}")
+    for k in sc:
+        if k.get("pct") is not None: lin.append(f"• ScraperAPI clave {k['key']}: {k['pct']}% usado")
+    lin.append(f"• Avisos sin sonido de {SILENCIO_DESDE:02d} a {SILENCIO_HASTA:02d} hs · resumen diario {RESUMEN_HORA:02d} hs")
+    lin += ["", "*Para revisar*", _lineas_alertas(est)]
+    return "\n".join(lin)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # COMPRAS AUTOMÁTICAS AL PROVEEDOR
@@ -2261,7 +2796,7 @@ def tg_menu():
             [{"text": "▶️ Encender scraping", "callback_data": "/encender"},
              {"text": "⏸️ Apagar scraping", "callback_data": "/apagar"}],
             [{"text": "🔁 Ciclo Manual", "callback_data": "/ciclo"},
-             {"text": "📊 Estado", "callback_data": "/estado_scraping"}],
+             {"text": "📊 Estado", "callback_data": "/estado"}],
             [{"text": "🔬 Test Proxy", "callback_data": "/test_proxy"}],
             [{"text": "📂 Ver Categorías", "callback_data": "/ver_categorias"}],
             [{"text": "🆕 Productos nuevos por aprobar", "callback_data": "/pendientes"}],
@@ -2504,24 +3039,24 @@ def procesar_cmd(texto):
 
     if cmd[0] == "/encender":
         db = leer_db(); db["scraping_activo"] = True; escribir_db(db)
+        recordar_scraping_apagado()
         tg(f"▶️ *Scraping ENCENDIDO* — el bot va a sincronizar cada {CICLO_MINUTOS} min.\n\nCorriendo un ciclo ahora...")
-        try: ciclo_monitoreo()
-        except Exception as e: tg(f"⚠️ Error en el ciclo: `{e}`")
+        def _encender():
+            try:
+                if ciclo_monitoreo() is False: tg("ℹ️ Ya había un ciclo corriendo: sigue ese.")
+            except Exception as e: tg(f"⚠️ Error en el ciclo: `{e}`")
+        threading.Thread(target=_encender, daemon=True).start()   # no frena los botones mientras corre
+        return
+    elif cmd[0] in ("/estado", "/estado_scraping"):
+        tg(texto_estado(), silencioso=True)
+        return
+    elif cmd[0] == "/forzar_caidos":
+        db = leer_db(); db["forzar_caidos"] = True; escribir_db(db)
+        tg("✅ En el próximo ciclo se marcan sin stock los productos que ya no están en el proveedor, aunque sean muchos.")
         return
     elif cmd[0] == "/apagar":
         db = leer_db(); db["scraping_activo"] = False; escribir_db(db)
         tg("⏸️ *Scraping APAGADO* — no va a salir al proveedor hasta que lo enciendas con /encender.\n\nUsalo antes de deployar cambios del bot para no bloquear RXZ.")
-        return
-    elif cmd[0] == "/estado_scraping":
-        db = leer_db()
-        activo = db.get("scraping_activo", False)
-        n_prov = len(db.get("productos_proveedor", {}))
-        web_ok = "✅ configurada" if comerciapp_ok() else "❌ falta COMERCIAPP_API / BOT_API_KEY"
-        tg(f"{'▶️ ENCENDIDO' if activo else '⏸️ APAGADO'}\n\n"
-           f"• Proveedor en cache: {n_prov} productos\n"
-           f"• Web ComerciApp: {web_ok}\n"
-           f"• Margen: {MARGEN} (~{round((1-MARGEN)*100)}% ganancia)\n"
-           f"• Ciclo: cada {CICLO_MINUTOS} min")
         return
     elif cmd[0] == "/ver_categorias":
         db = leer_db()
@@ -2824,7 +3359,7 @@ def procesar_cmd(texto):
             if not era_activo:
                 db["scraping_activo"] = True; escribir_db(db)
             try:
-                ciclo_monitoreo()
+                if ciclo_monitoreo() is False: tg("ℹ️ Ya hay un ciclo corriendo: esperá que termine.")
             finally:
                 if not era_activo:
                     db2 = leer_db(); db2["scraping_activo"] = False; escribir_db(db2)
@@ -3138,15 +3673,19 @@ if __name__ == "__main__":
         threading.Thread(target=run_flask, daemon=True).start()
     else:
         print('⚠️ Flask no disponible — webhooks desactivados')
-    try:
-        ciclo_monitoreo()
-    except Exception as e:
-        print(f"⚠️ Error en ciclo inicial: {e}")
-        tg(f"⚠️ *{_nt('Error en ciclo inicial')}*\n`{e}`\nEl bot sigue activo, reintentará en {CICLO_MINUTOS} min.")
-    while True:
-        time.sleep(CICLO_MINUTOS * 60)
+
+    def _vuelta():
+        """Una vuelta del bot: ciclo + tareas periódicas + latido a la web (si el latido deja de llegar, la web avisa)."""
         try:
             ciclo_monitoreo()
+            resolver("ciclo")
         except Exception as e:
-            print(f"⚠️ Error en ciclo: {e}")
-            tg(f"⚠️ *{_nt('Error en ciclo')}*\n`{e}`\nReintentando en {CICLO_MINUTOS} min.")
+            import traceback; traceback.print_exc()
+            alerta("ciclo", "Error en el ciclo del bot", f"{_md(str(e))[:300]}\nSigue intentando cada {CICLO_MINUTOS} min.")
+        tareas_periodicas()
+
+    threading.Thread(target=hilo_latido, daemon=True).start()
+    _vuelta()
+    while True:
+        time.sleep(CICLO_MINUTOS * 60)
+        _vuelta()
