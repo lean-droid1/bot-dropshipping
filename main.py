@@ -57,7 +57,11 @@ ENVIO_GRATIS_MIN   = 100000  # Activar envio gratis en productos >= este precio
 # Estos productos tienen envío caro (~$200.000), se les pone cartel manual en la foto
 PRODUCTOS_PESADOS_IDS = {3643182, 3643163, 3643153, 3643173}
 
-CICLO_MINUTOS    = 15   # Cada cuántos minutos monitorea
+CICLO_MINUTOS    = int(os.environ.get("CICLO_MINUTOS", "15") or 15)       # de día, cada cuántos minutos monitorea
+CICLO_NOCHE_MIN  = int(os.environ.get("CICLO_NOCHE_MIN", "60") or 60)     # de noche (menos cambios), cada cuántos minutos
+NOCHE_DESDE      = int(os.environ.get("NOCHE_DESDE", "21") or 21)          # hora AR en que arranca la "noche"
+NOCHE_HASTA      = int(os.environ.get("NOCHE_HASTA", "8") or 8)            # hora AR en que vuelve el ritmo de día
+THORDATA_USD_1K  = float(os.environ.get("THORDATA_USD_1K", "1.30") or 1.30)  # precio por 1.000 pedidos del Web Unlocker (para estimar el gasto)
 
 # Categorías del proveedor a excluir siempre (no nos interesan)
 CATEGORIAS_EXCLUIDAS = {'pantallas', 'modulos', 'baterias', 'bateria'}
@@ -1002,6 +1006,7 @@ def _diag_falla(servicio, codigo=None, texto=""):
 def _diag_ok(servicio):
     _diag.setdefault(servicio, {"fallas": 0})["ok"] = True
     _diag["fuente"] = servicio
+    _diag[f"n_{servicio}"] = _diag.get(f"n_{servicio}", 0) + 1   # pedidos que salieron bien (los que se cobran)
 
 def creditos_scraperapi():
     """Uso de cada clave de ScraperAPI (es el último respaldo para leer el proveedor)."""
@@ -1240,20 +1245,171 @@ def _categoria_excluida(cat_nombre, excluidas):
     c = _sin_acentos(cat_nombre)
     return any(_sin_acentos(ex) in c for ex in excluidas)
 
-def scrapear_proveedor(excluidas=None):
+PRODUCTOS_CON_VARIANTES = {'jc face id flex tag', 'jc bateria flex tag', 'maneral mango mijing'}
+PROV_COMPLETA_CADA_H = 24   # una vez por día se lee el catálogo entero (incluye categorías excluidas) para recalcular el filtro
+
+def _firma_excluidas(excluidas):
+    return "|".join(sorted(str(x).lower() for x in (excluidas or [])))
+
+def _entrada_simple(p, nombre_orig, nombre_base, cat_nombre):
+    """Arma la entrada de un producto simple (mismo formato de siempre)."""
+    precio_pub      = _precio_real(p)
+    precio_original = int(p.get("prices", {}).get("regular_price", 0)) // 100
+    en_oferta       = p.get("on_sale", False) and 0 < precio_pub < precio_original
+    lista_imgs = []
+    for im in p.get("images", []) or []:
+        u = im.get("src") or im.get("thumbnail") or ""
+        if u and u not in lista_imgs:
+            lista_imgs.append(u)
+    desc_raw = p.get("description", "") or p.get("short_description", "") or ""
+    desc = re.sub(r"<[^>]+>", "", desc_raw).strip()[:2000]
+    def _f(x):
+        try: return float(x or 0)
+        except Exception: return 0.0
+    dims = p.get("dimensions", {}) or {}
+    return {
+        "nombre_real":           nombre_orig,
+        "nombre_base_proveedor": nombre_base,
+        "precio":                precio_pub,
+        "precio_anterior":       precio_original if en_oferta else 0,
+        "en_oferta":             en_oferta,
+        "stock":                 (_stock_real(p) if p.get("is_in_stock", False) else 0),
+        "woo_id":                p.get("id"),
+        "imagen":                lista_imgs[0] if lista_imgs else "",
+        "imagenes":              lista_imgs,
+        "categoria":             cat_nombre,
+        "descripcion":           desc,
+        "peso":                  _f(p.get("weight")),
+        "alto":                  _f(dims.get("height")),
+        "ancho":                 _f(dims.get("width")),
+        "largo":                 _f(dims.get("length")),
+    }
+
+def _entrada_variante(vd, nombre_orig, nombre_base):
+    """Arma la entrada de una variante (mismo formato de siempre). None si no tiene precio."""
+    v_var_str  = vd.get("variation", "") or ""
+    v_nombre   = v_var_str.split(":", 1)[1].strip() if ":" in v_var_str else v_var_str
+    v_precio   = _precio_real(vd)
+    v_original = int(vd.get("prices", {}).get("regular_price", 0)) // 100
+    v_oferta   = vd.get("on_sale", False) and 0 < v_precio < v_original
+    if v_precio == 0: return None, None
+    clave = normalizar(f"{nombre_orig} ({v_nombre})")
+    return clave, {
+        "nombre_real":           f"{nombre_orig} ({v_nombre})",
+        "nombre_base_proveedor": nombre_base,
+        "precio":                v_precio,
+        "precio_anterior":       v_original if v_oferta else 0,
+        "en_oferta":             v_oferta,
+        "stock":                 (_stock_real(vd) if vd.get("is_in_stock", False) else 0),
+        "woo_id":                vd.get("id"),
+    }
+
+def _pedir_lista(params, via_scraperapi):
+    """Un pedido al proveedor que devuelve una lista de productos. None si falló."""
+    r = _prov_get(PROV_API, params=params, usar_scraperapi=via_scraperapi)
+    if not r or r.status_code != 200 or not (r.text or "").strip():
+        return None
+    try:
+        lista = r.json()
+    except Exception:
+        return None
+    return lista if isinstance(lista, list) else None
+
+def _leer_variantes(grupos, via_scraperapi, info):
+    """Variantes de los productos variables conocidos. Antes: un pedido por variante (~50 por ciclo).
+    Ahora: todas juntas en uno. Si el proveedor no lo acepta o falta alguna, se piden una por una como antes."""
+    padre = {vid: (no, nb) for no, nb, vids in grupos for vid in vids}
+    ids = list(padre)
+    got = {}
+    if ids and info.get("variantes_lote", True):
+        for i in range(0, len(ids), 100):
+            parte = ids[i:i + 100]
+            lista = _pedir_lista({"type": "variation", "include": ",".join(map(str, parte)), "per_page": 100}, via_scraperapi)
+            for vd in lista or []:
+                if isinstance(vd, dict) and vd.get("id") in padre:
+                    got[vd["id"]] = vd
+        if not got:
+            info["variantes_lote"] = False   # el proveedor no lo acepta: desde ahora, una por una
+            print("   ⚠️ Variantes en lote: el proveedor no lo acepta — se piden una por una")
+        else:
+            info["variantes_lote"] = True
+    faltan = [vid for vid in ids if vid not in got]
+    if faltan and got:
+        print(f"   ⚠️ Variantes en lote: faltaron {len(faltan)}, se piden una por una")
+    ok_todas = True
+    for vid in faltan:
+        rv = _prov_get(f"{PROV_API}/{vid}", usar_scraperapi=via_scraperapi)
+        try:
+            vd = rv.json() if rv is not None and rv.status_code == 200 and (rv.text or "").strip() else None
+        except Exception:
+            vd = None
+        if isinstance(vd, dict): got[vid] = vd
+        else: ok_todas = False
+        time.sleep(0.25)
+    out = {}
+    for vid, vd in got.items():
+        no, nb = padre[vid]
+        clave, entrada = _entrada_variante(vd, no, nb)
+        if clave: out[clave] = entrada
+    return out, ok_todas
+
+def scrapear_proveedor(excluidas=None, completa=None):
+    """Lee el catálogo del proveedor (API WooCommerce). Para gastar menos pedidos del Web Unlocker:
+    - liviana (normal): le pide al proveedor que NO mande las categorías excluidas (módulos, baterías);
+    - completa (1 vez por día, o si cambió la lista de excluidas): trae todo y recalcula ese filtro.
+    Una lectura liviana que trae menos productos de lo esperado se rehace completa en el momento."""
+    db = leer_db()
     if excluidas is None:
-        excluidas = leer_db().get("categorias_excluidas", CATEGORIAS_EXCLUIDAS_DEFAULT)
-    productos = {}; pagina = 1; reintentos_202 = 0; via_scraperapi = False; vacias = 0; faltan_variantes = False; reintentos_pag = 0
-    categorias_vistas = set()  # todas las categorías que aparecen en el proveedor este ciclo
-    completo = False           # True solo si se leyeron TODAS las páginas
+        excluidas = db.get("categorias_excluidas", CATEGORIAS_EXCLUIDAS_DEFAULT)
+    info = dict(db.get("lectura_prov") or {})
+    if completa:
+        info.pop("variantes_lote", None)   # en la lectura completa se vuelve a probar pedir las variantes juntas
+    if completa is None:
+        completa = not (info.get("excl_ids") and info.get("firma") == _firma_excluidas(excluidas)
+                        and time.time() - info.get("completa_at", 0) < PROV_COMPLETA_CADA_H * 3600)
     _diag.clear()
     scrapear_proveedor.completo = False
-    print("📥 API proveedor...")
-    # Sesion nueva por ciclo: se abre con IP sticky y se calienta dentro de _prov_get
     global _prov_cf_sess
     _prov_cf_sess = None
+    print(f"📥 API proveedor ({'completa' if completa else 'liviana: sin categorías excluidas'})...")
+
+    productos = {}; pagina = 1; reintentos_202 = 0; via_scraperapi = False; vacias = 0; reintentos_pag = 0
+    categorias_vistas = set()
+    completo = False
+    excl_ids, cat_ids_de = set(), {}   # para recalcular el filtro en la lectura completa
+    grupos_var = []                    # (nombre, nombre_base, [ids de variantes])
+    n_padres = 0                       # productos (no variantes) que pasaron el filtro
+    vistos = set()
+    extra_ids = [int(x) for x in info.get("extra_ids", [])] if not completa else []
+
+    def _procesar(lote):
+        nonlocal n_padres
+        for p in lote:
+            if not isinstance(p, dict) or p.get("id") in vistos: continue
+            vistos.add(p.get("id"))
+            nombre_orig = (p.get("name") or "").strip()
+            if not nombre_orig or len(nombre_orig) < 4: continue
+            nombre_base = normalizar(nombre_orig)
+            if _precio_real(p) == 0: continue
+            cats = p.get("categories", []) or []
+            cat_nombre = (cats[0].get("name") or "") if cats else ""
+            if cat_nombre: categorias_vistas.add(cat_nombre)
+            if _categoria_excluida(cat_nombre, excluidas):
+                if cats and cats[0].get("id"): excl_ids.add(cats[0]["id"])
+                continue
+            n_padres += 1
+            cat_ids_de[p.get("id")] = [c.get("id") for c in cats if c.get("id")]
+            if p.get("type", "simple") == "variable" and any(pv in nombre_base for pv in PRODUCTOS_CON_VARIANTES):
+                vids = [v.get("id") for v in p.get("variations", []) or [] if v.get("id")]
+                if vids: grupos_var.append((nombre_orig, nombre_base, vids))
+            else:
+                productos[nombre_base] = _entrada_simple(p, nombre_orig, nombre_base, cat_nombre)
+
     while True:
-        r = _prov_get(PROV_API, params={"per_page":100,"page":pagina}, usar_scraperapi=via_scraperapi)
+        params = {"per_page": 100, "page": pagina}
+        if not completa:
+            params.update({"category": ",".join(map(str, info["excl_ids"])), "category_operator": "not_in"})
+        r = _prov_get(PROV_API, params=params, usar_scraperapi=via_scraperapi)
         if not r or r.status_code not in (200, 201, 202):
             codigo = r.status_code if r is not None else 'None'
             print(f"❌ Proveedor HTTP {codigo}")
@@ -1271,13 +1427,13 @@ def scrapear_proveedor(excluidas=None):
             break
         if r.status_code == 202:
             reintentos_202 += 1
-            if reintentos_202 == 2 and not via_scraperapi and (SCRAPERAPI_KEY or SCRAPERAPI_KEY2):
+            if reintentos_202 == 2 and not via_scraperapi and (SCRAPERAPI_KEY or SCRAPERAPI_KEY2) and not _diag.get("scraperapi", {}).get("credito"):
                 print("🔄 Activando ScraperAPI como fallback...")
                 via_scraperapi = True
                 continue
             if reintentos_202 >= 5:
                 print(f"❌ Proveedor HTTP 202 x{reintentos_202} - abortando scrape")
-                _diag_falla("proveedor", 202, f"no responde (HTTP 202 x5{' incluso vía ScraperAPI' if via_scraperapi else ''})")
+                _diag_falla("proveedor", 202, "no responde (HTTP 202 x5)")
                 break
             espera = 30 if reintentos_202 <= 2 else 60
             print(f"⚠️ Proveedor HTTP 202 ({reintentos_202}/5) - reintentando en {espera}s...")
@@ -1285,7 +1441,7 @@ def scrapear_proveedor(excluidas=None):
             continue
         if not r.text or not r.text.strip():
             vacias += 1
-            if vacias >= 3:   # antes reintentaba para siempre y trababa el bot
+            if vacias >= 3:
                 print(f"❌ Proveedor: {vacias} respuestas vacías en pág {pagina} — se corta (lectura incompleta)")
                 _diag_falla("proveedor", None, f"respuestas vacías en la página {pagina}")
                 break
@@ -1299,123 +1455,54 @@ def scrapear_proveedor(excluidas=None):
             _diag_falla("proveedor", None, f"respuesta inválida en la página {pagina}")
             break
         if not isinstance(lote, list):
-            # Un sobre de error (ej. {"code":402,"data":[]}) no es "fin del catálogo"
             print(f"⚠️ Proveedor: respuesta inesperada en pág {pagina} — se corta (lectura incompleta)")
             _diag_falla("proveedor", None, f"respuesta inesperada en la página {pagina}: " + str(lote)[:100])
             break
         if not lote:
             completo = True; break
-
-        for p in lote:
-            nombre_orig = p.get("name","").strip()
-            if not nombre_orig or len(nombre_orig) < 4: continue
-            nombre_base = normalizar(nombre_orig)
-            tipo        = p.get("type","simple")
-            woo_id      = p.get("id")
-            precio_pub      = _precio_real(p)
-            precio_original = int(p.get("prices",{}).get("regular_price",0)) // 100
-            en_oferta       = p.get("on_sale", False) and 0 < precio_pub < precio_original
-            in_stock        = p.get("is_in_stock", False)
-            stock_base      = _stock_real(p)
-
-            if precio_pub == 0: continue
-
-            # Categoría del proveedor (la primera) — para filtro y detección de categorías nuevas
-            cats = p.get("categories", []) or []
-            cat_nombre = (cats[0].get("name") or "") if cats else ""
-            if cat_nombre:
-                categorias_vistas.add(cat_nombre)
-            # Filtro: si la categoría está excluida (módulos, baterías), saltar el producto
-            if _categoria_excluida(cat_nombre, excluidas):
-                continue
-
-            # Optimización: solo buscar variantes de productos conocidos con variantes
-            # Esto ahorra ~50 llamadas HTTP por ciclo
-            PRODUCTOS_CON_VARIANTES = {'jc face id flex tag', 'jc bateria flex tag', 'maneral mango mijing'}
-            es_variable_conocido = tipo == "variable" and any(pv in nombre_base for pv in PRODUCTOS_CON_VARIANTES)
-
-            if es_variable_conocido:
-                variaciones = p.get("variations", [])
-                for var_info in variaciones:
-                    vid = var_info.get("id")
-                    if not vid: continue
-                    rv = _prov_get(f"{PROV_API}/{vid}", usar_scraperapi=via_scraperapi)
-                    if not rv or rv.status_code != 200 or not rv.text or not rv.text.strip():
-                        faltan_variantes = True; continue
-                    try:
-                        vd = rv.json()
-                    except Exception:
-                        faltan_variantes = True; continue
-                    v_var_str   = vd.get("variation","")
-                    v_nombre    = v_var_str.split(":",1)[1].strip() if ":" in v_var_str else v_var_str
-                    v_precio    = _precio_real(vd)
-                    v_stock     = _stock_real(vd)
-                    v_original  = int(vd.get("prices",{}).get("regular_price",0)) // 100
-                    v_oferta    = vd.get("on_sale", False) and 0 < v_precio < v_original
-                    v_instock   = vd.get("is_in_stock", False)
-                    if v_precio == 0: continue
-
-                    clave = normalizar(f"{nombre_orig} ({v_nombre})")
-                    productos[clave] = {
-                        "nombre_real":           f"{nombre_orig} ({v_nombre})",
-                        "nombre_base_proveedor": nombre_base,
-                        "precio":                v_precio,
-                        "precio_anterior":       v_original if v_oferta else 0,
-                        "en_oferta":             v_oferta,
-                        "stock":                 v_stock if v_instock else 0,
-                        "woo_id":                vid,
-                    }
-                    time.sleep(0.25)
-            else:
-                # Imagen principal + TODAS las imágenes de la galería del proveedor
-                imgs = p.get("images", []) or []
-                lista_imgs = []
-                for im in imgs:
-                    u = im.get("src") or im.get("thumbnail") or ""
-                    if u and u not in lista_imgs:
-                        lista_imgs.append(u)
-                img_url = lista_imgs[0] if lista_imgs else ""
-                # Descripción (limpia HTML básico), peso y dimensiones
-                import re as _re
-                desc_raw = p.get("description", "") or p.get("short_description", "") or ""
-                desc = _re.sub(r"<[^>]+>", "", desc_raw).strip()[:2000]
-                peso = 0.0
-                try: peso = float(p.get("weight") or 0)
-                except Exception: peso = 0.0
-                dims = p.get("dimensions", {}) or {}
-                def _fdim(x):
-                    try: return float(x or 0)
-                    except Exception: return 0.0
-                productos[nombre_base] = {
-                    "nombre_real":           nombre_orig,
-                    "nombre_base_proveedor": nombre_base,
-                    "precio":                precio_pub,
-                    "precio_anterior":       precio_original if en_oferta else 0,
-                    "en_oferta":             en_oferta,
-                    "stock":                 stock_base if in_stock else 0,
-                    "woo_id":                woo_id,
-                    "imagen":                img_url,
-                    "imagenes":              lista_imgs,
-                    "categoria":             cat_nombre,
-                    "descripcion":           desc,
-                    "peso":                  peso,
-                    "alto":                  _fdim(dims.get("height")),
-                    "ancho":                 _fdim(dims.get("width")),
-                    "largo":                 _fdim(dims.get("length")),
-                }
-
+        _procesar(lote)
         reintentos_pag = 0
         print(f"   Pág {pagina}: {len(lote)} prods (total entradas: {len(productos)})")
         if len(lote) < 100:
             completo = True; break
         pagina += 1; time.sleep(0.5)
 
-    print(f"   ✅ {len(productos)} entradas del proveedor{'' if completo else ' (lectura INCOMPLETA)'}")
+    # Liviana: los productos que tienen ALGUNA categoría excluida de segunda (no de primera) no vienen con el filtro: se piden aparte
+    if completo and not completa and extra_ids:
+        for i in range(0, len(extra_ids), 100):
+            lista = _pedir_lista({"include": ",".join(map(str, extra_ids[i:i + 100])), "per_page": 100}, via_scraperapi)
+            if lista is None:
+                completo = False; break
+            _procesar(lista)
+
+    # Liviana que trae bastante menos de lo esperado → no confiar: se rehace completa ahora mismo
+    if completo and not completa and n_padres < 0.97 * (info.get("n_padres") or 0):
+        print(f"   ⚠️ Lectura liviana trajo {n_padres} productos (se esperaban ~{info.get('n_padres')}): se rehace completa")
+        n_prev = _diag.get("n_thordata", 0)
+        res = scrapear_proveedor(excluidas, completa=True)
+        _diag["n_thordata"] = _diag.get("n_thordata", 0) + n_prev   # que el contador incluya la lectura descartada
+        return res
+
+    # Variantes (todas juntas en un pedido)
+    if grupos_var:
+        vars_, ok_vars = _leer_variantes(grupos_var, via_scraperapi, info)
+        productos.update(vars_)
+        if not ok_vars and completo:
+            print("   ⚠️ Faltaron variantes: se toma como lectura incompleta (no se marca nada sin stock por faltante)")
+            completo = False
+
+    # Guardar el filtro para las próximas lecturas livianas
+    if completo and completa:
+        excl = sorted(excl_ids)
+        info.update({"excl_ids": excl, "firma": _firma_excluidas(excluidas), "completa_at": time.time(), "n_padres": n_padres,
+                     "extra_ids": sorted(pid for pid, cids in cat_ids_de.items() if any(c in excl_ids for c in cids))})
+    db2 = leer_db(); db2["lectura_prov"] = info; escribir_db(db2)
+
+    print(f"   ✅ {len(productos)} entradas del proveedor{'' if completo else ' (lectura INCOMPLETA)'}"
+          f" · {_diag.get('n_thordata', 0)} pedidos al Web Unlocker")
     scrapear_proveedor.ultimas_categorias = sorted(categorias_vistas)
-    if faltan_variantes and completo:
-        print("   ⚠️ Faltaron variantes: se toma como lectura incompleta (no se marca nada sin stock por faltante)")
-        completo = False
     scrapear_proveedor.completo = completo
+    scrapear_proveedor.modo = "completa" if completa else "liviana"
     return productos
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1901,12 +1988,44 @@ def hilo_latido():
         time.sleep(LATIDO_MIN * 60)
 
 def _registrar_ciclo(inicio, ok, motivo="", **extra):
+    n_pedidos = _diag.get("n_thordata", 0)
     def _f(e):
         e["ultimo_ciclo"] = {"at": time.time(), "dur": round(time.time() - inicio), "ok": ok, "motivo": motivo,
-                             "fuente": _diag.get("fuente", ""), **extra}
+                             "fuente": _diag.get("fuente", ""), "pedidos": n_pedidos,
+                             "modo": getattr(scrapear_proveedor, "modo", ""), **extra}
         dia = e["dia"]
         dia["ciclos_ok" if ok else "ciclos_fallidos"] = dia.get("ciclos_ok" if ok else "ciclos_fallidos", 0) + 1
+        dia["pedidos"] = dia.get("pedidos", 0) + n_pedidos
+        # Consumo del Web Unlocker por día (últimos 8 días) para estimar el gasto del mes
+        hoy = _ahora_ar().strftime("%Y-%m-%d")
+        c = e.setdefault("consumo", {})
+        c[hoy] = c.get(hoy, 0) + n_pedidos
+        for k in sorted(c)[:-8]: c.pop(k, None)
     _mod_estado(_f)
+
+def _minutos_ciclo():
+    """Cada cuánto corre el próximo ciclo: CICLO_MINUTOS de día, CICLO_NOCHE_MIN de noche (sin pasarse de las NOCHE_HASTA)."""
+    ahora = _ahora_ar()
+    h = ahora.hour
+    noche = (NOCHE_DESDE <= h or h < NOCHE_HASTA) if NOCHE_DESDE > NOCHE_HASTA else (NOCHE_DESDE <= h < NOCHE_HASTA)
+    if not noche or CICLO_NOCHE_MIN <= CICLO_MINUTOS:
+        return CICLO_MINUTOS
+    fin = ahora.replace(hour=NOCHE_HASTA, minute=0, second=0, microsecond=0)
+    if fin <= ahora: fin += timedelta(days=1)
+    return max(CICLO_MINUTOS, min(CICLO_NOCHE_MIN, int((fin - ahora).total_seconds() // 60) + 1))
+
+def texto_consumo():
+    """'X pedidos hoy · ~Y por día → ~Z por mes (≈ USD W)' del Web Unlocker."""
+    c = leer_estado().get("consumo", {})
+    if not c: return "todavía sin datos"
+    hoy = _ahora_ar().strftime("%Y-%m-%d")
+    dias_completos = [v for k, v in c.items() if k != hoy]
+    prom = (sum(dias_completos) / len(dias_completos)) if dias_completos else None
+    txt = f"{c.get(hoy, 0)} pedidos hoy"
+    if prom is not None:
+        mes = prom * 30
+        txt += f" · promedio {prom:.0f} por día → ~{mes:,.0f} por mes (≈ USD {mes * THORDATA_USD_1K / 1000:.0f})".replace(",", ".")
+    return txt
 
 def _sumar_dia(**kw):
     """Acumula números para el resumen diario."""
@@ -2315,6 +2434,7 @@ def resumen_diario():
         f"• Volvieron a tener stock: {dia.get('con_stock', 0)}",
     ]
     if dia.get("ofertas"): lineas.append(f"• Ofertas nuevas del proveedor: {dia['ofertas']}")
+    lineas.append(f"• Web Unlocker: {dia.get('pedidos', 0)} pedidos · {texto_consumo()}")
     if dia.get("fotos"): lineas.append(f"• Fotos subidas a la web: {dia['fotos']}")
     estado = (f"Scraping {'encendido' if activo else 'APAGADO (mandá /encender)'}"
               + (f" · último ciclo {_hora_ar(uc['at'])} {('incompleto' if uc.get('motivo') else 'bien') if uc.get('ok') else 'con problemas'}" if uc.get("at") else ""))
@@ -2351,7 +2471,7 @@ def texto_estado():
     cl, sc = chequear_creditos()
     est = leer_estado()
     lin = [f"*{_nt('Estado del bot')}*", "",
-           f"• Scraping: {'▶️ encendido, cada ' + str(CICLO_MINUTOS) + ' min' if activo else '⏸️ APAGADO (mandá /encender)'}"]
+           f"• Scraping: {'▶️ encendido, cada ' + str(CICLO_MINUTOS) + ' min (de noche cada ' + str(CICLO_NOCHE_MIN) + ')' if activo else '⏸️ APAGADO (mandá /encender)'}"]
     if uc.get("at"):
         if not uc.get("ok"): res = "con problemas: " + _md(uc.get("motivo", ""))
         elif uc.get("motivo"): res = "⚠️ INCOMPLETO" + (f" ({uc.get('productos', 0)} de unos {uc['referencia']} productos)" if uc.get("referencia") else "") + ": no se marcó nada sin stock"
@@ -2360,7 +2480,9 @@ def texto_estado():
                    f"tardó {_dur(uc.get('dur', 0)) if uc.get('dur', 0) >= 60 else str(uc.get('dur', 0)) + ' s'}")
         if uc.get("productos"):
             lin.append(f"• Proveedor: {uc['productos']} productos" + (f" vía {FUENTES.get(uc['fuente'], uc['fuente'])}" if uc.get("fuente") else "")
+                       + (f" (lectura {uc['modo']})" if uc.get("modo") else "")
                        + f" · a la web: {uc.get('enviados', 0)} enviados, {uc.get('cambios', 0)} con cambios")
+        lin.append(f"• Web Unlocker: {uc.get('pedidos', 0)} pedidos el último ciclo · {texto_consumo()}")
     else:
         lin.append("• Último ciclo: todavía no corrió desde que arrancó el bot")
     lin.append(f"• Web: {'✅ conectada' if comerciapp_ok() else '❌ falta `COMERCIAPP_API` / `BOT_API_KEY`'}")
@@ -3741,5 +3863,5 @@ if __name__ == "__main__":
     threading.Thread(target=hilo_latido, daemon=True).start()
     _vuelta()
     while True:
-        time.sleep(CICLO_MINUTOS * 60)
+        time.sleep(_minutos_ciclo() * 60)
         _vuelta()
