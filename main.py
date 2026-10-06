@@ -2,7 +2,7 @@
 Bot de Dropshipping — Tienda Negocio / RXZ Web
 Versión limpia con API WooCommerce del proveedor.
 """
-import os, time, json, re, io, threading, imaplib, email
+import os, time, json, re, io, threading, imaplib, email, unicodedata
 try:
     from flask import Flask, request, jsonify
     FLASK_OK = True
@@ -202,7 +202,7 @@ def tg(msg, silencioso=None):
                                          "disable_notification": bool(silencioso)}, timeout=15)
             if r.status_code == 400 and "parse" in (r.text or "").lower():
                 requests.post(url, json={"chat_id": CHAT_ID, "text": parte, "disable_notification": bool(silencioso)}, timeout=15)
-        except Exception as e: print(f"❌ Telegram: {e}")
+        except Exception as e: print(f"❌ Telegram: {type(e).__name__}")   # el texto del error trae la URL con el token
 
 def tg_doc(data, nombre, caption=""):
     if not TELEGRAM_TOKEN or not CHAT_ID: return False
@@ -212,7 +212,7 @@ def tg_doc(data, nombre, caption=""):
             files={"document": (nombre, data, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")},
             timeout=30)
         return r.status_code == 200
-    except Exception as e: print(f"❌ Telegram doc: {e}"); return False
+    except Exception as e: print(f"❌ Telegram doc: {type(e).__name__}"); return False
 
 def _nt(txt): return f"[{NOMBRE_TIENDA}] {txt}"
 
@@ -328,6 +328,8 @@ _Los avisos de noche (00 a 08 hs) llegan sin sonido. A las 9 hs llega el resumen
 /reparar\_fotos — Sube a Cloudinary las fotos del proveedor que se ven rotas en la web
 /pendientes — Productos nuevos del proveedor esperando aprobación (Publicar / Ignorar)
 /aprobar\_nuevos on|off — Si está on, lo nuevo entra oculto hasta que lo apruebes
+/aceptar\_precios — Publica los precios raros del proveedor que el bot retuvo (bajas de más de la mitad, subas de más de 4 veces)
+/forzar\_caidos — En el próximo ciclo marca sin stock lo que ya no está en el proveedor aunque sean muchos (vale 3 horas)
 /registrar\_webhooks — Registra webhooks en Tienda Nube para notificaciones instantáneas
 /ver\_webhooks — Muestra los webhooks activos
 /borrar\_webhook ID — Elimina un webhook por ID
@@ -375,7 +377,7 @@ def canjear_code(code):
             json={"client_id": CLIENT_ID, "client_secret": CLIENT_SECRET,
                   "grant_type": "authorization_code", "code": code},
             headers={"Content-Type":"application/json","User-Agent":USER_AGENT}, timeout=30)
-        print(f"OAuth {r.status_code}: {r.text[:200]}")
+        print(f"OAuth {r.status_code}")   # la respuesta trae el token: no se imprime
         if r.status_code in (200, 201):
             d = r.json().get("data", r.json())
             t = d.get("access_token")
@@ -411,8 +413,11 @@ def _comerciapp_sync_chunk(lote, ocultar_nuevos=False):
             print(f"⚠️ ComerciApp sync HTTP {r.status_code}: {r.text[:200]}")
             if r.status_code in (401, 503):  # auth/config error → no reintentar
                 return None
+        except requests.exceptions.ReadTimeout:
+            print("❌ ComerciApp sync: tardó demasiado — no se reenvía (el servidor puede seguir procesándolo); va en el próximo ciclo")
+            return None
         except Exception as e:
-            print(f"❌ ComerciApp sync (intento {intento+1}/3): {e}")
+            print(f"❌ ComerciApp sync (intento {intento+1}/3): {type(e).__name__}")
         time.sleep(3 * (intento + 1))
     return None
 
@@ -466,7 +471,10 @@ def comerciapp_skus_existentes():
     try:
         r = requests.get(f"{COMERCIAPP_API}/api/bot/skus", headers=_ca_headers(), timeout=40)
         if r.status_code == 200:
-            return {row["sku"]: row.get("stock", 0) for row in r.json().get("skus", [])}
+            filas = r.json().get("skus", [])
+            comerciapp_skus_existentes.categorias = {row["sku"]: row.get("categoria") or "" for row in filas}
+            comerciapp_skus_existentes.costos = {row["sku"]: row.get("costo_proveedor") or 0 for row in filas}
+            return {row["sku"]: row.get("stock", 0) for row in filas}
         print(f"⚠️ ComerciApp skus HTTP {r.status_code}: {r.text[:150]}")
         comerciapp_skus_existentes.error = f"HTTP {r.status_code}"
     except Exception as e:
@@ -508,6 +516,68 @@ def enviar_latido():
             "scraping_activo": bool(leer_db().get("scraping_activo", False)), "ciclo_min": LATIDO_MIN,
             "nombre": NOMBRE_TIENDA, "tg_token": TELEGRAM_TOKEN or "", "tg_chat": CHAT_ID or "", "datos": datos})
     except Exception as e: print(f"⚠️ latido: {e}")
+
+AJUSTES_PERSISTENTES = ("categorias_excluidas", "aprobar_nuevos")
+
+_ajustes = {"cargados": False}
+
+def guardar_ajustes_web():
+    """Guarda en la web las categorías excluidas y la aprobación de nuevos (la base del bot se borra en cada deploy)."""
+    if not comerciapp_ok(): return False
+    if not _ajustes["cargados"]:
+        cargar_ajustes_web()
+        if not _ajustes["cargados"]:
+            tg("⚠️ No pude guardar el ajuste en la web (no responde). Queda solo hasta el próximo deploy; volvé a mandarlo más tarde.")
+            return False
+    db = leer_db()
+    ajustes = {k: db[k] for k in AJUSTES_PERSISTENTES if k in db}
+    try:
+        r = requests.put(f"{COMERCIAPP_API}/api/bot/ajustes", headers=_ca_headers(), json={"ajustes": ajustes}, timeout=20)
+        if r.status_code == 200: return True
+        print(f"⚠️ Guardar ajustes HTTP {r.status_code}")
+    except Exception as e: print(f"⚠️ Guardar ajustes: {type(e).__name__}")
+    return False
+
+def cargar_ajustes_web():
+    """Al arrancar: trae de la web los ajustes guardados (si no hay, quedan los de siempre)."""
+    if not comerciapp_ok(): return
+    try:
+        r = requests.get(f"{COMERCIAPP_API}/api/bot/ajustes", headers=_ca_headers(), timeout=20)
+        if r.status_code != 200: return
+        _ajustes["cargados"] = True
+        aj = (r.json() or {}).get("ajustes") or {}
+        aj = {k: v for k, v in aj.items() if k in AJUSTES_PERSISTENTES}
+        if not aj: return
+        db = leer_db(); db.update(aj); escribir_db(db)
+        print(f"⚙️ Ajustes recuperados de la web: {', '.join(aj)}")
+    except Exception as e: print(f"⚠️ Cargar ajustes: {type(e).__name__}")
+
+def confirmar_faltantes(skus, excluidas=(), var_ids=()):
+    """De una lista de SKU RXZ-<id> que faltaron en la lectura, devuelve los que el proveedor TODAVÍA tiene
+    (pedido directo por id, 100 por pedido). None si no se pudo consultar (en ese caso no se toca nada)."""
+    ids = []
+    for sku in skus:
+        try: ids.append(int(str(sku).split("-", 1)[1]))
+        except Exception: pass
+    if not ids: return set()
+    siguen = set()
+    for tipo in (None, "variation"):
+        faltan = [i for i in ids if f"RXZ-{i}" not in siguen]
+        for k in range(0, len(faltan), 100):
+            params = {"include": ",".join(map(str, faltan[k:k + 100])), "per_page": 100}
+            if tipo: params["type"] = tipo
+            lista = _pedir_lista(params, False)
+            if lista is None: return None
+            for d in lista:
+                if not (isinstance(d, dict) and d.get("id")): continue
+                if _precio_real(d) <= 0 or not d.get("is_in_stock", False): continue   # sin precio o sin stock: está caído de verdad
+                if tipo is None:
+                    if len((d.get("name") or "").strip()) < 4: continue
+                    cats = d.get("categories") or []
+                    if _categoria_excluida((cats[0].get("name") or "") if cats else "", excluidas): continue
+                elif d["id"] not in var_ids: continue   # variante de un producto que no se leyó (excluido o dado de baja)
+                siguen.add(f"RXZ-{d['id']}")
+    return siguen
 
 def comerciapp_stock_cero(skus):
     """Pone stock 0 a una lista de SKU en ComerciApp (los que se cayeron del proveedor)."""
@@ -990,7 +1060,7 @@ def run_fix_envio_gratis():
 # ══════════════════════════════════════════════════════════════════════════════
 SCRAPERAPI_KEY  = _e("SCRAPERAPI_KEY")
 SCRAPERAPI_KEY2 = _e("SCRAPERAPI_KEY2")
-SCRAPERAPI_URL = "http://api.scraperapi.com"
+SCRAPERAPI_URL = "https://api.scraperapi.com"
 
 # Diagnóstico de cada ciclo: qué servicio falló y si parece falta de crédito (para avisar por Telegram).
 _diag = {}
@@ -1047,7 +1117,7 @@ def _via_scraperapi(url, params=None):
             if r.status_code == 200: _diag_ok("scraperapi")
             return r
         except Exception as e:
-            print(f"⚠️ ScraperAPI key {i}: {e}")
+            print(f"⚠️ ScraperAPI key {i}: {type(e).__name__}")   # el error trae la URL con la clave
             _diag_falla("scraperapi", None, f"clave {i}: {type(e).__name__}")
             continue
     print("❌ Todas las keys de ScraperAPI fallaron")
@@ -1113,7 +1183,14 @@ def _extraer_json(texto):
             return inner
     m = re.search(r"(\[.*\]|\{.*\})", texto, re.S)
     if m:
-        return m.group(1).strip()
+        # Solo si de verdad son productos (antes cualquier {...} de una página de desafío contaba como dato)
+        cand = m.group(1).strip()
+        try:
+            v = _json.loads(cand, strict=False)
+            if (isinstance(v, list) and v and all(isinstance(x, dict) for x in v[:3])) or (isinstance(v, dict) and "id" in v):
+                return cand
+        except Exception:
+            pass
     return None
 
 def _via_thordata(url, params=None):
@@ -1229,8 +1306,15 @@ def _prov_get(url, params=None, usar_scraperapi=False):
             time.sleep(3)
     return None
 
+def _div_moneda(p):
+    """Divisor según los decimales que informa el proveedor (WooCommerce: currency_minor_unit, normalmente 2)."""
+    mu = (p.get("prices") or {}).get("currency_minor_unit")
+    try: mu = 2 if mu is None else int(mu)
+    except Exception: mu = 2
+    return 10 ** max(0, min(mu, 4))
+
 def _precio_real(p):
-    return int(p.get("prices",{}).get("price", 0)) // 100
+    return int((p.get("prices") or {}).get("price", 0) or 0) // _div_moneda(p)
 
 def _stock_real(p):
     return p.get("add_to_cart",{}).get("maximum") or 0
@@ -1254,7 +1338,7 @@ def _firma_excluidas(excluidas):
 def _entrada_simple(p, nombre_orig, nombre_base, cat_nombre):
     """Arma la entrada de un producto simple (mismo formato de siempre)."""
     precio_pub      = _precio_real(p)
-    precio_original = int(p.get("prices", {}).get("regular_price", 0)) // 100
+    precio_original = int((p.get("prices") or {}).get("regular_price", 0) or 0) // _div_moneda(p)
     en_oferta       = p.get("on_sale", False) and 0 < precio_pub < precio_original
     lista_imgs = []
     for im in p.get("images", []) or []:
@@ -1290,7 +1374,7 @@ def _entrada_variante(vd, nombre_orig, nombre_base):
     v_var_str  = vd.get("variation", "") or ""
     v_nombre   = v_var_str.split(":", 1)[1].strip() if ":" in v_var_str else v_var_str
     v_precio   = _precio_real(vd)
-    v_original = int(vd.get("prices", {}).get("regular_price", 0)) // 100
+    v_original = int((vd.get("prices") or {}).get("regular_price", 0) or 0) // _div_moneda(vd)
     v_oferta   = vd.get("on_sale", False) and 0 < v_precio < v_original
     if v_precio == 0: return None, None
     clave = normalizar(f"{nombre_orig} ({v_nombre})")
@@ -1321,30 +1405,45 @@ def _leer_variantes(grupos, via_scraperapi, info):
     padre = {vid: (no, nb) for no, nb, vids in grupos for vid in vids}
     ids = list(padre)
     got = {}
-    if ids and info.get("variantes_lote", True):
+    fallo_pedido = False
+    if ids and (info.get("variantes_lote", True) or time.time() - info.get("variantes_lote_at", 0) > 4 * 3600):
+        respondio = False
         for i in range(0, len(ids), 100):
             parte = ids[i:i + 100]
             lista = _pedir_lista({"type": "variation", "include": ",".join(map(str, parte)), "per_page": 100}, via_scraperapi)
-            for vd in lista or []:
+            if lista is None:
+                fallo_pedido = True   # el pedido falló (corte, crédito, timeout): NO es que el proveedor no lo acepte
+                continue
+            respondio = True
+            for vd in lista:
                 if isinstance(vd, dict) and vd.get("id") in padre:
                     got[vd["id"]] = vd
-        if not got:
-            info["variantes_lote"] = False   # el proveedor no lo acepta: desde ahora, una por una
+        if respondio and not got:
+            info["variantes_lote"] = False; info["variantes_lote_at"] = time.time()   # contestó bien pero sin variantes: no lo acepta → una por una (se reintenta en la lectura completa)
             print("   ⚠️ Variantes en lote: el proveedor no lo acepta — se piden una por una")
-        else:
+        elif got:
             info["variantes_lote"] = True
     faltan = [vid for vid in ids if vid not in got]
-    if faltan and got:
-        print(f"   ⚠️ Variantes en lote: faltaron {len(faltan)}, se piden una por una")
     ok_todas = True
+    if fallo_pedido and not got:
+        # El servicio está fallando: pedir ~50 variantes de a una gastaría pedidos pagos y tardaría horas. Lectura incompleta.
+        print(f"   ⚠️ Variantes: el pedido en lote falló — no se piden de a una ({len(faltan)} quedan para el próximo ciclo)")
+        faltan, ok_todas = [], False
+    elif faltan and got:
+        print(f"   ⚠️ Variantes en lote: faltaron {len(faltan)}, se piden una por una")
+    fallas_seguidas = 0
     for vid in faltan:
+        if fallas_seguidas >= 3:
+            ok_todas = False   # 3 fallas seguidas: se corta (no seguir gastando pedidos)
+            print("   ⚠️ Variantes: 3 fallas seguidas, se dejan para el próximo ciclo")
+            break
         rv = _prov_get(f"{PROV_API}/{vid}", usar_scraperapi=via_scraperapi)
         try:
             vd = rv.json() if rv is not None and rv.status_code == 200 and (rv.text or "").strip() else None
         except Exception:
             vd = None
-        if isinstance(vd, dict): got[vid] = vd
-        else: ok_todas = False
+        if isinstance(vd, dict): got[vid] = vd; fallas_seguidas = 0
+        else: ok_todas = False; fallas_seguidas += 1
         time.sleep(0.25)
     out = {}
     for vid, vd in got.items():
@@ -1362,11 +1461,11 @@ def scrapear_proveedor(excluidas=None, completa=None):
     if excluidas is None:
         excluidas = db.get("categorias_excluidas", CATEGORIAS_EXCLUIDAS_DEFAULT)
     info = dict(db.get("lectura_prov") or {})
-    if completa:
-        info.pop("variantes_lote", None)   # en la lectura completa se vuelve a probar pedir las variantes juntas
     if completa is None:
         completa = not (info.get("excl_ids") and info.get("firma") == _firma_excluidas(excluidas)
                         and time.time() - info.get("completa_at", 0) < PROV_COMPLETA_CADA_H * 3600)
+    if completa:
+        info.pop("variantes_lote", None)   # en la lectura completa (también la diaria automática) se vuelve a probar pedir las variantes juntas
     _diag.clear()
     scrapear_proveedor.completo = False
     global _prov_cf_sess
@@ -1380,6 +1479,8 @@ def scrapear_proveedor(excluidas=None, completa=None):
     grupos_var = []                    # (nombre, nombre_base, [ids de variantes])
     n_padres = 0                       # productos (no variantes) que pasaron el filtro
     vistos = set()
+    nombres_rep = set()   # nombres que se repiten en el proveedor: van con el id para que no se pisen
+    var_ids_leidos = set()
     extra_ids = [int(x) for x in info.get("extra_ids", [])] if not completa else []
 
     def _procesar(lote):
@@ -1401,11 +1502,23 @@ def scrapear_proveedor(excluidas=None, completa=None):
             cat_ids_de[p.get("id")] = [c.get("id") for c in cats if c.get("id")]
             if p.get("type", "simple") == "variable" and any(pv in nombre_base for pv in PRODUCTOS_CON_VARIANTES):
                 vids = [v.get("id") for v in p.get("variations", []) or [] if v.get("id")]
-                if vids: grupos_var.append((nombre_orig, nombre_base, vids))
+                if vids: grupos_var.append((nombre_orig, nombre_base, vids)); var_ids_leidos.update(vids)
             else:
-                productos[nombre_base] = _entrada_simple(p, nombre_orig, nombre_base, cat_nombre)
+                if nombre_base in nombres_rep:
+                    clave = f"{nombre_base} #{p.get('id')}"
+                elif nombre_base in productos and productos[nombre_base].get("woo_id") != p.get("id"):
+                    viejo = productos.pop(nombre_base)
+                    productos[f"{nombre_base} #{viejo.get('woo_id')}"] = viejo
+                    nombres_rep.add(nombre_base); clave = f"{nombre_base} #{p.get('id')}"
+                else:
+                    clave = nombre_base
+                productos[clave] = _entrada_simple(p, nombre_orig, nombre_base, cat_nombre)
 
     while True:
+        if pagina > 40:
+            print("❌ Proveedor: más de 40 páginas — se corta (lectura incompleta)")
+            _diag_falla("proveedor", None, "más de 40 páginas de catálogo")
+            break
         params = {"per_page": 100, "page": pagina}
         if not completa:
             params.update({"category": ",".join(map(str, info["excl_ids"])), "category_operator": "not_in"})
@@ -1460,7 +1573,13 @@ def scrapear_proveedor(excluidas=None, completa=None):
             break
         if not lote:
             completo = True; break
+        n_vistos = len(vistos)
         _procesar(lote)
+        if len(vistos) == n_vistos:
+            # La página no trajo nada nuevo (caché que ignora la página): seguir sería gastar pedidos pagos sin fin
+            print(f"⚠️ Proveedor: la página {pagina} repite productos ya leídos — se corta (lectura incompleta)")
+            _diag_falla("proveedor", None, f"la página {pagina} repite productos")
+            break
         reintentos_pag = 0
         print(f"   Pág {pagina}: {len(lote)} prods (total entradas: {len(productos)})")
         if len(lote) < 100:
@@ -1502,6 +1621,7 @@ def scrapear_proveedor(excluidas=None, completa=None):
           f" · {_diag.get('n_thordata', 0)} pedidos al Web Unlocker")
     scrapear_proveedor.ultimas_categorias = sorted(categorias_vistas)
     scrapear_proveedor.completo = completo
+    scrapear_proveedor.var_ids = var_ids_leidos
     scrapear_proveedor.modo = "completa" if completa else "liviana"
     return productos
 
@@ -1951,14 +2071,14 @@ def _firma(p):
 
 _ciclo_desde = {"t": 0}
 
-def ciclo_monitoreo():
-    """Un ciclo completo. Devuelve False si ya había otro corriendo (no se pisan)."""
+def ciclo_monitoreo(forzar=False):
+    """Un ciclo completo. Devuelve False si ya había otro corriendo (no se pisan). forzar: corre aunque el scraping esté apagado."""
     if not _ciclo_lock.acquire(blocking=False):
         print("⏳ Ya hay un ciclo corriendo — se saltea.")
         return False
     _ciclo_desde["t"] = time.time()
     try:
-        _ciclo_monitoreo()
+        _ciclo_monitoreo(forzar)
         return True
     finally:
         _ciclo_desde["t"] = 0
@@ -2095,15 +2215,18 @@ def _pl(n, uno, varios):
 
 FUENTES = {"thordata": "ThorData", "proxy": "proxy residencial", "scraperapi": "ScraperAPI"}
 
-def _ciclo_monitoreo():
+def _ciclo_monitoreo(forzar=False):
     inicio = time.time()
     print(f"\n─── 🔄 Ciclo {_ahora_ar().strftime('%H:%M')} ───")
     db = leer_db()
 
     # ── Botón ON/OFF: si el scraping está apagado, no salir a RXZ ──
-    if not db.get("scraping_activo", False):
+    if not forzar and not db.get("scraping_activo", False):
         print("⏸️  Scraping APAGADO — encendé con /encender (o botón del menú).")
         return
+    if not _ajustes["cargados"]:
+        cargar_ajustes_web()   # si al arrancar la web no respondía, se reintenta acá (antes de leer el proveedor)
+        db = leer_db()
 
     prov_ant = db.get("productos_proveedor", {})
     excluidas = db.get("categorias_excluidas", CATEGORIAS_EXCLUIDAS_DEFAULT)
@@ -2159,10 +2282,30 @@ def _ciclo_monitoreo():
         if viejo and sku in vendidos and 0 < stock <= ALERTA_STOCK < stock_ant and stock < 9999:
             lineas_stock_bajo.append(f"• {_md(datos['nombre_real'])}: quedan {int(stock)} (vendiste {vendidos[sku].get('unidades', 0)} en 30 días)")
 
+    # La web se consulta antes de armar el lote: su costo guardado sirve de referencia para detectar precios raros
+    skus_web = comerciapp_skus_existentes()
+    if skus_web is None:
+        n = _mod_estado(lambda e: e.__setitem__("fallos_web", e.get("fallos_web", 0) + 1) or e["fallos_web"])
+        if n >= 2:
+            alerta("web", "No puedo conectarme con la web",
+                   f"Van {n} ciclos sin poder actualizar la web ({_md(getattr(comerciapp_skus_existentes, 'error', '') or 'sin respuesta')}). "
+                   "Revisá el servicio de la API en Railway.")
+        _registrar_ciclo(inicio, False, "la web no responde", productos=len(prov_nuevo))
+        return   # no se guarda el proveedor: los cambios se avisan cuando la web vuelva
     # 3) Armar el LOTE para ComerciApp (upsert por SKU = RXZ-{woo_id})
     lote = []
     cambios_precio, subas_fuertes = [], []
     n_subas = n_bajas = 0
+    # Precios sospechosos (el precio normal baja a menos de la mitad, o queda en 0): NO se publican.
+    # Se mantiene el precio anterior hasta que vuelva a la normalidad o se acepte con /aceptar_precios.
+    # Las subas no se retienen (retenerlas = vender por debajo del costo, ej. cuando termina una oferta).
+    retenidos = dict(db.get("precios_retenidos") or {})
+    acept = db.get("aceptar_precios_at")
+    if acept:   # solo los que ya se avisaron antes del /aceptar_precios
+        retenidos = {k: v for k, v in retenidos.items() if float(v.get("desde", 0)) > float(acept)}
+    retenidos_nuevos = []
+    retenidos_inicio = set(retenidos)
+    costos_web = getattr(comerciapp_skus_existentes, "costos", {}) or {}
     for clave, datos in prov_nuevo.items():
         woo_id = datos.get("woo_id")
         if not woo_id:
@@ -2171,6 +2314,28 @@ def _ciclo_monitoreo():
         costo = datos.get("precio", 0)
         if costo <= 0:
             continue
+        costo_ref = (prov_ant.get(clave, {}) or {}).get("precio", 0) or 0
+        if not costo_ref:   # después de un deploy no hay ciclo anterior: se compara con el costo que tiene la web
+            try: costo_ref = float(costos_web.get(sku) or 0)
+            except Exception: costo_ref = 0
+        ret = retenidos.get(sku)
+        # Oferta del proveedor con su precio normal intacto: es una oferta real, no un error
+        es_oferta_real = datos.get("en_oferta") and (datos.get("precio_anterior") or 0) >= 0.8 * costo_ref
+        if ret:
+            ok = ret.get("costo_ok", 0) or 0
+            if ok and costo >= 0.5 * ok and precio_obj(costo) > 0:
+                retenidos.pop(sku, None)          # volvió a un precio razonable: se publica normal
+            else:
+                ret["costo_nuevo"] = costo        # sigue raro: se publica con el precio anterior
+                costo = ok
+                datos = {**datos, "precio": ok, "en_oferta": False, "precio_anterior": 0}
+        elif costo_ref > 0 and precio_obj(costo_ref) > 0 and (precio_obj(costo) <= 0 or (costo < 0.5 * costo_ref and not es_oferta_real)):
+            retenidos[sku] = {"costo_ok": costo_ref, "costo_nuevo": costo, "nombre": datos.get("nombre_real", ""), "desde": time.time()}
+            retenidos_nuevos.append(f"• {_md(datos.get('nombre_real', ''))}: {_pesos(precio_obj(costo_ref))} → {_pesos(precio_obj(costo))} (no lo cambié)")
+            costo = costo_ref
+            datos = {**datos, "precio": costo_ref, "en_oferta": False, "precio_anterior": 0}
+        elif precio_obj(costo) <= 0:
+            continue   # producto nuevo con precio casi 0: no se publica
         precio_venta = precio_obj(costo)
         stock = datos.get("stock", 0) or 0
         en_oferta = datos.get("en_oferta", False)
@@ -2203,9 +2368,9 @@ def _ciclo_monitoreo():
             "costo": costo,   # lo que cobra rxz → precio de costo en la web (ganancia real en el dashboard)
         })
 
-        # Cambio de precio del proveedor (comparando con el ciclo anterior)
+        # Cambio de precio del proveedor (comparando con el ciclo anterior). Los retenidos no se informan como cambio.
         costo_viejo = prov_ant.get(clave, {}).get("precio", 0)
-        if costo_viejo and costo_viejo != costo:
+        if costo_viejo and costo_viejo != costo and sku not in retenidos and sku not in retenidos_inicio:
             pv_viejo = precio_obj(costo_viejo)
             if pv_viejo != precio_venta and pv_viejo > 0:
                 pct = (precio_venta - pv_viejo) * 100 / pv_viejo
@@ -2221,15 +2386,6 @@ def _ciclo_monitoreo():
                     cambios_precio.append(linea)
 
     # 4) Mandar a la web SOLO lo que cambió (y cada RECONCILIAR_H horas, todo)
-    skus_web = comerciapp_skus_existentes()
-    if skus_web is None:
-        n = _mod_estado(lambda e: e.__setitem__("fallos_web", e.get("fallos_web", 0) + 1) or e["fallos_web"])
-        if n >= 2:
-            alerta("web", "No puedo conectarme con la web",
-                   f"Van {n} ciclos sin poder actualizar la web ({_md(getattr(comerciapp_skus_existentes, 'error', '') or 'sin respuesta')}). "
-                   "Revisá el servicio de la API en Railway.")
-        _registrar_ciclo(inicio, False, "la web no responde", productos=len(prov_nuevo))
-        return   # no se guarda el proveedor: los cambios se avisan cuando la web vuelva
     enviado = db.get("enviado_web", {})
     reconciliar = (time.time() - db.get("reconciliado_at", 0) > RECONCILIAR_H * 3600) or not enviado
     lote_envio = [p for p in lote if reconciliar or p["sku"] not in skus_web or enviado.get(p["sku"]) != _firma(p)
@@ -2268,10 +2424,14 @@ def _ciclo_monitoreo():
     caidos, afectados = [], 0
     if completo and skus_web:
         skus_proveedor = {f"RXZ-{d.get('woo_id')}" for d in prov_nuevo.values() if d.get("woo_id")}
-        caidos = [sku for sku, stock_web in skus_web.items() if sku not in skus_proveedor and (stock_web or 0) > 0]
+        # Confirmados como vigentes hace menos de 6 h: no se vuelven a consultar (pedidos pagos) ni cuentan para el tope
+        vigentes = {k: v for k, v in (db.get("faltantes_vigentes") or {}).items() if time.time() - v < 6 * 3600}
+        caidos = [sku for sku, stock_web in skus_web.items() if sku not in skus_proveedor and (stock_web or 0) > 0 and sku not in vigentes]
         con_stock_web = sum(1 for v in skus_web.values() if (v or 0) > 0)
-        forzar = bool(db.get("forzar_caidos"))
-        if len(caidos) > max(20, con_stock_web * 0.15) and not forzar:
+        fz = db.get("forzar_caidos")
+        forzar_c = bool(fz) and (fz is True or time.time() - float(fz) < 3 * 3600)   # vale 3 horas
+        caidos_evaluado = False
+        if len(caidos) > max(20, con_stock_web * 0.15) and not forzar_c:
             # Demasiados faltantes de golpe: más probable una lectura rara que un cambio real. No se toca nada.
             alerta("caidos", "Muchos productos desaparecieron del proveedor de golpe",
                    f"Faltan {len(caidos)} de {con_stock_web} con stock. Por seguridad NO los marqué sin stock. "
@@ -2280,11 +2440,42 @@ def _ciclo_monitoreo():
         elif caidos or completo:
             resolver("caidos", avisar=False)
         if caidos:
+            # Confirmación barata (1-2 pedidos): los que el proveedor todavía tiene a la venta no se tocan
+            siguen = confirmar_faltantes(caidos, excluidas, getattr(scrapear_proveedor, "var_ids", set()))
+            if siguen is None:
+                print("   ⚠️ No pude confirmar los faltantes con el proveedor: no se marca nada sin stock este ciclo.")
+                caidos = []
+            else:
+                caidos_evaluado = True
+                if siguen:
+                    print(f"   ℹ️ {len(siguen)} 'faltantes' siguen en el proveedor (no se tocan)")
+                    caidos = [x for x in caidos if x not in siguen]
+                    vigentes.update({k: time.time() for k in siguen})
+        elif not caidos:
+            caidos_evaluado = True
+        if caidos:
             afectados = comerciapp_stock_cero(caidos)
             for sku in caidos: enviado.pop(sku, None)
             print(f"   📉 {afectados} productos caídos del proveedor → stock 0")
-    elif not completo:
+    else:
+        caidos_evaluado, vigentes = False, None
+    if not completo:
         print("   ⚠️ Lectura incompleta del proveedor: no se marca nada sin stock por faltante.")
+
+    # Precios retenidos: los nuevos se avisan en el momento; la alerta queda en /estado mientras haya alguno
+    if completo:
+        skus_leidos = {f"RXZ-{d.get('woo_id')}" for d in prov_nuevo.values() if d.get("woo_id")}
+        retenidos = {k: v for k, v in retenidos.items() if k in skus_leidos}   # los que ya no están en el proveedor salen de la lista
+    if retenidos_nuevos:
+        tg(f"⚠️ *{_nt(f'{len(retenidos_nuevos)} precios raros del proveedor: no los publiqué')}*\n" + "\n".join(retenidos_nuevos[:15]) +
+           ("\n…" if len(retenidos_nuevos) > 15 else "") + "\n\nSigo vendiendo con el precio anterior. Si el cambio es real, mandá /aceptar\\_precios.")
+    if retenidos:
+        alerta("precios", f"{len(retenidos)} precios del proveedor retenidos (sin publicar)",
+               "Mandá /aceptar\\_precios si son reales.", grave=False)
+    else:
+        resolver("precios", avisar=False)
+    for base in [b for b, d in ofertas_nuevas.items() if f"RXZ-{d.get('woo_id')}" in retenidos]:
+        ofertas_nuevas.pop(base, None)
 
     # 6) Un solo mensaje por ciclo, y solo si hay algo que contar
     partes = []
@@ -2322,6 +2513,8 @@ def _ciclo_monitoreo():
                 print(f"   📸 {rf['ok']} fotos subidas a Cloudinary (quedan {rf['pendientes']})")
                 partes.append(f"📸 {rf['ok']} fotos subidas" + (f" (quedan {rf['pendientes']})" if rf['pendientes'] else ""))
                 resolver("fotos")
+            elif rf and rf.get("fallidas", 0) < 10:
+                resolver("fotos", avisar=False)   # ya no hay una falla masiva (las que no se pueden se saltean)
             elif rf and rf.get("fallidas", 0) >= 10:
                 top = sorted(rf.get("motivos", {}).items(), key=lambda x: -x[1])[:3]
                 alerta("fotos", "No se pueden subir las fotos del proveedor a la web",
@@ -2346,8 +2539,15 @@ def _ciclo_monitoreo():
         db2["reconciliado_at"] = time.time()
     if completo:
         db2["ultimo_completo_n"] = len(prov_nuevo)
-    if caidos:
+    # /forzar_caidos vale para UN ciclo completo (aunque no haya faltado nada); uno mandado durante el ciclo queda para el próximo
+    fz2 = db2.get("forzar_caidos")
+    if caidos_evaluado and fz2 and (fz2 is True or float(fz2) <= inicio):
         db2.pop("forzar_caidos", None)
+    if vigentes is not None:
+        db2["faltantes_vigentes"] = vigentes
+    db2["precios_retenidos"] = retenidos
+    if db2.get("aceptar_precios_at") and float(db2["aceptar_precios_at"]) <= inicio:
+        db2.pop("aceptar_precios_at", None)
     if ofertas_nuevas:
         db2["ofertas_pendientes"] = ofertas_nuevas
     escribir_db(db2)
@@ -2692,7 +2892,7 @@ def run_productos_sin_cargar(modo_todo=False):
             cats_str = " ".join(cats)
             if any(exc in cats_str for exc in CATEGORIAS_EXCLUIDAS):
                 continue
-            precio = int(p.get("prices",{}).get("price",0)) // 100
+            precio = int((p.get("prices") or {}).get("price",0) or 0) // _div_moneda(p)
             if precio == 0: continue
             stock = p.get("add_to_cart",{}).get("maximum") or 0
             productos_prov[normalizar(nombre)] = {
@@ -2734,6 +2934,9 @@ if FLASK_OK:
 
     @flask_app.route("/webhook", methods=["POST"])
     def recibir_webhook():
+        # Integración vieja de Tienda Nube: sin firma, cualquiera podía llamarla. Solo con LEGACY_WEBHOOK=1.
+        if os.environ.get("LEGACY_WEBHOOK") != "1":
+            return jsonify({"status": "disabled"}), 404
         try:
             data = request.get_json(silent=True) or {}
             evento   = data.get("event", "")
@@ -2974,7 +3177,6 @@ def tg_menu():
             [{"text": "🆕 Productos nuevos por aprobar", "callback_data": "/pendientes"}],
             [{"text": "🖼️ Reparar fotos de la web", "callback_data": "/reparar_fotos"}],
             [{"text": "📸 Migrar Fotos Empretienda", "callback_data": "/migrar_fotos"}],
-            [{"text": "🧹 Limpiar DEPOSITO", "callback_data": "/limpiar_deposito"}],
             [{"text": "🏷️ Ver Ofertas Proveedor", "callback_data": "/ver_ofertas_proveedor"}],
             [{"text": "🛠️ Debug Env", "callback_data": "/debug_env"}],
             [{"text": "📄 Ayuda completa", "callback_data": "/ayuda"}],
@@ -3226,8 +3428,16 @@ def procesar_cmd(texto):
         tg(texto_estado(), silencioso=True)
         return
     elif cmd[0] == "/forzar_caidos":
-        db = leer_db(); db["forzar_caidos"] = True; escribir_db(db)
-        tg("✅ En el próximo ciclo se marcan sin stock los productos que ya no están en el proveedor, aunque sean muchos.")
+        db = leer_db(); db["forzar_caidos"] = time.time(); escribir_db(db)
+        tg("✅ En el próximo ciclo completo (dentro de las próximas 3 horas) se marcan sin stock los productos que ya no están en el proveedor, aunque sean muchos.")
+        return
+    elif cmd[0] == "/aceptar_precios":
+        db = leer_db(); ret = db.get("precios_retenidos") or {}
+        if not ret:
+            tg("ℹ️ No hay precios retenidos."); return
+        db["aceptar_precios_at"] = time.time(); escribir_db(db)
+        lin = [f"• {_md(v.get('nombre', k))}: {_pesos(precio_obj(v.get('costo_nuevo', 0)))}" for k, v in list(ret.items())[:15]]
+        tg(f"✅ En el próximo ciclo se publican estos {len(ret)} precios:\n" + "\n".join(lin))
         return
     elif cmd[0] == "/apagar":
         db = leer_db(); db["scraping_activo"] = False; escribir_db(db)
@@ -3257,7 +3467,10 @@ def procesar_cmd(texto):
             excl.append(nombre)
             db["categorias_excluidas"] = excl
             escribir_db(db)
-            tg(f"🚫 Categoría *{nombre}* agregada a excluidas. No se cargará en el próximo ciclo.\n\n(Los productos ya cargados de esa categoría no se borran solos — si querés, limpiá y recargá.)")
+            guardar_ajustes_web()
+            tg(f"🚫 Categoría *{nombre}* agregada a excluidas. No se carga más del proveedor.\n\n"
+               "Los productos de esa categoría que ya están en la web quedan *sin stock* en el próximo ciclo completo (no se borran), "
+               "así no se venden con un precio viejo.")
         else:
             tg(f"ℹ️ *{nombre}* ya estaba excluida.")
         return
@@ -3267,9 +3480,13 @@ def procesar_cmd(texto):
         nombre = " ".join(texto.split()[1:]).strip()
         db = leer_db()
         excl = db.get("categorias_excluidas", CATEGORIAS_EXCLUIDAS_DEFAULT)
-        nueva = [e for e in excl if e.lower() != nombre.lower() and nombre.lower() not in e.lower()]
+        _n = lambda x: unicodedata.normalize("NFD", str(x)).encode("ascii", "ignore").decode().lower().strip()
+        nueva = [e for e in excl if _n(e) != _n(nombre)]
+        if len(nueva) == len(excl):
+            tg(f"ℹ️ *{nombre}* no estaba en la lista de excluidas. Mirá /ver\\_categorias."); return
         db["categorias_excluidas"] = nueva
         escribir_db(db)
+        guardar_ajustes_web()
         tg(f"✅ Categoría *{nombre}* incluida. Se cargará en el próximo /ciclo.")
         return
     elif cmd[0] == "/migrar_fotos" or cmd[0] == "/migrar_fotos_aplicar":
@@ -3339,7 +3556,7 @@ def procesar_cmd(texto):
     elif cmd[0] == "/aprobar_nuevos":
         db = leer_db()
         if len(cmd) > 1 and cmd[1] in ("on", "off", "si", "no"):
-            db["aprobar_nuevos"] = cmd[1] in ("on", "si"); escribir_db(db)
+            db["aprobar_nuevos"] = cmd[1] in ("on", "si"); escribir_db(db); guardar_ajustes_web()
         activo = db.get("aprobar_nuevos", True)
         tg(("✅ *Aprobación de nuevos: ACTIVADA*\nLo nuevo del proveedor entra oculto y te pregunto antes de publicarlo."
             if activo else "⏩ *Aprobación de nuevos: DESACTIVADA*\nLo nuevo del proveedor se publica solo.") +
@@ -3351,6 +3568,10 @@ def procesar_cmd(texto):
     elif cmd[0] == "/limpiar_deposito":
         if not comerciapp_ok():
             tg("❌ ComerciApp no configurado."); return
+        if len(cmd) < 2 or cmd[1] != "confirmar":
+            tg("⚠️ *Limpiar DEPOSITO borra TODOS los productos de esa sección* (fotos, nombres editados, aprobaciones).\n\n"
+               "Si estás seguro, escribí: `/limpiar_deposito confirmar`")
+            return
         tg("🧹 *Limpiando DEPOSITO...* (borra TODOS los productos de esa sección para recargar sin duplicados)")
         def _limpiar():
             try:
@@ -3529,15 +3750,10 @@ def procesar_cmd(texto):
     elif cmd[0] == "/ciclo":
         tg(f"🔄 *{_nt('Ciclo manual iniciado')}* (corre aunque el scraping esté apagado)")
         def _ciclo_manual():
-            db = leer_db()
-            era_activo = db.get("scraping_activo", False)
-            if not era_activo:
-                db["scraping_activo"] = True; escribir_db(db)
+            # Ya no cambia el encendido/apagado guardado (antes un /encender durante el ciclo se perdía)
             try:
-                if ciclo_monitoreo() is False: tg("ℹ️ Ya hay un ciclo corriendo: esperá que termine.")
-            finally:
-                if not era_activo:
-                    db2 = leer_db(); db2["scraping_activo"] = False; escribir_db(db2)
+                if ciclo_monitoreo(forzar=True) is False: tg("ℹ️ Ya hay un ciclo corriendo: esperá que termine.")
+            except Exception as e: tg(f"⚠️ Error en el ciclo: `{type(e).__name__}`")
         threading.Thread(target=_ciclo_manual, daemon=True).start()
     elif cmd[0] == "/debug_ordenes":
         if not _token: tg("❌ Necesito el token primero."); return
@@ -3779,6 +3995,26 @@ def procesar_cmd(texto):
         tg("❓ Comando no reconocido. Mandá `/ayuda`.")
 
 # ── Loop Telegram ─────────────────────────────────────────────────────────────
+_tg_inicio = {"offset": 0, "descartados": 0}
+
+def descartar_pendientes_tg():
+    """Al arrancar: lo que quedó pendiente durante el reinicio NO se ejecuta (antes se repetían botones como Limpiar DEPOSITO)."""
+    if not TELEGRAM_TOKEN: return
+    try:
+        requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/deleteWebhook?drop_pending_updates=false", timeout=10)
+        rp = None
+        for _ in range(4):   # 409 = la versión anterior del bot todavía está leyendo (deploy): se espera un poco
+            rp = requests.get(f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates?timeout=0", timeout=15)
+            if rp.status_code != 409: break
+            time.sleep(5)
+        pend = rp.json().get("result", []) if rp is not None and rp.status_code == 200 else []
+        if pend:
+            _tg_inicio["offset"] = max(u["update_id"] for u in pend) + 1
+            _tg_inicio["descartados"] = len(pend)
+            print(f"🧹 Telegram: {len(pend)} mensajes/botones de antes del reinicio descartados (no se ejecutan)")
+    except Exception as e:
+        print(f"⚠️ Telegram pendientes: {type(e).__name__}")
+
 def escuchar_telegram():
     if not TELEGRAM_TOKEN: return
     offset = 0; url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates"
@@ -3788,6 +4024,7 @@ def escuchar_telegram():
         print(f"🧹 deleteWebhook: {wr.status_code} {wr.text[:80]}")
     except Exception as e:
         print(f"⚠️ deleteWebhook: {e}")
+    offset = _tg_inicio["offset"]
     print("📡 Telegram activo...")
     while True:
         try:
@@ -3814,7 +4051,7 @@ def escuchar_telegram():
                             print(f"🔘 Botón: {cb_data[:60]}")
                             try: procesar_cmd(cb_data)
                             except Exception as e: print(f"❌ Botón cmd: {e}")
-        except Exception as e: print(f"⚠️ Telegram: {e}")
+        except Exception as e: print(f"⚠️ Telegram: {type(e).__name__}")   # sin el texto: trae la URL con el token
         time.sleep(1)
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -3833,6 +4070,8 @@ if __name__ == "__main__":
     else:
         print(f"   ⚠️ Sin proxy residencial — usando curl-cffi directo")
 
+    cargar_ajustes_web()   # categorías excluidas y aprobación de nuevos, como estaban antes del deploy
+    descartar_pendientes_tg()
     _db_ini = leer_db()
     _scr = _db_ini.get("scraping_activo", False)
     _web = "✅" if comerciapp_ok() else "❌ falta config"
@@ -3841,7 +4080,8 @@ if __name__ == "__main__":
        f"• Web ComerciApp: {_web}\n"
        f"• Margen: {MARGEN}\n\n"
        f"Mandá /encender para arrancar la sincronización.\n"
-       f"Mandá /menu para el panel de botones.")
+       f"Mandá /menu para el panel de botones." +
+       (f"\n\n_{_tg_inicio['descartados']} mensaje(s) enviados durante el reinicio no se ejecutaron: si hacía falta, mandalos de nuevo._" if _tg_inicio["descartados"] else ""))
 
     registrar_comandos_tg()
     threading.Thread(target=escuchar_telegram, daemon=True).start()
